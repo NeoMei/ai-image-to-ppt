@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+out/
+.secrets/
+*_api_key
+.DS_Store
