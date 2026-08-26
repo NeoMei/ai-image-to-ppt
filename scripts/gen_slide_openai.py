@@ -124,6 +124,9 @@ def gen(prompt: str, out_path: str, retries: int = 2) -> bool:
                 time.sleep(2)
                 continue
             return False
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            print("  ERR: invalid JSON response from OpenAI")
+            return False
 
         try:
             encoded = result["data"][0]["b64_json"]

@@ -107,6 +107,17 @@ class OpenAIGenerationTests(unittest.TestCase):
             self.assertEqual(out_path.read_bytes(), b"existing")
             self.assertEqual(list(Path(temp_dir).glob("*.tmp")), [])
 
+    def test_malformed_json_does_not_overwrite_existing_file(self):
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.return_value = b"{not-json"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            out_path = Path(temp_dir) / "slide.jpg"
+            out_path.write_bytes(b"existing")
+            with mock.patch.dict(os.environ, {"OPENAI_API_KEY": "test-key"}, clear=True), \
+                 mock.patch.object(gen_slide_openai.urllib.request, "urlopen", return_value=response):
+                self.assertFalse(gen_slide_openai.gen("prompt", str(out_path), retries=0))
+            self.assertEqual(out_path.read_bytes(), b"existing")
+
     def test_429_retries_then_succeeds(self):
         error = urllib.error.HTTPError(
             gen_slide_openai.API_URL,
