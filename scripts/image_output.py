@@ -34,6 +34,8 @@ MAX_IMAGE_BYTES = 50 * 1024 * 1024
 MAX_IMAGE_PIXELS = 64_000_000
 MAX_ENCODED_IMAGE_BYTES = 4 * ((MAX_IMAGE_BYTES + 2) // 3)
 MAX_PROVIDER_RESPONSE_BYTES = MAX_ENCODED_IMAGE_BYTES + 1024 * 1024
+PROVIDER_RESPONSE_READ_CHUNK_BYTES = 64 * 1024
+MAX_PROVIDER_RESPONSE_READS = 4096
 
 
 class ImageOutputError(ValueError):
@@ -127,23 +129,38 @@ def decode_base64(encoded: object) -> bytes:
 
 def read_response_body(response) -> bytes:
     """Read one provider response with a hard maximum allocation boundary."""
-    try:
+    data = bytearray()
+    remaining = MAX_PROVIDER_RESPONSE_BYTES + 1
+    read_count = 0
+    while remaining:
+        if read_count >= MAX_PROVIDER_RESPONSE_READS:
+            raise ImageOutputError("provider response returned too many chunks")
+        read_count += 1
         try:
-            data = response.read(MAX_PROVIDER_RESPONSE_BYTES + 1)
-        except TypeError:
-            # Some simple file-like test doubles expose only read(). Real
-            # HTTPResponse objects accept an explicit byte bound.
-            data = response.read()
-    except (OSError, http.client.HTTPException) as error:
-        raise ImageStreamError(f"provider response read failed: {error}") from error
-    if not isinstance(data, bytes):
-        raise ImageOutputError("provider response body must be bytes")
+            chunk = response.read(
+                min(PROVIDER_RESPONSE_READ_CHUNK_BYTES, remaining)
+            )
+        except TypeError as error:
+            raise ImageOutputError(
+                "provider response does not support bounded reads"
+            ) from error
+        except (OSError, http.client.HTTPException) as error:
+            raise ImageStreamError(
+                f"provider response read failed: {error}"
+            ) from error
+        if not isinstance(chunk, bytes):
+            raise ImageOutputError("provider response body must be bytes")
+        if not chunk:
+            break
+        data.extend(chunk[:remaining])
+        remaining -= min(len(chunk), remaining)
+
     if len(data) > MAX_PROVIDER_RESPONSE_BYTES:
         raise ImageOutputError(
             "provider response exceeds maximum size of "
             f"{MAX_PROVIDER_RESPONSE_BYTES} bytes"
         )
-    return data
+    return bytes(data)
 
 
 def _validate_dimensions(width: int, height: int) -> None:
@@ -203,8 +220,11 @@ def load_image(
 
 def prepare_target(target: Path) -> PreparedTarget:
     """Capture the parent directory identity for one output target."""
-    output_path = Path(target)
-    parent_path = Path(os.path.abspath(str(output_path.parent)))
+    try:
+        output_path = Path(os.path.abspath(str(Path(target).expanduser())))
+    except (TypeError, ValueError, OSError) as error:
+        raise ImageOutputError(f"invalid output target: {error}") from error
+    parent_path = output_path.parent
     try:
         parent_path.mkdir(parents=True, exist_ok=True)
         if parent_path.is_symlink():
@@ -270,10 +290,10 @@ def preflight_output(out_path: str, overwrite: bool = False) -> PreparedTarget:
     if not isinstance(overwrite, bool):
         raise ImageOutputError("overwrite must be a boolean")
 
-    target = Path(out_path)
     probe_path = None
     try:
-        prepared = prepare_target(target)
+        prepared = prepare_target(Path(out_path))
+        target = prepared.path
         if os.path.lexists(target):
             if not overwrite:
                 raise ImageOutputError(

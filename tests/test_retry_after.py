@@ -42,6 +42,7 @@ def image_bytes(image_format="JPEG", size=(160, 90)):
 class JsonResponse:
     def __init__(self, payload):
         self.payload = json.dumps(payload).encode("utf-8")
+        self.stream = io.BytesIO(self.payload)
         self.headers = {}
 
     def __enter__(self):
@@ -50,8 +51,8 @@ class JsonResponse:
     def __exit__(self, exc_type, exc, traceback):
         return False
 
-    def read(self, _size=-1):
-        return self.payload
+    def read(self, size=-1):
+        return self.stream.read(size)
 
 
 class StreamResponse:

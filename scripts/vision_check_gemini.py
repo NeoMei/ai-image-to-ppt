@@ -26,6 +26,11 @@ DEFAULT_QUESTION = "详细描述这张图片: 配色、布局、文字内容、�
 SECRET_PATH = Path("~/.secrets/gemini_api_key").expanduser()
 API_ROOT = "https://generativelanguage.googleapis.com/v1beta/models"
 REQUEST_TIMEOUT = 60
+# Gemini text inspections should stay compact. Keep response and diagnostic
+# bodies bounded independently so an upstream service cannot exhaust memory.
+MAX_RESPONSE_BYTES = 1024 * 1024
+MAX_ERROR_BODY_BYTES = 64 * 1024
+RESPONSE_READ_CHUNK_BYTES = 64 * 1024
 # Inline request bodies have a 20 MB limit. Four-thirds Base64 expansion and
 # JSON overhead make 14 MiB a safe raw-image ceiling.
 MAX_IMAGE_BYTES = 14 * 1024 * 1024
@@ -56,6 +61,28 @@ def _redact(value: object, key: str) -> str:
     if key:
         text = text.replace(key, "[REDACTED]")
     return GOOGLE_KEY_PATTERN.sub("[REDACTED]", text)[:300]
+
+
+def _read_bounded_body(stream: object, limit: int, label: str) -> bytes:
+    """Read a response stream incrementally, rejecting anything over ``limit``."""
+    chunks = []
+    total = 0
+    while True:
+        read_size = min(RESPONSE_READ_CHUNK_BYTES, limit - total + 1)
+        try:
+            chunk = stream.read(read_size)
+        except TypeError as error:
+            raise VisionCheckError(
+                f"{label} reader does not support bounded reads"
+            ) from error
+        if not isinstance(chunk, (bytes, bytearray)):
+            raise VisionCheckError(f"{label} reader returned non-bytes data")
+        if not chunk:
+            return b"".join(chunks)
+        total += len(chunk)
+        if total > limit:
+            raise VisionCheckError(f"{label} exceeds {limit} bytes")
+        chunks.append(bytes(chunk))
 
 
 def _read_image(img_path: str) -> tuple[bytes, str]:
@@ -111,7 +138,7 @@ def _read_image(img_path: str) -> tuple[bytes, str]:
 
 def _http_error_message(error: urllib.error.HTTPError, key: str) -> str:
     try:
-        raw = error.read()
+        raw = _read_bounded_body(error, MAX_ERROR_BODY_BYTES, "Gemini error body")
         if isinstance(raw, bytes):
             raw = raw.decode("utf-8")
         if not isinstance(raw, str):
@@ -121,6 +148,8 @@ def _http_error_message(error: urllib.error.HTTPError, key: str) -> str:
         message = details.get("message") if isinstance(details, dict) else None
         if isinstance(message, str) and message.strip():
             return _redact(message.strip(), key)
+    except VisionCheckError:
+        raise
     except Exception:
         pass
     return _redact(error.reason or "request failed", key)
@@ -192,9 +221,16 @@ def check(img_path: str, question: str = None, retries: int = 2) -> str:
         )
         try:
             with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT) as response:
-                raw_response = response.read()
+                raw_response = _read_bounded_body(
+                    response, MAX_RESPONSE_BYTES, "Gemini response body"
+                )
         except urllib.error.HTTPError as error:
-            message = _http_error_message(error, key)
+            try:
+                message = _http_error_message(error, key)
+            except VisionCheckError as body_error:
+                raise VisionCheckError(
+                    f"Gemini HTTP {error.code}: {body_error}"
+                ) from error
             failure = VisionCheckError(f"Gemini HTTP {error.code}: {message}")
             if (error.code == 429 or error.code >= 500) and attempt < retries:
                 time.sleep(retry_delay(attempt, error.headers))

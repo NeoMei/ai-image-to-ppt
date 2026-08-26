@@ -28,6 +28,7 @@ def image_bytes(image_format="JPEG", size=(160, 90)):
 class FakeResponse:
     def __init__(self, payload):
         self.payload = json.dumps(payload).encode("utf-8")
+        self.stream = io.BytesIO(self.payload)
 
     def __enter__(self):
         return self
@@ -35,8 +36,8 @@ class FakeResponse:
     def __exit__(self, exc_type, exc, tb):
         return False
 
-    def read(self):
-        return self.payload
+    def read(self, size=-1):
+        return self.stream.read(size)
 
 
 class ReadFailureResponse:
@@ -49,13 +50,14 @@ class ReadFailureResponse:
     def __exit__(self, exc_type, exc, tb):
         return False
 
-    def read(self):
+    def read(self, _size=-1):
         raise self.error
 
 
 class RawResponse:
     def __init__(self, payload):
         self.payload = payload
+        self.returned = False
 
     def __enter__(self):
         return self
@@ -63,7 +65,10 @@ class RawResponse:
     def __exit__(self, exc_type, exc, tb):
         return False
 
-    def read(self):
+    def read(self, _size=-1):
+        if self.returned:
+            return b""
+        self.returned = True
         return self.payload
 
 
@@ -155,7 +160,7 @@ class OpenAIGenerationTests(unittest.TestCase):
 
     def test_malformed_json_does_not_overwrite_existing_file(self):
         response = mock.MagicMock()
-        response.__enter__.return_value.read.return_value = b"{not-json"
+        response.__enter__.return_value = io.BytesIO(b"{not-json")
         with tempfile.TemporaryDirectory() as temp_dir:
             out_path = Path(temp_dir) / "slide.jpg"
             out_path.write_bytes(b"existing")

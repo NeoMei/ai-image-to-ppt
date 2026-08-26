@@ -229,27 +229,65 @@ def _publish_pair(
         for temporary, target in zip(temporary_paths, targets):
             if parent is not None:
                 verify_parent_identity(parent)
-            os.replace(temporary, target)
-            published.append(target)
+            temporary_stat = os.stat(temporary, follow_symlinks=False)
+            os.link(temporary, target)
+            published.append(
+                (target, temporary_stat.st_dev, temporary_stat.st_ino)
+            )
         publication_succeeded = True
     except Exception as publication_error:
-        for target in reversed(published):
+        cleanup_errors = []
+        for target, temporary_device, temporary_inode in reversed(published):
+            if target in backups:
+                continue
             try:
-                target.unlink()
+                target_stat = os.stat(target, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            except OSError as error:
+                cleanup_errors.append((target, error))
+                continue
+            if (
+                temporary_device != target_stat.st_dev
+                or temporary_inode != target_stat.st_ino
+            ):
+                cleanup_errors.append(
+                    (
+                        target,
+                        OSError(
+                            "published output ownership changed; "
+                            "external target preserved"
+                        ),
+                    )
+                )
+                continue
+            try:
+                os.unlink(target)
             except FileNotFoundError:
                 pass
-        rollback_errors = []
+            except OSError as error:
+                cleanup_errors.append((target, error))
+
+        restore_errors = []
         for target, backup in backups.items():
-            if os.path.exists(backup):
-                try:
-                    os.replace(backup, target)
-                except OSError as error:
-                    rollback_errors.append((backup, target, error))
-        if rollback_errors:
-            preserved = ", ".join(item[0] for item in rollback_errors)
+            try:
+                os.replace(backup, target)
+            except OSError as error:
+                restore_errors.append((backup, target, error))
+
+        if cleanup_errors or restore_errors:
+            details = []
+            if cleanup_errors:
+                failures = ", ".join(
+                    f"{path} ({error})" for path, error in cleanup_errors
+                )
+                details.append(f"could not remove published outputs: {failures}")
+            if restore_errors:
+                preserved = ", ".join(item[0] for item in restore_errors)
+                details.append(f"backups preserved at: {preserved}")
             raise OSError(
-                "publication failed and rollback could not restore all outputs; "
-                f"backups preserved at: {preserved}"
+                "publication failed and rollback was incomplete; "
+                + "; ".join(details)
             ) from publication_error
         raise
     finally:
@@ -270,6 +308,7 @@ def _export_deck_owned(
     files: Sequence[str], output_prefix: str, force: bool = False
 ) -> None:
     """Build PDF and PPTX completely, then publish them as one logical pair."""
+    output_prefix = os.path.abspath(output_prefix)
     targets = (Path(f"{output_prefix}.pdf"), Path(f"{output_prefix}.pptx"))
     parent = prepare_target(targets[0]).parent
     images = _load_all(files)

@@ -1,4 +1,5 @@
 import base64
+import http.client
 import io
 import json
 import os
@@ -45,6 +46,7 @@ def png_header(width, height):
 class JsonResponse:
     def __init__(self, payload):
         self.payload = json.dumps(payload).encode("utf-8")
+        self.stream = io.BytesIO(self.payload)
         self.headers = {}
 
     def __enter__(self):
@@ -53,8 +55,8 @@ class JsonResponse:
     def __exit__(self, exc_type, exc, tb):
         return False
 
-    def read(self, _size=-1):
-        return self.payload
+    def read(self, size=-1):
+        return self.stream.read(size)
 
 
 class StreamResponse:
@@ -86,6 +88,43 @@ class RecordingOversizedResponse:
     def read(self, size=-1):
         self.read_sizes.append(size)
         return b"x" * max(size, 0)
+
+
+class ChunkedResponse:
+    def __init__(self, chunks):
+        self.chunks = list(chunks)
+        self.read_sizes = []
+
+    def read(self, size):
+        self.read_sizes.append(size)
+        if not self.chunks:
+            return b""
+        chunk = self.chunks.pop(0)
+        if len(chunk) > size:
+            raise AssertionError("test chunk exceeded the requested read size")
+        return chunk
+
+
+class UnsizedOnlyResponse:
+    def __init__(self):
+        self.sized_reads = 0
+        self.unsized_reads = 0
+
+    def read(self, *args):
+        if args:
+            self.sized_reads += 1
+            raise TypeError("read() takes no arguments")
+        self.unsized_reads += 1
+        return b"x" * 1024
+
+
+class EndlessTinyResponse:
+    def __init__(self):
+        self.reads = 0
+
+    def read(self, _size):
+        self.reads += 1
+        return b"x"
 
 
 class SharedImageLimitTests(unittest.TestCase):
@@ -151,6 +190,68 @@ class SharedImageLimitTests(unittest.TestCase):
 
 
 class ProviderResourceBoundaryTests(unittest.TestCase):
+    def test_response_reader_never_falls_back_to_unbounded_read(self):
+        response = UnsizedOnlyResponse()
+        with mock.patch.object(image_output, "MAX_PROVIDER_RESPONSE_BYTES", 16), \
+             self.assertRaisesRegex(
+                 image_output.ImageOutputError,
+                 "bounded reads",
+             ):
+            image_output.read_response_body(response)
+
+        self.assertEqual(response.sized_reads, 1)
+        self.assertEqual(response.unsized_reads, 0)
+
+    def test_response_reader_accumulates_real_chunked_stream_within_limit(self):
+        response = ChunkedResponse([b"ab", b"cd", b"e", b""])
+        with mock.patch.object(image_output, "MAX_PROVIDER_RESPONSE_BYTES", 5):
+            self.assertEqual(image_output.read_response_body(response), b"abcde")
+
+        self.assertEqual(response.read_sizes, [6, 4, 2, 1])
+
+    def test_response_reader_rejects_chunked_stream_at_max_plus_one(self):
+        response = ChunkedResponse([b"ab", b"cde"])
+        with mock.patch.object(image_output, "MAX_PROVIDER_RESPONSE_BYTES", 4), \
+             self.assertRaisesRegex(
+                 image_output.ImageOutputError,
+                 "exceeds maximum size",
+             ):
+            image_output.read_response_body(response)
+
+        self.assertEqual(response.read_sizes, [5, 3])
+
+    def test_response_reader_rejects_non_bytes_chunk(self):
+        response = ChunkedResponse(["not bytes"])
+        with self.assertRaisesRegex(
+            image_output.ImageOutputError,
+            "body must be bytes",
+        ):
+            image_output.read_response_body(response)
+
+    def test_response_reader_classifies_transport_failures_as_retryable(self):
+        for error in (OSError("socket reset"), http.client.IncompleteRead(b"x", 2)):
+            with self.subTest(error=type(error).__name__):
+                response = mock.Mock()
+                response.read.side_effect = error
+                with self.assertRaises(image_output.ImageStreamError):
+                    image_output.read_response_body(response)
+
+    def test_response_reader_rejects_stream_that_never_reaches_eof(self):
+        response = EndlessTinyResponse()
+        with mock.patch.object(image_output, "MAX_PROVIDER_RESPONSE_BYTES", 100), \
+             mock.patch.object(
+                 image_output,
+                 "MAX_PROVIDER_RESPONSE_READS",
+                 3,
+                 create=True,
+             ), self.assertRaisesRegex(
+                 image_output.ImageOutputError,
+                 "too many chunks",
+             ):
+            image_output.read_response_body(response)
+
+        self.assertEqual(response.reads, 3)
+
     def test_bomb_header_is_controlled_for_all_three_providers(self):
         bomb = png_header(17_920, 10_080)
         cases = (

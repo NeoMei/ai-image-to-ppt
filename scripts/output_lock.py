@@ -1,20 +1,35 @@
 """Fail-fast cross-thread and cross-process ownership for output paths."""
 
 import errno
-import fcntl
 import hashlib
 import os
 import tempfile
 import threading
+import unicodedata
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator, Union
+from typing import Iterator, Tuple, Union
+
+try:
+    import fcntl as _fcntl
+except ImportError:  # pragma: no cover - exercised by isolated import tests
+    _fcntl = None
+
+if _fcntl is None:
+    try:
+        import msvcrt as _msvcrt
+    except ImportError:  # pragma: no cover - exercised by isolated import tests
+        _msvcrt = None
+else:
+    _msvcrt = None
 
 
 PathValue = Union[str, os.PathLike]
 _LOCK_DIRECTORY = Path(tempfile.gettempdir()) / "ai-image-to-ppt-output-locks"
 _REGISTRY_GUARD = threading.Lock()
 _THREAD_LOCKS = {}
+_SEMANTICS_GUARD = threading.Lock()
+_FILESYSTEM_SEMANTICS = {}
 
 
 class OutputLockError(OSError):
@@ -25,11 +40,90 @@ class OutputLockBusy(OutputLockError):
     """Raised when another live caller owns the same output."""
 
 
+def _nearest_existing_directory(path: Path) -> Path:
+    candidate = path.parent
+    while not candidate.exists():
+        parent = candidate.parent
+        if parent == candidate:
+            break
+        candidate = parent
+    if not candidate.is_dir():
+        raise OutputLockError(
+            f"cannot determine output filesystem semantics: {candidate} "
+            "is not a directory"
+        )
+    return candidate
+
+
+def _probe_filesystem_semantics(directory: Path) -> Tuple[bool, bool]:
+    descriptor = None
+    probe_path = None
+    try:
+        descriptor, probe_path = tempfile.mkstemp(
+            prefix=".ai-image-to-ppt-case-probe-é-",
+            dir=str(directory),
+        )
+        os.close(descriptor)
+        descriptor = None
+        probe = Path(probe_path)
+        case_alias = probe.with_name(
+            probe.name.replace("case-probe", "CASE-PROBE", 1)
+        )
+        unicode_alias = probe.with_name(unicodedata.normalize("NFD", probe.name))
+
+        def aliases_same_file(alias: Path) -> bool:
+            try:
+                return alias.exists() and os.path.samefile(str(probe), str(alias))
+            except OSError:
+                return False
+
+        return aliases_same_file(case_alias), aliases_same_file(unicode_alias)
+    except OSError as error:
+        raise OutputLockError(
+            f"cannot determine output filesystem semantics: {error}"
+        ) from error
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        if probe_path is not None:
+            try:
+                os.unlink(probe_path)
+            except OSError:
+                pass
+
+
+def _filesystem_semantics(path: Path) -> Tuple[bool, bool]:
+    directory = _nearest_existing_directory(path)
+    try:
+        device = directory.stat().st_dev
+    except OSError as error:
+        raise OutputLockError(
+            f"cannot determine output filesystem identity: {error}"
+        ) from error
+    with _SEMANTICS_GUARD:
+        semantics = _FILESYSTEM_SEMANTICS.get(device)
+        if semantics is None:
+            semantics = _probe_filesystem_semantics(directory)
+            _FILESYSTEM_SEMANTICS[device] = semantics
+        return semantics
+
+
 def _identity(target: PathValue, namespace: str) -> str:
     try:
-        canonical = str(Path(target).expanduser().resolve(strict=False))
+        canonical_path = Path(target).expanduser().resolve(strict=False)
     except (TypeError, ValueError, OSError) as error:
         raise OutputLockError(f"invalid output lock target: {error}") from error
+    case_insensitive, normalization_insensitive = _filesystem_semantics(
+        canonical_path
+    )
+    canonical = str(canonical_path)
+    if normalization_insensitive:
+        canonical = unicodedata.normalize("NFC", canonical)
+    if case_insensitive:
+        canonical = canonical.casefold()
     return f"{namespace}\0{canonical}"
 
 
@@ -58,9 +152,39 @@ def _open_lock_file(path: Path) -> int:
         flags = os.O_RDWR | os.O_CREAT
         flags |= getattr(os, "O_CLOEXEC", 0)
         flags |= getattr(os, "O_NOFOLLOW", 0)
-        return os.open(str(path), flags, 0o600)
+        descriptor = os.open(str(path), flags, 0o600)
+        if _msvcrt is not None:
+            if os.fstat(descriptor).st_size < 1:
+                os.write(descriptor, b"\0")
+            os.lseek(descriptor, 0, os.SEEK_SET)
+        return descriptor
     except OSError as error:
         raise OutputLockError(f"cannot open output lock: {error}") from error
+
+
+def _busy_lock_error(error: OSError) -> bool:
+    return error.errno in (errno.EACCES, errno.EAGAIN, errno.EDEADLK) or getattr(
+        error, "winerror", None
+    ) in (33, 36)
+
+
+def _acquire_process_lock(descriptor: int) -> None:
+    if _fcntl is not None:
+        _fcntl.flock(descriptor, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+        return
+    if _msvcrt is not None:
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        _msvcrt.locking(descriptor, _msvcrt.LK_NBLCK, 1)
+        return
+    raise OutputLockError("no supported process lock backend is available")
+
+
+def _release_process_lock(descriptor: int) -> None:
+    if _fcntl is not None:
+        _fcntl.flock(descriptor, _fcntl.LOCK_UN)
+    elif _msvcrt is not None:
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        _msvcrt.locking(descriptor, _msvcrt.LK_UNLCK, 1)
 
 
 @contextmanager
@@ -77,12 +201,14 @@ def output_lock(
     descriptor = None
     file_locked = False
     try:
+        if _fcntl is None and _msvcrt is None:
+            raise OutputLockError("no supported process lock backend is available")
         descriptor = _open_lock_file(_lock_file_for_identity(identity))
         try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            _acquire_process_lock(descriptor)
             file_locked = True
         except OSError as error:
-            if error.errno in (errno.EACCES, errno.EAGAIN):
+            if _busy_lock_error(error):
                 raise OutputLockBusy(f"output is busy: {Path(target)}") from error
             raise OutputLockError(f"cannot acquire output lock: {error}") from error
         yield
@@ -91,7 +217,7 @@ def output_lock(
             if descriptor is not None:
                 if file_locked:
                     try:
-                        fcntl.flock(descriptor, fcntl.LOCK_UN)
+                        _release_process_lock(descriptor)
                     except OSError:
                         pass
                 os.close(descriptor)

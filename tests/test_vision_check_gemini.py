@@ -25,6 +25,8 @@ class FakeResponse:
             self.payload = payload
         else:
             self.payload = json.dumps(payload).encode("utf-8")
+        self.stream = io.BytesIO(self.payload)
+        self.read_sizes = []
 
     def __enter__(self):
         return self
@@ -32,8 +34,35 @@ class FakeResponse:
     def __exit__(self, exc_type, exc, traceback):
         return False
 
+    def read(self, size=-1):
+        self.read_sizes.append(size)
+        return self.stream.read(size)
+
+
+class UnsizedOnlyResponse(FakeResponse):
     def read(self):
         return self.payload
+
+
+class RecordingBody(io.BytesIO):
+    def __init__(self, payload):
+        super().__init__(payload)
+        self.read_sizes = []
+
+    def read(self, size=-1):
+        self.read_sizes.append(size)
+        return super().read(size)
+
+
+class UnsizedOnlyBody:
+    def __init__(self, payload):
+        self.payload = payload
+
+    def read(self):
+        return self.payload
+
+    def close(self):
+        pass
 
 
 def make_image(path: Path, image_format: str = "PNG") -> None:
@@ -216,6 +245,50 @@ class GeminiVisionResponseTests(unittest.TestCase):
             vision_check_gemini.check(str(image_path), retries=0), "found"
         )
 
+    def test_success_body_is_accumulated_using_only_bounded_reads(self):
+        response = successful_response("bounded")
+        image_path, _ = self._check_with_response(response)
+        with mock.patch.object(
+            vision_check_gemini,
+            "MAX_RESPONSE_BYTES",
+            len(response.payload),
+            create=True,
+        ):
+            self.assertEqual(
+                vision_check_gemini.check(str(image_path), retries=0),
+                "bounded",
+            )
+
+        self.assertGreaterEqual(len(response.read_sizes), 2)
+        self.assertTrue(all(size > 0 for size in response.read_sizes))
+
+    def test_oversized_success_body_is_controlled_without_retry_or_secret_leak(self):
+        response = successful_response("known-secret-key" * 10)
+        image_path, urlopen = self._check_with_response(response)
+        with mock.patch.object(
+            vision_check_gemini, "MAX_RESPONSE_BYTES", 32, create=True
+        ):
+            with self.assertRaises(vision_check_gemini.VisionCheckError) as raised:
+                vision_check_gemini.check(str(image_path), retries=2)
+
+        message = str(raised.exception)
+        self.assertIn("response body exceeds 32 bytes", message)
+        self.assertNotIn("known-secret-key", message)
+        self.assertEqual(urlopen.call_count, 1)
+        self.assertTrue(all(size > 0 for size in response.read_sizes))
+
+    def test_success_reader_without_sized_read_is_a_controlled_non_retryable_error(self):
+        response = UnsizedOnlyResponse({
+            "candidates": [{"content": {"parts": [{"text": "hidden"}]}}]
+        })
+        image_path, urlopen = self._check_with_response(response)
+        with self.assertRaisesRegex(
+            vision_check_gemini.VisionCheckError,
+            "does not support bounded reads",
+        ):
+            vision_check_gemini.check(str(image_path), retries=2)
+        self.assertEqual(urlopen.call_count, 1)
+
     def test_malformed_json_empty_candidates_empty_parts_and_safety_block_are_controlled(self):
         responses = [
             FakeResponse(b"{not-json"),
@@ -261,6 +334,74 @@ class GeminiVisionResponseTests(unittest.TestCase):
                 self.assertNotIn("known-secret-key", message)
                 self.assertNotIn("AIzaSyRemoteSecret1234567890", message)
                 self.assertEqual(urlopen.call_count, 1)
+
+    def test_http_error_body_is_accumulated_using_only_bounded_reads(self):
+        payload = json.dumps({"error": {"message": "safe failure"}}).encode("utf-8")
+        body = RecordingBody(payload)
+        error = urllib.error.HTTPError(
+            "https://example.invalid", 400, "failed", {}, body
+        )
+        image_path, _ = self._check_with_response(error)
+        with mock.patch.object(
+            vision_check_gemini,
+            "MAX_ERROR_BODY_BYTES",
+            len(payload),
+            create=True,
+        ):
+            with self.assertRaisesRegex(
+                vision_check_gemini.VisionCheckError,
+                "Gemini HTTP 400: safe failure",
+            ):
+                vision_check_gemini.check(str(image_path), retries=0)
+
+        self.assertGreaterEqual(len(body.read_sizes), 2)
+        self.assertTrue(all(size > 0 for size in body.read_sizes))
+
+    def test_oversized_http_error_body_is_controlled_without_retry_or_secret_leak(self):
+        payload = json.dumps({
+            "error": {"message": "known-secret-key" * 10}
+        }).encode("utf-8")
+        body = RecordingBody(payload)
+        error = urllib.error.HTTPError(
+            "https://example.invalid",
+            503,
+            "known-secret-key",
+            {"Retry-After": "60"},
+            body,
+        )
+        image_path, urlopen = self._check_with_response(error)
+        with mock.patch.object(
+            vision_check_gemini, "MAX_ERROR_BODY_BYTES", 32, create=True
+        ), \
+             mock.patch.object(vision_check_gemini.time, "sleep") as sleep:
+            with self.assertRaises(vision_check_gemini.VisionCheckError) as raised:
+                vision_check_gemini.check(str(image_path), retries=2)
+
+        message = str(raised.exception)
+        self.assertIn("Gemini HTTP 503", message)
+        self.assertIn("error body exceeds 32 bytes", message)
+        self.assertNotIn("known-secret-key", message)
+        self.assertEqual(urlopen.call_count, 1)
+        sleep.assert_not_called()
+        self.assertTrue(all(size > 0 for size in body.read_sizes))
+
+    def test_http_error_reader_without_sized_read_is_controlled_and_not_retried(self):
+        body = UnsizedOnlyBody(json.dumps({
+            "error": {"message": "known-secret-key"}
+        }).encode("utf-8"))
+        error = urllib.error.HTTPError(
+            "https://example.invalid", 503, "known-secret-key", {}, body
+        )
+        image_path, urlopen = self._check_with_response(error)
+        with mock.patch.object(vision_check_gemini.time, "sleep") as sleep:
+            with self.assertRaises(vision_check_gemini.VisionCheckError) as raised:
+                vision_check_gemini.check(str(image_path), retries=2)
+
+        message = str(raised.exception)
+        self.assertIn("does not support bounded reads", message)
+        self.assertNotIn("known-secret-key", message)
+        self.assertEqual(urlopen.call_count, 1)
+        sleep.assert_not_called()
 
     def test_429_and_5xx_are_retried_then_succeed(self):
         for status in (429, 500, 503):
