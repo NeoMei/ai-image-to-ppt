@@ -23,7 +23,9 @@ class RouterTests(unittest.TestCase):
             self.assertTrue(gen_slide.gen("prompt", "slide.jpg"))
 
         import_module.assert_called_once_with("gen_slide_openai")
-        provider_gen.assert_called_once_with("prompt", "slide.jpg", retries=2)
+        provider_gen.assert_called_once_with(
+            "prompt", "slide.jpg", retries=2, overwrite=False
+        )
 
     def test_each_named_engine_is_lazy_loaded(self):
         expected = {
@@ -41,7 +43,9 @@ class RouterTests(unittest.TestCase):
                 ) as import_module:
                     self.assertTrue(gen_slide.gen("prompt", "slide.jpg", engine=engine, retries=4))
                 import_module.assert_called_once_with(module_name)
-                provider_gen.assert_called_once_with("prompt", "slide.jpg", retries=4)
+                provider_gen.assert_called_once_with(
+                    "prompt", "slide.jpg", retries=4, overwrite=False
+                )
 
     def test_unknown_engine_fails_without_importing(self):
         with mock.patch.object(gen_slide.importlib, "import_module") as import_module:
@@ -53,7 +57,11 @@ class RouterTests(unittest.TestCase):
             exit_code = gen_slide.main(["slide.jpg", "draw a slide"])
         self.assertEqual(exit_code, 0)
         generate.assert_called_once_with(
-            "draw a slide", "slide.jpg", engine="openai", retries=2
+            "draw a slide",
+            "slide.jpg",
+            engine="openai",
+            retries=2,
+            overwrite=False,
         )
 
     def test_cli_passes_explicit_engine_and_retry_count(self):
@@ -68,7 +76,24 @@ class RouterTests(unittest.TestCase):
             ])
         self.assertEqual(exit_code, 1)
         generate.assert_called_once_with(
-            "draw a slide", "slide.png", engine="gemini", retries=5
+            "draw a slide",
+            "slide.png",
+            engine="gemini",
+            retries=5,
+            overwrite=False,
+        )
+
+    def test_cli_force_requests_explicit_overwrite(self):
+        with mock.patch.object(gen_slide, "gen", return_value=True) as generate:
+            exit_code = gen_slide.main(["slide.png", "prompt", "--force"])
+
+        self.assertEqual(exit_code, 0)
+        generate.assert_called_once_with(
+            "prompt",
+            "slide.png",
+            engine="openai",
+            retries=2,
+            overwrite=True,
         )
 
     def test_python_router_rejects_negative_retries_before_importing(self):
@@ -77,6 +102,38 @@ class RouterTests(unittest.TestCase):
                 gen_slide.gen("prompt", "slide.jpg", engine="openai", retries=-1)
             )
         import_module.assert_not_called()
+
+    def test_python_router_rejects_invalid_retry_types_before_importing(self):
+        for retries in ("2", 1.5, None, True, [], -1):
+            with self.subTest(retries=retries), mock.patch.object(
+                gen_slide.importlib, "import_module"
+            ) as import_module:
+                self.assertFalse(
+                    gen_slide.gen(
+                        "prompt", "slide.jpg", engine="openai", retries=retries
+                    )
+                )
+                import_module.assert_not_called()
+
+    def test_import_failure_is_controlled(self):
+        with mock.patch.object(
+            gen_slide.importlib,
+            "import_module",
+            side_effect=ModuleNotFoundError("missing dependency"),
+        ):
+            self.assertFalse(gen_slide.gen("prompt", "slide.jpg"))
+
+    def test_unexpected_provider_failure_is_controlled_without_secret_echo(self):
+        provider = SimpleNamespace(
+            gen=mock.Mock(side_effect=OSError("failed with sk-secret-value"))
+        )
+        output = io.StringIO()
+        with mock.patch.object(
+            gen_slide.importlib, "import_module", return_value=provider
+        ), mock.patch("sys.stdout", output):
+            self.assertFalse(gen_slide.gen("prompt", "slide.jpg"))
+
+        self.assertNotIn("sk-secret-value", output.getvalue())
 
     def test_cli_rejects_negative_retries_with_usage_error(self):
         stderr = io.StringIO()

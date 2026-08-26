@@ -1,34 +1,45 @@
 #!/usr/bin/env python3
-"""Gemini nano banana 2 图像生成（显式备用引擎）.
+"""Gemini image generation (explicit fallback engine)."""
 
-依赖:
-  - ~/.secrets/gemini_api_key  (从 https://aistudio.google.com/apikey 获取)
-
-用法:
-  # 单张
-  python3 gen_slide_gemini.py <输出路径.jpg> "<prompt>"
-  # 脚本内调用
-  from gen_slide_gemini import gen
-  gen("<prompt>", "<输出路径.jpg>")
-"""
-import base64
+import argparse
+import http.client
 import json
+import os
 import re
-import sys
 import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+from typing import Optional, Sequence
+
+from image_output import (
+    ImageOutputError,
+    decode_base64,
+    expected_mime_type,
+    preflight_output,
+    publish_bytes,
+    validate_retries,
+)
 
 SECRET_PATH = Path("~/.secrets/gemini_api_key").expanduser()
+DEFAULT_MODEL = "gemini-3.1-flash-image"
 URL_TEMPLATE = (
     "https://generativelanguage.googleapis.com/v1beta/models/"
-    "gemini-3.1-flash-image-preview:generateContent?key={}"
+    "{}:generateContent"
 )
 KEY_LIKE_PATTERN = re.compile(r"(?<![A-Za-z0-9_-])sk-[A-Za-z0-9_-]+")
+TRANSPORT_ERRORS = (
+    urllib.error.URLError,
+    TimeoutError,
+    OSError,
+    http.client.HTTPException,
+)
 
 
 def _load_api_key() -> str:
+    key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if key:
+        return key
     try:
         return SECRET_PATH.read_text(encoding="utf-8").strip()
     except (OSError, UnicodeError):
@@ -39,12 +50,12 @@ def _redact(message: object, key: str) -> str:
     text = str(message)
     if key:
         text = text.replace(key, "[REDACTED]")
-    return KEY_LIKE_PATTERN.sub("[REDACTED]", text)[:200]
+    return KEY_LIKE_PATTERN.sub("[REDACTED]", text)[:300]
 
 
 def _http_error_message(error: urllib.error.HTTPError, key: str) -> str:
     if error.code in (401, 403):
-        return "authentication failed; check ~/.secrets/gemini_api_key"
+        return "authentication failed; check GEMINI_API_KEY or ~/.secrets/gemini_api_key"
     try:
         raw_body = error.read()
         if isinstance(raw_body, bytes):
@@ -59,57 +70,133 @@ def _http_error_message(error: urllib.error.HTTPError, key: str) -> str:
     return _redact(error.reason or "request failed", key)
 
 
-def gen(prompt: str, out_path: str, retries: int = 2) -> bool:
-    """生成单张图. 成功返回 True."""
-    if retries < 0:
-        print("  ERR: retries must be non-negative")
+def _extract_image(payload: object, target: Path) -> bytes:
+    if not isinstance(payload, dict):
+        raise ImageOutputError("response envelope must be an object")
+    candidates = payload.get("candidates")
+    if not isinstance(candidates, list) or not candidates:
+        raise ImageOutputError("response candidates must be a non-empty list")
+    first = candidates[0]
+    if not isinstance(first, dict):
+        raise ImageOutputError("response candidate must be an object")
+    content = first.get("content")
+    if not isinstance(content, dict):
+        raise ImageOutputError("response content must be an object")
+    parts = content.get("parts")
+    if not isinstance(parts, list):
+        raise ImageOutputError("response parts must be a list")
+
+    for part in parts:
+        if not isinstance(part, dict):
+            continue
+        inline = part.get("inlineData") or part.get("inline_data")
+        if not isinstance(inline, dict) or not inline.get("data"):
+            continue
+        declared_mime = inline.get("mimeType") or inline.get("mime_type")
+        expected_mime = expected_mime_type(str(target))
+        if declared_mime is not None and not isinstance(declared_mime, str):
+            raise ImageOutputError("response MIME type must be text")
+        if declared_mime and declared_mime.lower() != expected_mime:
+            raise ImageOutputError(
+                f"response MIME type {declared_mime} does not match {target.suffix.lower()}"
+            )
+        return decode_base64(inline.get("data"))
+    raise ImageOutputError("response contains no image data")
+
+
+def gen(
+    prompt: str,
+    out_path: str,
+    retries: int = 2,
+    overwrite: bool = False,
+) -> bool:
+    """Generate one strict 16:9 image. Return True only after atomic publication."""
+    try:
+        retries = validate_retries(retries)
+        target = preflight_output(out_path, overwrite=overwrite)
+    except ImageOutputError as error:
+        print(f"  ERR: {error}")
         return False
 
     key = _load_api_key()
     if not key:
         print(
-            "  ERR: Gemini API key not found. Create "
+            "  ERR: Gemini API key not found. Set GEMINI_API_KEY or create "
             "~/.secrets/gemini_api_key (see README.md)"
         )
         return False
 
+    model = os.environ.get("GEMINI_IMAGE_MODEL", DEFAULT_MODEL).strip() or DEFAULT_MODEL
+    url = URL_TEMPLATE.format(model)
     body = json.dumps({
         "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"responseModalities": ["IMAGE"]},
-    }).encode()
-    req = urllib.request.Request(
-        URL_TEMPLATE.format(key),
-        data=body,
-        headers={"Content-Type": "application/json"},
-    )
+        "generationConfig": {
+            "responseModalities": ["IMAGE"],
+            "responseFormat": {
+                "image": {"aspectRatio": "16:9", "imageSize": "2K"}
+            },
+        },
+    }).encode("utf-8")
+
     for attempt in range(retries + 1):
+        request = urllib.request.Request(
+            url,
+            data=body,
+            headers={
+                "Content-Type": "application/json",
+                "X-Goog-Api-Key": key,
+            },
+        )
         try:
-            with urllib.request.urlopen(req, timeout=120) as r:
-                d = json.loads(r.read())
-            parts = d.get("candidates", [{}])[0].get("content", {}).get("parts", [])
-            for p in parts:
-                data = p.get("inlineData") or p.get("inline_data")
-                if data and data.get("data"):
-                    b = base64.b64decode(data["data"])
-                    with open(out_path, "wb") as f:
-                        f.write(b)
-                    print(f"  OK: {out_path} ({len(b)//1024}KB)")
-                    return True
-            print(f"  无图片数据 (attempt {attempt+1})")
-        except urllib.error.HTTPError as e:
+            with urllib.request.urlopen(request, timeout=120) as response:
+                raw_response = response.read()
+        except urllib.error.HTTPError as error:
             print(
-                f"  HTTP {e.code}: {_http_error_message(e, key)} "
-                f"(attempt {attempt+1})"
+                f"  HTTP {error.code}: {_http_error_message(error, key)} "
+                f"(attempt {attempt + 1})"
             )
-        except Exception as e:
-            print(f"  ERR: {_redact(e, key)} (attempt {attempt+1})")
-        if attempt < retries:
-            time.sleep(2)
+            if (error.code == 429 or error.code >= 500) and attempt < retries:
+                time.sleep(2)
+                continue
+            return False
+        except TRANSPORT_ERRORS as error:
+            print(f"  ERR: {_redact(error, key)} (attempt {attempt + 1})")
+            if attempt < retries:
+                time.sleep(2)
+                continue
+            return False
+
+        try:
+            payload = json.loads(raw_response)
+            image = _extract_image(payload, target)
+            byte_count = publish_bytes(image, target, overwrite=overwrite)
+        except (TypeError, ValueError, UnicodeError, OSError) as error:
+            print(f"  ERR: invalid image response or output failure: {_redact(error, key)}")
+            return False
+
+        print(
+            f"  OK: {_redact(target, key)} "
+            f"({byte_count // 1024}KB, Gemini {_redact(model, key)})"
+        )
+        return True
+
     return False
 
 
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("output_path", help="Output .jpg, .jpeg, .png, or .webp")
+    parser.add_argument("prompt", help="Slide image prompt")
+    parser.add_argument(
+        "--force", action="store_true", help="Atomically replace an existing output"
+    )
+    return parser
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    args = _parser().parse_args(argv)
+    return 0 if gen(args.prompt, args.output_path, overwrite=args.force) else 1
+
+
 if __name__ == "__main__":
-    if len(sys.argv) >= 3:
-        ok = gen(sys.argv[2], sys.argv[1])
-        sys.exit(0 if ok else 1)
-    print("用法: gen_slide_gemini.py <输出路径.jpg> <prompt>")
+    raise SystemExit(main())

@@ -21,7 +21,7 @@ Generate 16:9 educational textbook-style slide images from any topic using OpenA
 
 ## Prerequisites
 
-One OpenAI key is sufficient for default generation:
+Python 3.9 or newer and one OpenAI key are sufficient for default generation:
 
 ```bash
 # Preferred
@@ -40,7 +40,7 @@ chmod 600 ~/.secrets/gemini_api_key
 printf '%s\n' "YOUR_DOUBAO_KEY" > ~/.secrets/doubao_api_key
 chmod 600 ~/.secrets/doubao_api_key
 
-pip install 'Pillow>=9.1' python-pptx
+python3 -m pip install -r requirements.txt
 ```
 
 Add a Gemini credential only for Gemini image generation or the visual self-check. Add a Doubao credential only when explicitly selecting Doubao. The exact secret-file paths above are what the legacy scripts read. Provider selection is explicit; generation does not automatically fall back.
@@ -53,10 +53,10 @@ All in `scripts/` directory. Copy to project or add to `PYTHONPATH`.
 |---|---|---|
 | `gen_slide.py` | Default provider router | OpenAI by default; Gemini and Doubao are explicit choices |
 | `gen_slide_openai.py` | OpenAI GPT Image 2 | `gpt-image-2`; 2048×1152, medium by default |
-| `gen_slide_gemini.py` | Gemini nano banana | `gemini-3.1-flash-image-preview` |
+| `gen_slide_gemini.py` | Gemini nano banana | `gemini-3.1-flash-image`; 16:9, 2K |
 | `gen_slide_doubao.py` | 方舟 doubao-seedream-5-0 | OpenAI-compatible API |
 | `prepare_editable_input.py` | Editable-converter handoff | Exact 1280x720 PNG |
-| `vision_check_gemini.py` | Gemini visual self-check | `gemini-2.0-flash` |
+| `vision_check_gemini.py` | Gemini visual self-check | `gemini-3.6-flash` |
 | `export_images.py` | Local export | PDF + PPTX |
 
 ## Workflow
@@ -88,14 +88,16 @@ PROMPTS = {
 }
 
 def gen_one(name, prompt):
-    ok = gen(prompt, f"out/{name}.jpg")
-    return name, ok
+    path = f"out/{name}.jpg"
+    if __import__('os').path.exists(path):
+        return name, "cached"
+    ok = gen(prompt, path)
+    return name, "done" if ok else "failed"
 
 with ThreadPoolExecutor(max_workers=8) as ex:
     futures = {ex.submit(gen_one, n, p): n for n, p in PROMPTS.items()}
     for f in as_completed(futures):
-        name, ok = f.result()
-        status = "done" if ok else "failed"
+        name, status = f.result()
         print(name, status)
 ```
 
@@ -129,6 +131,11 @@ files = sorted(__import__('glob').glob("out/*.jpg"))
 export_pdf(files, "deck.pdf")
 export_pptx(files, "deck.pptx")
 ```
+
+The CLI validates all source images before publishing, creates missing output
+directories, and treats the PDF/PPTX files as one transactional pair. Existing
+outputs are preserved unless `--force` is supplied. Transparent pixels are
+composited onto the style's cream `#f8f5f0` background rather than black.
 
 ## Style Template (Educational Textbook)
 
@@ -199,7 +206,7 @@ See `examples/chapters_meta.py` for a filled-in example.
 | Chinese 错字/糊字 | Run `vision_check_gemini.py` on samples, regenerate failures |
 | 风格不统一 | Always append the same `STYLE` block to every prompt |
 | Output not工整 (misaligned) | Don't embed raw images of varying dimensions; always go through normalize |
-| Gemini key 报 404 on vision | Use `gemini-2.0-flash` not `gemini-2.5-flash` (not all keys enabled) |
+| Gemini vision model unavailable | Use the current default `gemini-3.6-flash` or set `GEMINI_VISION_MODEL` to an enabled compatible model |
 | doubao chat 404 | Vision models need separate endpoint activation; image gen works |
 
 ## Real-World Reference
@@ -211,7 +218,7 @@ See `examples/chapters_meta.py` for a filled-in example.
 - **Concurrency sweet spot**: 4-8 workers. Higher triggers rate limits.
 - **OpenAI defaults and overrides**: Confirmed defaults are `gpt-image-2`, `2048x1152`, and `medium`. Override them with `OPENAI_IMAGE_MODEL`, `OPENAI_IMAGE_SIZE`, and `OPENAI_IMAGE_QUALITY` when needed.
 - **Retry behavior**: Providers retry some transient failures internally; surface final failures for manual handling. There is no automatic provider fallback.
-- **Output extensions**: OpenAI output extensions `.jpg`, `.jpeg`, `.png`, and `.webp` select matching API formats. Legacy Gemini and Doubao keep provider-returned encoding; conventionally use `.jpg` and do not assume suffix-based transcoding.
-- **Cache by file existence**: Skip already-generated files when re-running batch jobs.
+- **Output extensions**: All providers accept `.jpg`, `.jpeg`, `.png`, and `.webp`; the requested/returned encoding and strict 16:9 dimensions are validated before publication.
+- **Safe reruns**: Generation refuses existing outputs without contacting a provider. Treat that as cached in batch jobs; pass `overwrite=True` or `--force` only for intentional regeneration.
 - **First-page validation**: Generate 1 sample, visually confirm style, then batch.
 - **Pricing**: Provider pricing can change. Check the [OpenAI API pricing documentation](https://developers.openai.com/api/docs/pricing) instead of assuming a fixed per-image cost.

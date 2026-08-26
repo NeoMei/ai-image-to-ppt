@@ -11,10 +11,18 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
 
+from PIL import Image
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import gen_slide_openai
+
+
+def image_bytes(image_format="JPEG", size=(160, 90)):
+    buffer = io.BytesIO()
+    Image.new("RGB", size, "navy").save(buffer, format=image_format)
+    return buffer.getvalue()
 
 
 class FakeResponse:
@@ -82,9 +90,9 @@ class OpenAIConfigTests(unittest.TestCase):
 
 class OpenAIGenerationTests(unittest.TestCase):
     def test_success_uses_confirmed_defaults_and_writes_decoded_image(self):
-        image_bytes = b"fake-jpeg-bytes"
+        generated_image = image_bytes("JPEG")
         response = FakeResponse({
-            "data": [{"b64_json": base64.b64encode(image_bytes).decode("ascii")}]
+            "data": [{"b64_json": base64.b64encode(generated_image).decode("ascii")}]
         })
 
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -94,7 +102,7 @@ class OpenAIGenerationTests(unittest.TestCase):
                 ok = gen_slide_openai.gen("draw a slide", str(out_path), retries=0)
 
             self.assertTrue(ok)
-            self.assertEqual(out_path.read_bytes(), image_bytes)
+            self.assertEqual(out_path.read_bytes(), generated_image)
             request = urlopen.call_args.args[0]
             payload = json.loads(request.data)
             self.assertEqual(request.full_url, gen_slide_openai.API_URL)
@@ -108,7 +116,11 @@ class OpenAIGenerationTests(unittest.TestCase):
             })
 
     def test_environment_overrides_model_size_and_quality(self):
-        response = FakeResponse({"data": [{"b64_json": base64.b64encode(b"image").decode("ascii")}]})
+        response = FakeResponse({
+            "data": [{
+                "b64_json": base64.b64encode(image_bytes("PNG")).decode("ascii")
+            }]
+        })
         environment = {
             "OPENAI_API_KEY": "test-key",
             "OPENAI_IMAGE_MODEL": "gpt-image-test",
@@ -133,7 +145,11 @@ class OpenAIGenerationTests(unittest.TestCase):
             out_path.write_bytes(b"existing")
             with mock.patch.dict(os.environ, {"OPENAI_API_KEY": "test-key"}, clear=True), \
                  mock.patch.object(gen_slide_openai.urllib.request, "urlopen", return_value=response):
-                self.assertFalse(gen_slide_openai.gen("prompt", str(out_path), retries=0))
+                self.assertFalse(
+                    gen_slide_openai.gen(
+                        "prompt", str(out_path), retries=0, overwrite=True
+                    )
+                )
             self.assertEqual(out_path.read_bytes(), b"existing")
             self.assertEqual(list(Path(temp_dir).glob("*.tmp")), [])
 
@@ -145,7 +161,11 @@ class OpenAIGenerationTests(unittest.TestCase):
             out_path.write_bytes(b"existing")
             with mock.patch.dict(os.environ, {"OPENAI_API_KEY": "test-key"}, clear=True), \
                  mock.patch.object(gen_slide_openai.urllib.request, "urlopen", return_value=response):
-                self.assertFalse(gen_slide_openai.gen("prompt", str(out_path), retries=0))
+                self.assertFalse(
+                    gen_slide_openai.gen(
+                        "prompt", str(out_path), retries=0, overwrite=True
+                    )
+                )
             self.assertEqual(out_path.read_bytes(), b"existing")
 
     def test_429_retries_then_succeeds(self):
@@ -156,7 +176,7 @@ class OpenAIGenerationTests(unittest.TestCase):
             {},
             io.BytesIO(b'{"error":{"message":"slow down"}}'),
         )
-        response = FakeResponse({"data": [{"b64_json": base64.b64encode(b"image").decode("ascii")}]
+        response = FakeResponse({"data": [{"b64_json": base64.b64encode(image_bytes("JPEG")).decode("ascii")}]
         })
         with tempfile.TemporaryDirectory() as temp_dir, \
              mock.patch.dict(os.environ, {"OPENAI_API_KEY": "test-key"}, clear=True), \
@@ -175,7 +195,7 @@ class OpenAIGenerationTests(unittest.TestCase):
             io.BytesIO(b'{"error":{"message":"try later"}}'),
         )
         response = FakeResponse({
-            "data": [{"b64_json": base64.b64encode(b"image").decode("ascii")}]
+            "data": [{"b64_json": base64.b64encode(image_bytes("JPEG")).decode("ascii")}]
         })
         with tempfile.TemporaryDirectory() as temp_dir, \
              mock.patch.dict(os.environ, {"OPENAI_API_KEY": "test-key"}, clear=True), \
@@ -187,7 +207,7 @@ class OpenAIGenerationTests(unittest.TestCase):
 
     def test_url_error_retries_then_succeeds(self):
         response = FakeResponse({
-            "data": [{"b64_json": base64.b64encode(b"image").decode("ascii")}]
+            "data": [{"b64_json": base64.b64encode(image_bytes("JPEG")).decode("ascii")}]
         })
         with tempfile.TemporaryDirectory() as temp_dir, \
              mock.patch.dict(os.environ, {"OPENAI_API_KEY": "test-key"}, clear=True), \
@@ -204,7 +224,7 @@ class OpenAIGenerationTests(unittest.TestCase):
     def test_truncated_successful_read_is_retryable(self):
         truncated = ReadFailureResponse(http.client.IncompleteRead(b'{"data":', 20))
         response = FakeResponse({
-            "data": [{"b64_json": base64.b64encode(b"image").decode("ascii")}]
+            "data": [{"b64_json": base64.b64encode(image_bytes("JPEG")).decode("ascii")}]
         })
         with tempfile.TemporaryDirectory() as temp_dir, \
              mock.patch.dict(os.environ, {"OPENAI_API_KEY": "test-key"}, clear=True), \
@@ -287,9 +307,12 @@ class OpenAIGenerationTests(unittest.TestCase):
                 self.fail(f"HTTP error body read failure escaped: {escaped}")
             self.assertFalse(result)
 
-    def test_authentication_errors_are_generic_and_hide_remote_message(self):
+    def test_authentication_errors_preserve_safe_remote_message_and_redact_secrets(self):
         key = "known-test-key"
-        remote_message = f"invalid bearer {key}; also sk-remoteEcho123"
+        remote_message = (
+            "Your organization must be verified to use this model; "
+            f"request included {key}; also sk-remoteEcho123"
+        )
         error = urllib.error.HTTPError(
             gen_slide_openai.API_URL,
             401,
@@ -308,9 +331,9 @@ class OpenAIGenerationTests(unittest.TestCase):
                 )
             )
         self.assertIn("authentication failed", output.getvalue().lower())
+        self.assertIn("organization must be verified", output.getvalue())
         self.assertNotIn(key, output.getvalue())
         self.assertNotIn("sk-remoteEcho123", output.getvalue())
-        self.assertNotIn("invalid bearer", output.getvalue())
 
     def test_other_http_errors_redact_known_and_key_like_secrets(self):
         key = "known-test-key"
@@ -338,7 +361,7 @@ class OpenAIGenerationTests(unittest.TestCase):
 
     def test_missing_nested_parent_is_created_before_request(self):
         response = FakeResponse({
-            "data": [{"b64_json": base64.b64encode(b"image").decode("ascii")}]
+            "data": [{"b64_json": base64.b64encode(image_bytes("JPEG")).decode("ascii")}]
         })
         with tempfile.TemporaryDirectory() as temp_dir:
             parent = Path(temp_dir) / "missing" / "nested"
@@ -355,7 +378,9 @@ class OpenAIGenerationTests(unittest.TestCase):
                      side_effect=observe_parent,
                  ):
                 self.assertTrue(gen_slide_openai.gen("prompt", str(out_path), retries=0))
-            self.assertEqual(out_path.read_bytes(), b"image")
+            with Image.open(out_path) as image:
+                self.assertEqual(image.format, "JPEG")
+                self.assertEqual(image.size, (160, 90))
 
     def test_invalid_parent_fails_before_network(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -379,7 +404,7 @@ class OpenAIGenerationTests(unittest.TestCase):
              redirect_stdout(output):
             self.assertFalse(gen_slide_openai.gen("prompt", "slide.jpg", retries=-1))
         urlopen.assert_not_called()
-        self.assertIn("non-negative", output.getvalue())
+        self.assertIn("integer >= 0", output.getvalue())
 
     def test_non_retryable_400_stops_after_one_request(self):
         error = urllib.error.HTTPError(

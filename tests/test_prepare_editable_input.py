@@ -15,6 +15,18 @@ import prepare_editable_input
 
 
 class PrepareEditableInputTests(unittest.TestCase):
+    def test_transparency_is_composited_onto_cream_not_black(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "master.png"
+            target = Path(temp_dir) / "slide.png"
+            Image.new("RGBA", (1600, 900), (255, 0, 0, 0)).save(source)
+
+            self.assertTrue(prepare_editable_input.prepare(str(source), str(target)))
+
+            with Image.open(target) as image:
+                self.assertEqual(image.mode, "RGB")
+                self.assertEqual(image.getpixel((100, 100)), (248, 245, 240))
+
     def test_converts_16_by_9_jpeg_to_exact_1280_by_720_png(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             source = Path(temp_dir) / "master.jpg"

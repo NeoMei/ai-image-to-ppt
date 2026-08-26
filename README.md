@@ -14,7 +14,7 @@ Generate 16:9 educational textbook-style slide images from any topic using OpenA
 
 ## Setup
 
-One OpenAI API key is sufficient for default generation:
+Python 3.9 or newer and one OpenAI API key are sufficient for default generation:
 
 ```bash
 # Standard OpenAI credential (preferred)
@@ -33,7 +33,7 @@ chmod 600 ~/.secrets/gemini_api_key
 printf '%s\n' "YOUR_DOUBAO_KEY" > ~/.secrets/doubao_api_key
 chmod 600 ~/.secrets/doubao_api_key
 
-pip install 'Pillow>=9.1' python-pptx
+python3 -m pip install -r requirements.txt
 ```
 
 Gemini and Doubao credentials are only needed when selecting those fallback engines. A Gemini key is also required for the optional visual self-check. The commands above restore the exact secret-file paths expected by the legacy scripts. Never commit real keys.
@@ -45,6 +45,9 @@ mkdir -p out out/editable
 
 # Default: OpenAI GPT Image 2, 2048x1152, medium
 python3 scripts/gen_slide.py out/slide_01.jpg "<prompt>"
+
+# Existing outputs are protected. Regenerate explicitly only when intended.
+python3 scripts/gen_slide.py out/slide_01.jpg "<prompt>" --force
 
 # Explicit fallback engines
 python3 scripts/gen_slide.py out/slide_01.jpg "<prompt>" --engine gemini
@@ -63,6 +66,11 @@ python3 scripts/vision_check_gemini.py out/slide_01.jpg "精确数一下卡片�
 python3 scripts/export_images.py "deck_name" out/*.jpg
 ```
 
+The export command validates every image before publishing either artifact,
+creates missing parent directories, and publishes the PDF/PPTX pair
+transactionally. It refuses existing outputs by default; add `--force` to
+replace an existing pair with rollback protection.
+
 脚本内调用（批量并发生成见 [SKILL.md](SKILL.md)）：
 
 ```python
@@ -80,15 +88,19 @@ gen("<detailed prompt>", "out/slide_01.jpg", engine="gemini")
 |---|---|---|
 | `gen_slide.py` | Default provider router | OpenAI by default; `--engine gemini\|doubao` for explicit fallback |
 | `gen_slide_openai.py` | OpenAI GPT Image 2 | `gpt-image-2`; defaults to 2048×1152, medium quality |
-| `gen_slide_gemini.py` | Gemini nano banana | `gemini-3.1-flash-image-preview` |
+| `gen_slide_gemini.py` | Gemini nano banana | `gemini-3.1-flash-image`; 16:9, 2K |
 | `gen_slide_doubao.py` | 方舟 doubao-seedream | OpenAI-compatible API |
 | `prepare_editable_input.py` | Editable-converter handoff | Deterministic 1280x720 PNG |
-| `vision_check_gemini.py` | Gemini visual self-check | `gemini-2.0-flash` |
+| `vision_check_gemini.py` | Gemini visual self-check | `gemini-3.6-flash` |
 | `export_images.py` | Local export | PDF + PPTX |
 
 The router does not automatically switch providers: choose fallback engines explicitly. Provider pricing can change; consult the [OpenAI API pricing documentation](https://developers.openai.com/api/docs/pricing) instead of relying on a fixed per-image estimate.
 
-OpenAI output extensions `.jpg`, `.jpeg`, `.png`, and `.webp` select matching API formats. The legacy Gemini and Doubao engines keep provider-returned encoding; conventionally use `.jpg` for them and do not assume that changing the suffix transcodes the response.
+All providers support output extensions `.jpg`, `.jpeg`, `.png`, and `.webp`.
+The suffix selects the requested encoding, and the returned image's format and
+strict 16:9 dimensions are validated before publication. Generation refuses existing
+outputs by default and makes no provider request; pass `overwrite=True` in Python
+or `--force` on the CLI only when replacement is intentional.
 
 `prepare_editable_input.py` preserves the original high-resolution master, rejects input that is not strictly 16:9, and creates a new exact 1280x720 PNG. That PNG is input for the downstream `image-to-editable-pptx` converter; the standardizer does not itself create an editable PPTX, and the converter currently handles one slide at a time.
 
@@ -98,6 +110,14 @@ OpenAI output extensions `.jpg`, `.jpeg`, `.png`, and `.webp` select matching AP
 (style template, batch concurrency pattern, quantity-constraining tricks, pitfalls table).
 Drop the folder into your agent's skills directory (e.g. `~/.agents/skills/`) to let an
 AI agent generate decks autonomously.
+
+For development and package validation:
+
+```bash
+python3 -m pip install -r requirements-dev.txt
+python3 /Users/neomei/.codex/skills/.system/skill-creator/scripts/quick_validate.py .
+python3 -m unittest discover -s tests -v
+```
 
 ## License
 

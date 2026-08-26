@@ -10,6 +10,7 @@ from typing import Optional, Sequence
 from PIL import Image, UnidentifiedImageError
 
 TARGET_SIZE = (1280, 720)
+CREAM_BACKGROUND = (248, 245, 240)
 
 
 def _same_path(left: Path, right: Path) -> bool:
@@ -27,6 +28,17 @@ def _remove_temp(temp_path: str) -> Optional[OSError]:
         except OSError as error:
             last_error = error
     return last_error
+
+
+def _flatten_transparency(image: Image.Image) -> Image.Image:
+    has_transparency = image.mode in {"RGBA", "LA"} or (
+        image.mode == "P" and "transparency" in image.info
+    )
+    if not has_transparency:
+        return image.convert("RGB")
+    rgba = image.convert("RGBA")
+    background = Image.new("RGBA", rgba.size, CREAM_BACKGROUND + (255,))
+    return Image.alpha_composite(background, rgba).convert("RGB")
 
 
 def prepare(input_path: str, output_path: str) -> bool:
@@ -52,7 +64,7 @@ def prepare(input_path: str, output_path: str) -> bool:
                     f"  ERR: source must be exactly 16:9; received {width}x{height}"
                 )
                 return False
-            prepared = image.convert("RGB").resize(
+            prepared = _flatten_transparency(image).resize(
                 TARGET_SIZE,
                 Image.Resampling.LANCZOS,
             )

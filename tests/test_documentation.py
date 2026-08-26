@@ -12,8 +12,23 @@ class DocumentationTests(unittest.TestCase):
 
     def test_install_commands_pin_minimum_pillow_version(self):
         for document in (self.readme, self.skill):
-            self.assertIn("Pillow>=9.1", document)
-            self.assertNotIn("pip install Pillow python-pptx", document)
+            self.assertIn("python3 -m pip install -r requirements.txt", document)
+            self.assertNotIn("\npip install", document)
+
+        requirements = (ROOT / "requirements.txt").read_text(encoding="utf-8")
+        self.assertIn("Pillow>=9.1", requirements)
+        self.assertIn("python-pptx>=1.0", requirements)
+
+    def test_development_validator_dependency_and_command_are_documented(self):
+        dev_requirements = (ROOT / "requirements-dev.txt").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("PyYAML>=6.0", dev_requirements)
+        self.assertIn(
+            "python3 -m pip install -r requirements-dev.txt",
+            self.readme,
+        )
+        self.assertIn("quick_validate.py", self.readme)
 
     def test_fallback_secret_file_setup_commands_are_copy_pasteable(self):
         for document in (self.readme, self.skill):
@@ -31,14 +46,27 @@ class DocumentationTests(unittest.TestCase):
         self.assertIn("mkdir -p out", self.readme)
 
     def test_batch_example_reports_boolean_result(self):
-        self.assertIn("return name, ok", self.skill)
-        self.assertIn('status = "done" if ok else "failed"', self.skill)
+        self.assertIn('return name, "cached"', self.skill)
+        self.assertIn('return name, "done" if ok else "failed"', self.skill)
         self.assertNotIn('print(f.result(), "done")', self.skill)
 
     def test_output_extension_claim_is_provider_specific(self):
         for document in (self.readme, self.skill):
-            self.assertIn("OpenAI output extensions", document)
-            self.assertIn("provider-returned encoding", document)
+            self.assertIn("`.jpg`, `.jpeg`, `.png`, and `.webp`", document)
+            self.assertIn("validated before publication", document)
+            self.assertNotIn("provider-returned encoding", document)
+
+    def test_current_gemini_models_are_consistent(self):
+        for document in (self.readme, self.skill):
+            self.assertIn("`gemini-3.1-flash-image`", document)
+            self.assertIn("`gemini-3.6-flash`", document)
+            self.assertNotIn("gemini-3.1-flash-image-preview", document)
+            self.assertNotIn("gemini-2.0-flash", document)
+
+    def test_safe_existing_output_and_force_contract_is_documented(self):
+        for document in (self.readme, self.skill):
+            self.assertIn("--force", document)
+            self.assertIn("refuses existing", document)
 
 
 if __name__ == "__main__":
