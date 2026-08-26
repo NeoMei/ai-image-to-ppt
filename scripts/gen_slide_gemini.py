@@ -14,12 +14,16 @@ from typing import Optional, Sequence
 
 from image_output import (
     ImageOutputError,
+    ImageStreamError,
     decode_base64,
     expected_mime_type,
     preflight_output,
     publish_bytes,
+    read_response_body,
     validate_retries,
 )
+from output_lock import OutputLockError, output_lock
+from retry_delay import retry_delay
 
 SECRET_PATH = Path("~/.secrets/gemini_api_key").expanduser()
 DEFAULT_MODEL = "gemini-3.1-flash-image"
@@ -29,6 +33,7 @@ URL_TEMPLATE = (
 )
 KEY_LIKE_PATTERN = re.compile(r"(?<![A-Za-z0-9_-])sk-[A-Za-z0-9_-]+")
 TRANSPORT_ERRORS = (
+    ImageStreamError,
     urllib.error.URLError,
     TimeoutError,
     OSError,
@@ -57,7 +62,7 @@ def _http_error_message(error: urllib.error.HTTPError, key: str) -> str:
     if error.code in (401, 403):
         return "authentication failed; check GEMINI_API_KEY or ~/.secrets/gemini_api_key"
     try:
-        raw_body = error.read()
+        raw_body = read_response_body(error)
         if isinstance(raw_body, bytes):
             raw_body = raw_body.decode("utf-8")
         payload = json.loads(raw_body)
@@ -104,7 +109,7 @@ def _extract_image(payload: object, target: Path) -> bytes:
     raise ImageOutputError("response contains no image data")
 
 
-def gen(
+def _gen_owned(
     prompt: str,
     out_path: str,
     retries: int = 2,
@@ -149,21 +154,24 @@ def gen(
         )
         try:
             with urllib.request.urlopen(request, timeout=120) as response:
-                raw_response = response.read()
+                raw_response = read_response_body(response)
         except urllib.error.HTTPError as error:
             print(
                 f"  HTTP {error.code}: {_http_error_message(error, key)} "
                 f"(attempt {attempt + 1})"
             )
             if (error.code == 429 or error.code >= 500) and attempt < retries:
-                time.sleep(2)
+                time.sleep(retry_delay(attempt, error.headers))
                 continue
             return False
         except TRANSPORT_ERRORS as error:
             print(f"  ERR: {_redact(error, key)} (attempt {attempt + 1})")
             if attempt < retries:
-                time.sleep(2)
+                time.sleep(retry_delay(attempt))
                 continue
+            return False
+        except ImageOutputError as error:
+            print(f"  ERR: invalid provider response: {_redact(error, key)}")
             return False
 
         try:
@@ -181,6 +189,20 @@ def gen(
         return True
 
     return False
+
+
+def gen(
+    prompt: str,
+    out_path: str,
+    retries: int = 2,
+    overwrite: bool = False,
+) -> bool:
+    try:
+        with output_lock(out_path):
+            return _gen_owned(prompt, out_path, retries, overwrite)
+    except OutputLockError as error:
+        print(f"  ERR: {error}")
+        return False
 
 
 def _parser() -> argparse.ArgumentParser:

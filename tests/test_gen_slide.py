@@ -1,7 +1,7 @@
 import sys
 import io
 import unittest
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -130,7 +130,7 @@ class RouterTests(unittest.TestCase):
         output = io.StringIO()
         with mock.patch.object(
             gen_slide.importlib, "import_module", return_value=provider
-        ), mock.patch("sys.stdout", output):
+        ), redirect_stdout(output):
             self.assertFalse(gen_slide.gen("prompt", "slide.jpg"))
 
         self.assertNotIn("sk-secret-value", output.getvalue())

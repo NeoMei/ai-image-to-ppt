@@ -8,6 +8,13 @@ from pathlib import Path
 from typing import Optional, Sequence
 
 from PIL import Image, UnidentifiedImageError
+from image_output import (
+    ImageOutputError,
+    load_image,
+    prepare_target,
+    verify_parent_identity,
+)
+from output_lock import OutputLockError, output_lock
 
 TARGET_SIZE = (1280, 720)
 CREAM_BACKGROUND = (248, 245, 240)
@@ -41,7 +48,7 @@ def _flatten_transparency(image: Image.Image) -> Image.Image:
     return Image.alpha_composite(background, rgba).convert("RGB")
 
 
-def prepare(input_path: str, output_path: str) -> bool:
+def _prepare_owned(input_path: str, output_path: str) -> bool:
     source = Path(input_path)
     target = Path(output_path)
 
@@ -51,35 +58,50 @@ def prepare(input_path: str, output_path: str) -> bool:
     if _same_path(source, target):
         print("  ERR: source and output paths must be different")
         return False
-    if os.path.lexists(target):
-        print(f"  ERR: output already exists; refusing to overwrite: {target}")
+
+    try:
+        prepared_target = prepare_target(target)
+    except ImageOutputError as error:
+        print(f"  ERR: failed to prepare output path: {error}")
+        return False
+    if os.path.lexists(prepared_target.path):
+        print(
+            "  ERR: output already exists; refusing to overwrite: "
+            f"{prepared_target.path}"
+        )
         return False
 
     try:
-        with Image.open(source) as image:
-            image.load()
-            width, height = image.size
-            if width * 9 != height * 16:
-                print(
-                    f"  ERR: source must be exactly 16:9; received {width}x{height}"
-                )
-                return False
-            prepared = _flatten_transparency(image).resize(
-                TARGET_SIZE,
-                Image.Resampling.LANCZOS,
+        image = load_image(source).image
+        width, height = image.size
+        if width * 9 != height * 16:
+            print(
+                f"  ERR: source must be exactly 16:9; received {width}x{height}"
             )
-    except (OSError, UnidentifiedImageError) as error:
+            return False
+        prepared = _flatten_transparency(image).resize(
+            TARGET_SIZE,
+            Image.Resampling.LANCZOS,
+        )
+    except (ImageOutputError, OSError, UnidentifiedImageError) as error:
         print(f"  ERR: cannot read source image: {error}")
         return False
 
+    fd = None
+    temp_path = None
     try:
-        target.parent.mkdir(parents=True, exist_ok=True)
+        verify_parent_identity(prepared_target.parent)
         fd, temp_path = tempfile.mkstemp(
             prefix=f".{target.name}.",
             suffix=".tmp",
-            dir=str(target.parent),
+            dir=str(prepared_target.parent.path),
         )
-    except OSError as error:
+        verify_parent_identity(prepared_target.parent)
+    except (ImageOutputError, OSError) as error:
+        if fd is not None:
+            os.close(fd)
+        if temp_path is not None:
+            _remove_temp(temp_path)
         print(f"  ERR: failed to prepare output path: {error}")
         return False
 
@@ -96,14 +118,15 @@ def prepare(input_path: str, output_path: str) -> bool:
         return False
 
     try:
-        os.link(temp_path, target)
+        verify_parent_identity(prepared_target.parent)
+        os.link(temp_path, prepared_target.path)
     except FileExistsError:
         print(f"  ERR: output already exists; refusing to overwrite: {target}")
         cleanup_error = _remove_temp(temp_path)
         if cleanup_error is not None:
             print(f"  WARN: could not remove temporary file: {cleanup_error}")
         return False
-    except OSError as error:
+    except (ImageOutputError, OSError) as error:
         print(f"  ERR: failed to publish normalized PNG: {error}")
         cleanup_error = _remove_temp(temp_path)
         if cleanup_error is not None:
@@ -118,6 +141,15 @@ def prepare(input_path: str, output_path: str) -> bool:
         )
     print(f"  OK: {target} (1280x720 PNG, editable-converter input)")
     return True
+
+
+def prepare(input_path: str, output_path: str) -> bool:
+    try:
+        with output_lock(output_path):
+            return _prepare_owned(input_path, output_path)
+    except OutputLockError as error:
+        print(f"  ERR: {error}")
+        return False
 
 
 def _parser() -> argparse.ArgumentParser:

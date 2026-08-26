@@ -14,22 +14,26 @@ from pathlib import Path
 from typing import Optional, Sequence
 
 from image_output import (
+    MAX_IMAGE_BYTES,
     ImageOutputError,
     ImageStreamError,
     output_format,
     preflight_output,
     publish_stream,
+    read_response_body,
     validate_retries,
 )
+from output_lock import OutputLockError, output_lock
+from retry_delay import retry_delay
 
 SECRET_PATH = Path("~/.secrets/doubao_api_key").expanduser()
 URL = "https://ark.cn-beijing.volces.com/api/v3/images/generations"
 MODEL = "doubao-seedream-5-0-260128"
 SIZE = "2560x1440"
 DOWNLOAD_TIMEOUT = 120
-MAX_IMAGE_BYTES = 50 * 1024 * 1024
 KEY_LIKE_PATTERN = re.compile(r"(?<![A-Za-z0-9_-])sk-[A-Za-z0-9_-]+")
 TRANSPORT_ERRORS = (
+    ImageStreamError,
     urllib.error.URLError,
     TimeoutError,
     OSError,
@@ -58,7 +62,7 @@ def _http_error_message(error: urllib.error.HTTPError, key: str) -> str:
     if error.code in (401, 403):
         return "authentication failed; check DOUBAO_API_KEY or ~/.secrets/doubao_api_key"
     try:
-        raw_body = error.read()
+        raw_body = read_response_body(error)
         if isinstance(raw_body, bytes):
             raw_body = raw_body.decode("utf-8")
         payload = json.loads(raw_body)
@@ -113,13 +117,13 @@ def _download_image(
                 f"{_http_error_message(error, key)} (attempt {attempt + 1})"
             )
             if _retryable_http(error) and attempt < retries:
-                time.sleep(2)
+                time.sleep(retry_delay(attempt, error.headers))
                 continue
             return None
         except (ImageStreamError,) + TRANSPORT_ERRORS as error:
             print(f"  ERR: {_redact(error, key)} (attempt {attempt + 1})")
             if attempt < retries:
-                time.sleep(2)
+                time.sleep(retry_delay(attempt))
                 continue
             return None
         except (ImageOutputError, TypeError, ValueError) as error:
@@ -128,7 +132,7 @@ def _download_image(
     return None
 
 
-def gen(
+def _gen_owned(
     prompt: str,
     out_path: str,
     retries: int = 2,
@@ -173,21 +177,24 @@ def gen(
         )
         try:
             with urllib.request.urlopen(request, timeout=180) as response:
-                raw_response = response.read()
+                raw_response = read_response_body(response)
         except urllib.error.HTTPError as error:
             print(
                 f"  HTTP {error.code}: {_http_error_message(error, key)} "
                 f"(attempt {attempt + 1})"
             )
             if _retryable_http(error) and attempt < retries:
-                time.sleep(2)
+                time.sleep(retry_delay(attempt, error.headers))
                 continue
             return False
         except TRANSPORT_ERRORS as error:
             print(f"  ERR: {_redact(error, key)} (attempt {attempt + 1})")
             if attempt < retries:
-                time.sleep(2)
+                time.sleep(retry_delay(attempt))
                 continue
+            return False
+        except ImageOutputError as error:
+            print(f"  ERR: invalid provider response: {_redact(error, key)}")
             return False
 
         try:
@@ -206,6 +213,20 @@ def gen(
         return False
     print(f"  OK: {_redact(target, key)} ({byte_count // 1024}KB)")
     return True
+
+
+def gen(
+    prompt: str,
+    out_path: str,
+    retries: int = 2,
+    overwrite: bool = False,
+) -> bool:
+    try:
+        with output_lock(out_path):
+            return _gen_owned(prompt, out_path, retries, overwrite)
+    except OutputLockError as error:
+        print(f"  ERR: {error}")
+        return False
 
 
 def _parser() -> argparse.ArgumentParser:

@@ -3,10 +3,14 @@
 import base64
 import binascii
 import http.client
+import io
 import os
 import stat
 import tempfile
+import warnings
+from dataclasses import dataclass
 from pathlib import Path
+from typing import NamedTuple, Optional, Union
 
 from PIL import Image, UnidentifiedImageError
 
@@ -26,6 +30,10 @@ MIME_TYPES = {
     "png": "image/png",
     "webp": "image/webp",
 }
+MAX_IMAGE_BYTES = 50 * 1024 * 1024
+MAX_IMAGE_PIXELS = 64_000_000
+MAX_ENCODED_IMAGE_BYTES = 4 * ((MAX_IMAGE_BYTES + 2) // 3)
+MAX_PROVIDER_RESPONSE_BYTES = MAX_ENCODED_IMAGE_BYTES + 1024 * 1024
 
 
 class ImageOutputError(ValueError):
@@ -34,6 +42,45 @@ class ImageOutputError(ValueError):
 
 class ImageStreamError(ImageOutputError):
     """Raised for a retryable transport failure while reading image bytes."""
+
+
+class LoadedImage(NamedTuple):
+    image: Optional[Image.Image]
+    image_format: str
+    byte_count: int
+    width: int
+    height: int
+
+
+@dataclass(frozen=True)
+class ParentIdentity:
+    path: Path
+    real_path: Path
+    device: int
+    inode: int
+
+
+@dataclass(frozen=True)
+class PreparedTarget:
+    path: Path
+    parent: ParentIdentity
+
+    def __fspath__(self) -> str:
+        return str(self.path)
+
+    def __str__(self) -> str:
+        return str(self.path)
+
+    @property
+    def suffix(self) -> str:
+        return self.path.suffix
+
+    @property
+    def name(self) -> str:
+        return self.path.name
+
+
+TargetValue = Union[Path, PreparedTarget]
 
 
 def validate_retries(retries: object) -> int:
@@ -60,22 +107,173 @@ def expected_mime_type(out_path: str) -> str:
 def decode_base64(encoded: object) -> bytes:
     if not isinstance(encoded, str) or not encoded:
         raise ImageOutputError("image Base64 must be a non-empty string")
+    max_encoded_bytes = 4 * ((MAX_IMAGE_BYTES + 2) // 3)
+    if len(encoded) > max_encoded_bytes:
+        raise ImageOutputError(
+            f"image Base64 exceeds maximum encoded size of {max_encoded_bytes} bytes"
+        )
     try:
         decoded = base64.b64decode(encoded, validate=True)
     except (binascii.Error, UnicodeError, ValueError) as error:
         raise ImageOutputError("image Base64 is invalid") from error
     if not decoded:
         raise ImageOutputError("image data is empty")
+    if len(decoded) > MAX_IMAGE_BYTES:
+        raise ImageOutputError(
+            f"image data exceeds maximum size of {MAX_IMAGE_BYTES} bytes"
+        )
     return decoded
 
 
-def preflight_output(out_path: str, overwrite: bool = False) -> Path:
+def read_response_body(response) -> bytes:
+    """Read one provider response with a hard maximum allocation boundary."""
+    try:
+        try:
+            data = response.read(MAX_PROVIDER_RESPONSE_BYTES + 1)
+        except TypeError:
+            # Some simple file-like test doubles expose only read(). Real
+            # HTTPResponse objects accept an explicit byte bound.
+            data = response.read()
+    except (OSError, http.client.HTTPException) as error:
+        raise ImageStreamError(f"provider response read failed: {error}") from error
+    if not isinstance(data, bytes):
+        raise ImageOutputError("provider response body must be bytes")
+    if len(data) > MAX_PROVIDER_RESPONSE_BYTES:
+        raise ImageOutputError(
+            "provider response exceeds maximum size of "
+            f"{MAX_PROVIDER_RESPONSE_BYTES} bytes"
+        )
+    return data
+
+
+def _validate_dimensions(width: int, height: int) -> None:
+    if width <= 0 or height <= 0:
+        raise ImageOutputError("image dimensions must be positive")
+    if width * height > MAX_IMAGE_PIXELS:
+        raise ImageOutputError(
+            "image dimensions are too large; maximum pixel count is "
+            f"{MAX_IMAGE_PIXELS}"
+        )
+
+
+def load_image(
+    path: Path,
+    verify: bool = False,
+    copy_image: bool = True,
+) -> LoadedImage:
+    """Load one image under shared byte, pixel, and Pillow bomb limits."""
+    image_path = Path(path)
+    try:
+        stated_size = image_path.stat().st_size
+        if stated_size <= 0:
+            raise ImageOutputError("image data is empty")
+        if stated_size > MAX_IMAGE_BYTES:
+            raise ImageOutputError(
+                f"image exceeds maximum size of {MAX_IMAGE_BYTES} bytes"
+            )
+        with image_path.open("rb") as source:
+            data = source.read(MAX_IMAGE_BYTES + 1)
+        byte_count = len(data)
+        if byte_count > MAX_IMAGE_BYTES:
+            raise ImageOutputError(
+                f"image exceeds maximum size of {MAX_IMAGE_BYTES} bytes"
+            )
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            if verify:
+                with Image.open(io.BytesIO(data)) as image:
+                    _validate_dimensions(*image.size)
+                    image.verify()
+            with Image.open(io.BytesIO(data)) as image:
+                width, height = image.size
+                _validate_dimensions(width, height)
+                image_format = image.format
+                image.load()
+                loaded = image.copy() if copy_image else None
+    except ImageOutputError:
+        raise
+    except (Image.DecompressionBombError, Image.DecompressionBombWarning) as error:
+        raise ImageOutputError(f"image dimensions are too large: {error}") from error
+    except (OSError, SyntaxError, ValueError, UnidentifiedImageError) as error:
+        raise ImageOutputError(f"data is not a valid image: {error}") from error
+
+    return LoadedImage(loaded, image_format, byte_count, width, height)
+
+
+def prepare_target(target: Path) -> PreparedTarget:
+    """Capture the parent directory identity for one output target."""
+    output_path = Path(target)
+    parent_path = Path(os.path.abspath(str(output_path.parent)))
+    try:
+        parent_path.mkdir(parents=True, exist_ok=True)
+        if parent_path.is_symlink():
+            raise ImageOutputError(
+                f"parent directory identity is unsafe: {parent_path} is a symlink"
+            )
+        real_path = parent_path.resolve(strict=True)
+        parent_stat = parent_path.stat()
+        if not stat.S_ISDIR(parent_stat.st_mode):
+            raise ImageOutputError(
+                f"parent directory identity is unsafe: {parent_path} is not a directory"
+            )
+    except ImageOutputError:
+        raise
+    except (OSError, ValueError) as error:
+        raise ImageOutputError(
+            f"cannot capture parent directory identity: {error}"
+        ) from error
+    return PreparedTarget(
+        output_path,
+        ParentIdentity(
+            parent_path,
+            real_path,
+            parent_stat.st_dev,
+            parent_stat.st_ino,
+        ),
+    )
+
+
+def verify_parent_identity(parent: ParentIdentity) -> None:
+    """Fail closed if the captured output parent was replaced or redirected."""
+    try:
+        if parent.path.is_symlink():
+            raise ImageOutputError(
+                f"parent directory identity changed: {parent.path} is now a symlink"
+            )
+        current_real_path = parent.path.resolve(strict=True)
+        current_stat = parent.path.stat()
+        if (
+            current_real_path != parent.real_path
+            or current_stat.st_dev != parent.device
+            or current_stat.st_ino != parent.inode
+            or not stat.S_ISDIR(current_stat.st_mode)
+        ):
+            raise ImageOutputError(
+                f"parent directory identity changed: {parent.path}"
+            )
+    except ImageOutputError:
+        raise
+    except (OSError, ValueError) as error:
+        raise ImageOutputError(
+            f"cannot verify parent directory identity: {error}"
+        ) from error
+
+
+def _as_prepared_target(target: TargetValue) -> PreparedTarget:
+    if isinstance(target, PreparedTarget):
+        return target
+    return prepare_target(Path(target))
+
+
+def preflight_output(out_path: str, overwrite: bool = False) -> PreparedTarget:
     if not isinstance(overwrite, bool):
         raise ImageOutputError("overwrite must be a boolean")
 
     target = Path(out_path)
+    probe_path = None
     try:
-        target.parent.mkdir(parents=True, exist_ok=True)
+        prepared = prepare_target(target)
         if os.path.lexists(target):
             if not overwrite:
                 raise ImageOutputError(
@@ -86,24 +284,53 @@ def preflight_output(out_path: str, overwrite: bool = False) -> Path:
                 raise ImageOutputError(
                     "output path exists and is not a regular file"
                 )
+        verify_parent_identity(prepared.parent)
         descriptor, probe_path = tempfile.mkstemp(
-            prefix=".write-test.", dir=str(target.parent)
+            prefix=".write-test.", dir=str(prepared.parent.path)
         )
         os.close(descriptor)
+        verify_parent_identity(prepared.parent)
         os.unlink(probe_path)
+        probe_path = None
     except ImageOutputError:
         raise
     except (OSError, ValueError) as error:
         raise ImageOutputError(f"output path is not writable: {error}") from error
-    return target
+    finally:
+        if probe_path is not None:
+            try:
+                os.unlink(probe_path)
+            except OSError:
+                pass
+    return prepared
 
 
-def _temporary_path(target: Path):
+def _temporary_path(target: TargetValue):
+    prepared = _as_prepared_target(target)
+    descriptor = None
+    temp_path = None
     try:
-        return tempfile.mkstemp(
-            prefix=f".{target.name}.", suffix=".tmp", dir=str(target.parent)
+        verify_parent_identity(prepared.parent)
+        result = tempfile.mkstemp(
+            prefix=f".{prepared.name}.",
+            suffix=".tmp",
+            dir=str(prepared.parent.path),
         )
-    except OSError as error:
+        descriptor = result[0]
+        temp_path = result[1]
+        verify_parent_identity(prepared.parent)
+        return result
+    except (ImageOutputError, OSError) as error:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        if temp_path is not None:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
         raise ImageOutputError(f"failed to create output temporary file: {error}") from error
 
 
@@ -116,53 +343,53 @@ def _remove_temp(path: str) -> None:
         raise ImageOutputError(f"failed to remove output temporary file: {error}") from error
 
 
-def _validate_temp(path: str, target: Path) -> int:
+def _validate_temp(path: str, target: TargetValue) -> int:
+    prepared = _as_prepared_target(target)
     try:
-        byte_count = os.path.getsize(path)
-        if byte_count <= 0:
-            raise ImageOutputError("image data is empty")
-        with Image.open(path) as image:
-            image.verify()
-        with Image.open(path) as image:
-            image.load()
-            width, height = image.size
-            actual_format = image.format
+        verify_parent_identity(prepared.parent)
+        loaded = load_image(Path(path), verify=True, copy_image=False)
+        width, height = loaded.width, loaded.height
+        actual_format = loaded.image_format
     except ImageOutputError:
         raise
-    except (OSError, ValueError, UnidentifiedImageError) as error:
-        raise ImageOutputError(f"generated data is not a valid image: {error}") from error
 
-    expected_format = PIL_FORMATS[output_format(str(target))]
+    expected_format = PIL_FORMATS[output_format(str(prepared))]
     if actual_format != expected_format:
         raise ImageOutputError(
             f"image format {actual_format or '<unknown>'} does not match "
-            f"{target.suffix.lower()}"
+            f"{prepared.suffix.lower()}"
         )
     if width <= 0 or height <= 0 or width * 9 != height * 16:
         raise ImageOutputError(
             f"generated image must be exactly 16:9; received {width}x{height}"
         )
-    return byte_count
+    return loaded.byte_count
 
 
-def _publish_temp(temp_path: str, target: Path, overwrite: bool) -> None:
+def _publish_temp(temp_path: str, target: TargetValue, overwrite: bool) -> None:
+    prepared = _as_prepared_target(target)
     try:
+        verify_parent_identity(prepared.parent)
         if overwrite:
-            os.replace(temp_path, target)
+            os.replace(temp_path, prepared.path)
         else:
-            os.link(temp_path, target)
+            os.link(temp_path, prepared.path)
             os.unlink(temp_path)
     except FileExistsError as error:
         raise ImageOutputError(
-            f"output already exists; refusing to overwrite: {target}"
+            f"output already exists; refusing to overwrite: {prepared.path}"
         ) from error
     except OSError as error:
         raise ImageOutputError(f"failed to publish image atomically: {error}") from error
 
 
-def publish_bytes(data: bytes, target: Path, overwrite: bool = False) -> int:
+def publish_bytes(data: bytes, target: TargetValue, overwrite: bool = False) -> int:
     if not isinstance(data, bytes) or not data:
         raise ImageOutputError("image data must be non-empty bytes")
+    if len(data) > MAX_IMAGE_BYTES:
+        raise ImageOutputError(
+            f"image data exceeds maximum size of {MAX_IMAGE_BYTES} bytes"
+        )
     descriptor, temp_path = _temporary_path(target)
     published = False
     try:
@@ -185,9 +412,9 @@ def publish_bytes(data: bytes, target: Path, overwrite: bool = False) -> int:
 
 def publish_stream(
     response,
-    target: Path,
+    target: TargetValue,
     overwrite: bool = False,
-    max_bytes: int = 50 * 1024 * 1024,
+    max_bytes: int = MAX_IMAGE_BYTES,
 ) -> int:
     headers = getattr(response, "headers", {})
     content_length = None

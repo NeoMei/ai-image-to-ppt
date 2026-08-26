@@ -1,5 +1,9 @@
 # GPT Image Default Engine Implementation Plan
 
+> Historical implementation plan. The unchecked boxes and red/green test counts
+> below preserve the original execution recipe; they are not the current completion
+> state. See **Execution status — 2026-08-26** at the end of this document.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Add OpenAI GPT Image 2 generation as the default and provide a deterministic bridge from any 16:9 generated master image to the exact `1280x720 PNG` required by `image-to-editable-pptx`.
@@ -930,7 +934,7 @@ python3 -m unittest discover -s tests -v
 python3 -m compileall -q scripts tests
 python3 scripts/gen_slide.py --help
 python3 scripts/prepare_editable_input.py --help
-python3 /Users/neomei/.codex/skills/.system/skill-creator/scripts/quick_validate.py .
+python3 scripts/validate_skill.py .
 git status --short
 ```
 
@@ -960,10 +964,31 @@ python3 -m unittest discover -s tests -v
 python3 -m compileall -q scripts tests
 python3 scripts/gen_slide.py --help
 python3 scripts/prepare_editable_input.py --help
-python3 /Users/neomei/.codex/skills/.system/skill-creator/scripts/quick_validate.py .
+python3 scripts/validate_skill.py .
 git diff --check origin/main...HEAD
 git status --short --branch
 git log --oneline --decorate origin/main..HEAD
 ```
 
 Expected: every validation exits 0; working tree is clean; local `main` is ahead only by the design, revised plan, provider, router, editable-input standardizer, and documentation commits. Do not push without separate user authorization.
+
+## Execution status — 2026-08-26
+
+The feature and subsequent comprehensive audit were executed on local branches.
+The original task steps above are retained as historical TDD instructions; later
+hardening expanded their test counts and commit history.
+
+- OpenAI GPT Image 2 is the default router engine with `gpt-image-2`,
+  `2048x1152`, and `medium` defaults.
+- Gemini `gemini-3.1-flash-image` and Doubao remain explicit fallbacks;
+  Gemini visual inspection uses `gemini-3.6-flash`.
+- Normal PDF/PPTX export remains `1920x1080`; editable handoff remains a
+  separate exact `1280x720 PNG` operation.
+- Provider responses and local images now have strict format, 16:9, byte, pixel,
+  concurrency, directory-identity, retry, atomic-publication, and rollback tests.
+- Current automated suite: **137 tests passed** on Python 3.9 and Python 3.12;
+  compilation and `python3 scripts/validate_skill.py .` also passed. Tests used
+  mocked provider responses and made no real paid API request.
+- Audit work was performed on local branch `audit/comprehensive-completion`.
+  Local `main`, audit HEAD, and `origin/main` must be reported separately after
+  final integration. No push is implied by this execution record.

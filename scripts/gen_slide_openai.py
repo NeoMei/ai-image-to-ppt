@@ -14,12 +14,16 @@ from typing import Optional, Sequence
 
 from image_output import (
     ImageOutputError,
+    ImageStreamError,
     decode_base64,
     output_format,
     preflight_output,
     publish_bytes,
+    read_response_body,
     validate_retries,
 )
+from output_lock import OutputLockError, output_lock
+from retry_delay import retry_delay
 
 API_URL = "https://api.openai.com/v1/images/generations"
 DEFAULT_MODEL = "gpt-image-2"
@@ -52,7 +56,7 @@ def _redact(message: object, key: str) -> str:
 
 def _error_message(error: urllib.error.HTTPError, key: str) -> str:
     try:
-        raw_body = error.read()
+        raw_body = read_response_body(error)
         if isinstance(raw_body, bytes):
             raw_body = raw_body.decode("utf-8")
         if not isinstance(raw_body, str):
@@ -95,7 +99,7 @@ def _decode_image_response(result: object) -> bytes:
     return decode_base64(encoded)
 
 
-def gen(
+def _gen_owned(
     prompt: str,
     out_path: str,
     retries: int = 2,
@@ -137,7 +141,7 @@ def gen(
         )
         try:
             with urllib.request.urlopen(request, timeout=180) as response:
-                raw_response = response.read()
+                raw_response = read_response_body(response)
         except urllib.error.HTTPError as error:
             if error.code in (401, 403):
                 message = (
@@ -148,10 +152,11 @@ def gen(
                 message = _error_message(error, key)
             print(f"  HTTP {error.code}: {message} (attempt {attempt + 1})")
             if (error.code == 429 or error.code >= 500) and attempt < retries:
-                time.sleep(2)
+                time.sleep(retry_delay(attempt, error.headers))
                 continue
             return False
         except (
+            ImageStreamError,
             urllib.error.URLError,
             TimeoutError,
             OSError,
@@ -159,8 +164,11 @@ def gen(
         ) as error:
             print(f"  ERR: {_redact(error, key)} (attempt {attempt + 1})")
             if attempt < retries:
-                time.sleep(2)
+                time.sleep(retry_delay(attempt))
                 continue
+            return False
+        except ImageOutputError as error:
+            print(f"  ERR: invalid provider response: {_redact(error, key)}")
             return False
 
         try:
@@ -186,6 +194,20 @@ def gen(
         return True
 
     return False
+
+
+def gen(
+    prompt: str,
+    out_path: str,
+    retries: int = 2,
+    overwrite: bool = False,
+) -> bool:
+    try:
+        with output_lock(out_path):
+            return _gen_owned(prompt, out_path, retries, overwrite)
+    except OutputLockError as error:
+        print(f"  ERR: {error}")
+        return False
 
 
 def _parser() -> argparse.ArgumentParser:

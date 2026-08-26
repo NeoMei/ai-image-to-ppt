@@ -28,7 +28,8 @@ class DocumentationTests(unittest.TestCase):
             "python3 -m pip install -r requirements-dev.txt",
             self.readme,
         )
-        self.assertIn("quick_validate.py", self.readme)
+        self.assertIn("python3 scripts/validate_skill.py .", self.readme)
+        self.assertNotIn("/Users/neomei/", self.readme)
 
     def test_fallback_secret_file_setup_commands_are_copy_pasteable(self):
         for document in (self.readme, self.skill):
@@ -67,6 +68,9 @@ class DocumentationTests(unittest.TestCase):
         for document in (self.readme, self.skill):
             self.assertIn("--force", document)
             self.assertIn("refuses existing", document)
+            self.assertIn("50 MiB", document)
+            self.assertIn("64 megapixels", document)
+            self.assertIn("Retry-After", document)
 
 
 if __name__ == "__main__":

@@ -15,6 +15,14 @@ from typing import Callable, Iterable, List, Optional, Sequence
 from PIL import Image
 from pptx import Presentation
 from pptx.util import Emu
+from image_output import (
+    ImageOutputError,
+    ParentIdentity,
+    load_image,
+    prepare_target,
+    verify_parent_identity,
+)
+from output_lock import OutputLockError, output_lock
 
 TARGET_SIZE = (1920, 1080)
 CREAM_BACKGROUND = (248, 245, 240)
@@ -55,9 +63,10 @@ def normalize(image: Image.Image) -> Image.Image:
 
 
 def _load(path: str) -> Image.Image:
-    with Image.open(path) as source:
-        source.load()
-        return normalize(source)
+    try:
+        return normalize(load_image(Path(path)).image)
+    except ImageOutputError as error:
+        raise OSError(str(error)) from error
 
 
 def _load_all(files: Iterable[str]) -> List[Image.Image]:
@@ -98,15 +107,30 @@ def _save_pptx(images: Sequence[Image.Image], path: str) -> None:
     presentation.save(path)
 
 
-def _temporary_path(target: Path) -> str:
-    target.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, path = tempfile.mkstemp(
-        prefix=f".{target.name}.",
-        suffix=f".tmp{target.suffix}",
-        dir=str(target.parent),
-    )
-    os.close(descriptor)
-    return path
+def _temporary_path(
+    target: Path,
+    parent: Optional[ParentIdentity] = None,
+) -> str:
+    prepared = prepare_target(target) if parent is None else None
+    identity = prepared.parent if prepared is not None else parent
+    path = None
+    try:
+        verify_parent_identity(identity)
+        descriptor, path = tempfile.mkstemp(
+            prefix=f".{target.name}.",
+            suffix=f".tmp{target.suffix}",
+            dir=str(identity.path),
+        )
+        os.close(descriptor)
+        verify_parent_identity(identity)
+        return path
+    except Exception:
+        if path is not None:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        raise
 
 
 def _sync_file(path: str) -> None:
@@ -144,22 +168,47 @@ def export_pptx(files: Sequence[str], pptx_path: str) -> None:
     print(f"  PPTX: {pptx_path} ({len(images)} slides, {size_mb:.1f}MB)")
 
 
-def _backup_path(target: Path) -> str:
-    descriptor, path = tempfile.mkstemp(
-        prefix=f".{target.name}.",
-        suffix=".backup",
-        dir=str(target.parent),
-    )
-    os.close(descriptor)
-    os.unlink(path)
-    return path
+def _backup_path(
+    target: Path,
+    parent: Optional[ParentIdentity] = None,
+) -> str:
+    identity = prepare_target(target).parent if parent is None else parent
+    descriptor = None
+    path = None
+    try:
+        verify_parent_identity(identity)
+        descriptor, path = tempfile.mkstemp(
+            prefix=f".{target.name}.",
+            suffix=".backup",
+            dir=str(identity.path),
+        )
+        os.close(descriptor)
+        descriptor = None
+        verify_parent_identity(identity)
+        os.unlink(path)
+        return path
+    except Exception:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        if path is not None:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        raise
 
 
 def _publish_pair(
     temporary_paths: Sequence[str],
     targets: Sequence[Path],
     force: bool,
+    parent: Optional[ParentIdentity] = None,
 ) -> None:
+    if parent is not None:
+        verify_parent_identity(parent)
     existing = [target for target in targets if os.path.lexists(target)]
     if existing and not force:
         names = ", ".join(str(target) for target in existing)
@@ -170,12 +219,16 @@ def _publish_pair(
     publication_succeeded = False
     try:
         for target in existing:
+            if parent is not None:
+                verify_parent_identity(parent)
             if target.is_symlink() or not target.is_file():
                 raise OSError(f"refusing non-regular output target: {target}")
-            backup = _backup_path(target)
+            backup = _backup_path(target, parent=parent)
             os.replace(target, backup)
             backups[target] = backup
         for temporary, target in zip(temporary_paths, targets):
+            if parent is not None:
+                verify_parent_identity(parent)
             os.replace(temporary, target)
             published.append(target)
         publication_succeeded = True
@@ -213,21 +266,22 @@ def _publish_pair(
                     )
 
 
-def export_deck(files: Sequence[str], output_prefix: str, force: bool = False) -> None:
+def _export_deck_owned(
+    files: Sequence[str], output_prefix: str, force: bool = False
+) -> None:
     """Build PDF and PPTX completely, then publish them as one logical pair."""
-    images = _load_all(files)
     targets = (Path(f"{output_prefix}.pdf"), Path(f"{output_prefix}.pptx"))
-    for target in targets:
-        target.parent.mkdir(parents=True, exist_ok=True)
+    parent = prepare_target(targets[0]).parent
+    images = _load_all(files)
     temporary_paths = []
     try:
         for target in targets:
-            temporary_paths.append(_temporary_path(target))
+            temporary_paths.append(_temporary_path(target, parent=parent))
         _save_pdf(images, temporary_paths[0])
         _sync_file(temporary_paths[0])
         _save_pptx(images, temporary_paths[1])
         _sync_file(temporary_paths[1])
-        _publish_pair(temporary_paths, targets, force=force)
+        _publish_pair(temporary_paths, targets, force=force, parent=parent)
     finally:
         for temporary in temporary_paths:
             try:
@@ -235,8 +289,22 @@ def export_deck(files: Sequence[str], output_prefix: str, force: bool = False) -
             except FileNotFoundError:
                 pass
     for label, target in zip(("PDF", "PPTX"), targets):
+        verify_parent_identity(parent)
         size_mb = target.stat().st_size / 1024 / 1024
         print(f"  {label}: {target} ({len(images)} slides, {size_mb:.1f}MB)")
+
+
+def export_deck(
+    files: Sequence[str], output_prefix: str, force: bool = False
+) -> bool:
+    """Build and publish one pair while owning the complete output prefix."""
+    try:
+        with output_lock(output_prefix, namespace="deck"):
+            _export_deck_owned(files, output_prefix, force=force)
+        return True
+    except OutputLockError as error:
+        print(f"  ERR: export failed: {error}", file=sys.stderr)
+        return False
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -256,7 +324,8 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = _parser().parse_args(argv)
     try:
-        export_deck(args.images, args.output_prefix, force=args.force)
+        if not export_deck(args.images, args.output_prefix, force=args.force):
+            return 1
     except (OSError, ValueError) as error:
         print(f"  ERR: export failed: {error}", file=sys.stderr)
         return 1

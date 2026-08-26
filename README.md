@@ -102,6 +102,11 @@ strict 16:9 dimensions are validated before publication. Generation refuses exis
 outputs by default and makes no provider request; pass `overwrite=True` in Python
 or `--force` on the CLI only when replacement is intentional.
 
+Concurrent work on the same output fails fast before contacting a provider. Generated
+and local inputs are capped at 50 MiB and 64 megapixels, parent-directory replacement
+is detected before publication, and transient HTTP retries honor a bounded
+`Retry-After` value when supplied.
+
 `prepare_editable_input.py` preserves the original high-resolution master, rejects input that is not strictly 16:9, and creates a new exact 1280x720 PNG. That PNG is input for the downstream `image-to-editable-pptx` converter; the standardizer does not itself create an editable PPTX, and the converter currently handles one slide at a time.
 
 ## As an Agent Skill
@@ -115,7 +120,7 @@ For development and package validation:
 
 ```bash
 python3 -m pip install -r requirements-dev.txt
-python3 /Users/neomei/.codex/skills/.system/skill-creator/scripts/quick_validate.py .
+python3 scripts/validate_skill.py .
 python3 -m unittest discover -s tests -v
 ```
 

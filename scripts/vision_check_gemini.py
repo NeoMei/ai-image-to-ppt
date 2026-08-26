@@ -18,6 +18,8 @@ from pathlib import Path
 
 from PIL import Image, UnidentifiedImageError
 
+from retry_delay import retry_delay
+
 
 DEFAULT_MODEL = "gemini-3.6-flash"
 DEFAULT_QUESTION = "详细描述这张图片: 配色、布局、文字内容、任何渲染问题。"
@@ -195,7 +197,7 @@ def check(img_path: str, question: str = None, retries: int = 2) -> str:
             message = _http_error_message(error, key)
             failure = VisionCheckError(f"Gemini HTTP {error.code}: {message}")
             if (error.code == 429 or error.code >= 500) and attempt < retries:
-                time.sleep(2)
+                time.sleep(retry_delay(attempt, error.headers))
                 continue
             raise failure from error
         except (
@@ -208,7 +210,7 @@ def check(img_path: str, question: str = None, retries: int = 2) -> str:
                 f"Gemini network request failed: {_redact(error, key)}"
             )
             if attempt < retries:
-                time.sleep(2)
+                time.sleep(retry_delay(attempt))
                 continue
             raise failure from error
 

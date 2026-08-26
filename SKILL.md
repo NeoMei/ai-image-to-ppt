@@ -220,5 +220,6 @@ See `examples/chapters_meta.py` for a filled-in example.
 - **Retry behavior**: Providers retry some transient failures internally; surface final failures for manual handling. There is no automatic provider fallback.
 - **Output extensions**: All providers accept `.jpg`, `.jpeg`, `.png`, and `.webp`; the requested/returned encoding and strict 16:9 dimensions are validated before publication.
 - **Safe reruns**: Generation refuses existing outputs without contacting a provider. Treat that as cached in batch jobs; pass `overwrite=True` or `--force` only for intentional regeneration.
+- **Safety boundaries**: Same-output work fails fast before provider access; images are limited to 50 MiB and 64 megapixels; directory replacement fails closed; transient HTTP retries honor bounded `Retry-After` guidance.
 - **First-page validation**: Generate 1 sample, visually confirm style, then batch.
 - **Pricing**: Provider pricing can change. Check the [OpenAI API pricing documentation](https://developers.openai.com/api/docs/pricing) instead of assuming a fixed per-image cost.
