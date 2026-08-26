@@ -30,8 +30,11 @@ def _retry_after_value(headers: Optional[Mapping[str, str]]) -> Optional[str]:
 
 
 def _parse_retry_after(value: str, now: datetime) -> Optional[float]:
-    if value.isdigit():
-        return _clamp(float(value))
+    if value.isascii() and value.isdecimal():
+        try:
+            return _clamp(float(value))
+        except (ValueError, OverflowError):
+            return None
     try:
         retry_at = parsedate_to_datetime(value)
     except (TypeError, ValueError, OverflowError):

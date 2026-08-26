@@ -42,6 +42,13 @@ class JsonResponse:
         return self.stream.read(size)
 
 
+class RawResponse(JsonResponse):
+    def __init__(self, payload):
+        self.payload = payload
+        self.stream = io.BytesIO(payload)
+        self.headers = {}
+
+
 class StreamResponse:
     def __init__(self, data, headers=None):
         self.stream = io.BytesIO(data)
@@ -86,17 +93,51 @@ class ProviderOutputContractTests(unittest.TestCase):
                 self.assertEqual(target.read_bytes(), b"existing")
 
     def test_invalid_retry_values_fail_before_credentials_and_network(self):
-        invalid_values = (-1, "2", 1.5, None, True)
+        invalid_values = (-1, "2", 1.5, None, True, 11)
         for provider in (gen_slide_openai, gen_slide_gemini, gen_slide_doubao):
             for retries in invalid_values:
                 with self.subTest(provider=provider.__name__, retries=retries):
                     with mock.patch.object(provider, "_load_api_key") as load_key, \
+                         mock.patch.object(
+                             provider, "resolve_output_path"
+                         ) as resolve_output_path, \
+                         mock.patch.object(provider, "output_lock") as output_lock, \
                          mock.patch.object(provider.urllib.request, "urlopen") as urlopen:
                         self.assertFalse(
                             provider.gen("prompt", "slide.jpg", retries=retries)
                         )
+                    resolve_output_path.assert_not_called()
+                    output_lock.assert_not_called()
                     load_key.assert_not_called()
                     urlopen.assert_not_called()
+
+    def test_deep_success_json_is_controlled_by_each_direct_cli(self):
+        deep_json = b"[" * 1500 + b"0" + b"]" * 1500
+        providers = (
+            (gen_slide_openai, "slide.jpg"),
+            (gen_slide_gemini, "slide.png"),
+            (gen_slide_doubao, "slide.jpg"),
+        )
+        for provider, filename in providers:
+            with self.subTest(provider=provider.__name__), \
+                 tempfile.TemporaryDirectory() as temp_dir, \
+                 mock.patch.object(
+                     provider, "_load_api_key", return_value="mock-key"
+                 ), mock.patch.object(
+                     provider.urllib.request,
+                     "urlopen",
+                     return_value=RawResponse(deep_json),
+                 ) as urlopen:
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    exit_code = provider.main(
+                        [str(Path(temp_dir) / filename), "prompt"]
+                    )
+
+            self.assertEqual(exit_code, 1)
+            self.assertNotIn("Traceback", output.getvalue())
+            self.assertIn("invalid", output.getvalue().lower())
+            self.assertEqual(urlopen.call_count, 1)
 
     def test_openai_rejects_non_image_wrong_ratio_and_wrong_format(self):
         cases = (

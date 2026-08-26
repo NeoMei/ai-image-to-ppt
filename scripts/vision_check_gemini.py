@@ -18,6 +18,14 @@ from pathlib import Path
 
 from PIL import Image, UnidentifiedImageError
 
+from image_output import (
+    MAX_RETRIES,
+    ImageOutputError,
+    capture_path_base,
+    parse_json_response,
+    resolve_input_path,
+    validate_retries,
+)
 from provider_credentials import APIKeyError, load_api_key, validate_api_key
 from retry_delay import retry_delay
 
@@ -181,10 +189,14 @@ def _parse_text(payload: object) -> str:
 
 def check(img_path: str, question: str = None, retries: int = 2) -> str:
     """Return Gemini's textual inspection of a PNG, JPEG, or WebP image."""
-    if retries < 0:
-        raise VisionCheckError("retries must be non-negative")
+    try:
+        retries = validate_retries(retries)
+        path_base = capture_path_base()
+        frozen_image_path = resolve_input_path(img_path, base=path_base)
+    except ImageOutputError as error:
+        raise VisionCheckError(str(error)) from error
 
-    image_data, mime = _read_image(img_path)
+    image_data, mime = _read_image(str(frozen_image_path))
     key = _load_api_key()
     if not key:
         raise VisionCheckError(
@@ -250,8 +262,8 @@ def check(img_path: str, question: str = None, retries: int = 2) -> str:
             raise failure from error
 
         try:
-            payload = json.loads(raw_response)
-        except (TypeError, ValueError, UnicodeError, json.JSONDecodeError) as error:
+            payload = parse_json_response(raw_response)
+        except ImageOutputError as error:
             raise VisionCheckError("Gemini returned invalid JSON") from error
         return _parse_text(payload)
 
@@ -259,10 +271,12 @@ def check(img_path: str, question: str = None, retries: int = 2) -> str:
 
 
 def _non_negative(value: str) -> int:
-    number = int(value)
-    if number < 0:
-        raise argparse.ArgumentTypeError("must be non-negative")
-    return number
+    try:
+        return validate_retries(int(value))
+    except (ValueError, ImageOutputError) as error:
+        raise argparse.ArgumentTypeError(
+            f"must be non-negative and at most {MAX_RETRIES}"
+        ) from error
 
 
 def _parser() -> argparse.ArgumentParser:

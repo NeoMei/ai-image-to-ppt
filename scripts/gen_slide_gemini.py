@@ -17,6 +17,9 @@ from image_output import (
     ImageOutputError,
     ImageStreamError,
     decode_base64,
+    parse_json_response,
+    prepare_target,
+    prepared_lock_target,
     preflight_output,
     publish_bytes,
     read_response_body,
@@ -191,7 +194,7 @@ def _gen_owned(
             return False
 
         try:
-            payload = json.loads(raw_response)
+            payload = parse_json_response(raw_response)
             image = _extract_image(payload, target, expected_mime)
             byte_count = publish_bytes(image, target, overwrite=overwrite)
         except (TypeError, ValueError, UnicodeError, OSError) as error:
@@ -214,12 +217,17 @@ def gen(
     overwrite: bool = False,
 ) -> bool:
     try:
-        target = str(resolve_output_path(out_path))
+        retries = validate_retries(retries)
     except ImageOutputError as error:
         print(f"  ERR: {error}")
         return False
     try:
-        with output_lock(target):
+        target = prepare_target(resolve_output_path(out_path))
+    except ImageOutputError as error:
+        print(f"  ERR: {error}")
+        return False
+    try:
+        with output_lock(prepared_lock_target(target)):
             return _gen_owned(prompt, target, retries, overwrite)
     except OutputLockError as error:
         print(f"  ERR: {error}")

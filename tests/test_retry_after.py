@@ -116,6 +116,12 @@ class RetryDelayTests(unittest.TestCase):
         )
         self.assertEqual(retry_delay.retry_delay(20, None), 60)
 
+    def test_non_ascii_digit_retry_after_uses_fallback(self):
+        self.assertEqual(
+            retry_delay.retry_delay(0, {"Retry-After": "²"}),
+            2,
+        )
+
 
 class RetryAfterIntegrationTests(unittest.TestCase):
     def test_openai_generation_uses_retry_after(self):

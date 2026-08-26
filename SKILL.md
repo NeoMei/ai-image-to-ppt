@@ -1,6 +1,6 @@
 ---
 name: ai-image-to-ppt
-description: Use when generating 16:9 presentation slide images from a topic using AI image generation models, then packaging them into PDF/PPTX. Triggers include "用 AI 生成 PPT", "nano banana 生成幻灯片", "方舟 doubao-seedream 生成图", "把主题/大纲变成图文 PPT", "批量生成教科书风插图", "图片打包成 PDF PPTX", "16:9 slide generation". Especially useful for converting book outlines, course materials, or technical documentation into visual decks.
+description: Use when generating 16:9 presentation slide images from a topic using AI image generation models, then packaging them into PDF/PPTX. Triggers include "用 AI 生成 PPT", "OpenAI GPT Image 2 生成 PPT", "gpt-image-2 slide generation", "nano banana 生成幻灯片", "方舟 doubao-seedream 生成图", "把主题/大纲变成图文 PPT", "批量生成教科书风插图", "图片打包成 PDF PPTX", "16:9 slide generation". Especially useful for converting book outlines, course materials, or technical documentation into visual decks.
 ---
 
 # AI Image to PPT
@@ -123,21 +123,52 @@ python3 scripts/vision_check_gemini.py out/slide_01.jpg "精确数一下卡片�
 
 ### Step 5: Export to PDF + PPTX
 
-```bash
-# CLI (glob accepts space-separated paths)
-python3 scripts/export_images.py "deck_name" out/*.jpg
+Use one explicit manifest as the source of truth. This supports mixed suffixes,
+keeps page order deterministic, and rejects duplicate slide IDs before export.
+Update the paths to match the artifacts actually generated; do not use a
+single-suffix glob.
 
-# Python
-from export_images import export_pdf, export_pptx
-files = sorted(__import__('glob').glob("out/*.jpg"))
-export_pdf(files, "deck.pdf")
-export_pptx(files, "deck.pptx")
+```python
+from pathlib import Path
+import subprocess
+import sys
+
+SLIDES = [
+    "out/slide_01.jpg",
+    "out/slide_02.png",
+    "out/slide_03.webp",
+]
+if len(SLIDES) != len(set(SLIDES)):
+    raise SystemExit("duplicate slide paths in SLIDES")
+SLIDE_IDS = [Path(path).stem for path in SLIDES]
+if len(SLIDE_IDS) != len(set(SLIDE_IDS)):
+    raise SystemExit("duplicate slide IDs across output suffixes")
+missing = [path for path in SLIDES if not Path(path).is_file()]
+if missing:
+    raise SystemExit(f"missing slide files: {missing}")
+
+# Keep True for the CLI route; set False to use the Python API instead.
+USE_CLI = True
+if USE_CLI:
+    subprocess.run(
+        [sys.executable, "scripts/export_images.py", "deck_name", *SLIDES],
+        check=True,
+    )
+else:
+    sys.path.insert(0, "scripts")
+    from export_images import export_pdf, export_pptx
+
+    export_pdf(SLIDES, "deck.pdf")
+    export_pptx(SLIDES, "deck.pptx")
 ```
 
 The CLI validates all source images before publishing, creates missing output
-directories, and treats the PDF/PPTX files as one transactional pair. Existing
-outputs are preserved unless `--force` is supplied. Transparent pixels are
-composited onto the style's cream `#f8f5f0` background rather than black.
+directories, and uses a durable same-directory journal so an interrupted
+PDF/PPTX publication is recovered on the next export. Existing outputs are
+preserved unless `--force` is supplied. Transparent pixels are composited onto
+the style's cream `#f8f5f0` background rather than black. A deck is limited to
+128 slides and 512 MiB of aggregate source bytes; over-limit Python or CLI calls
+stop before image decoding or PDF/PPTX serialization.
 
 ## Style Template (Educational Textbook)
 
@@ -222,6 +253,6 @@ See `examples/chapters_meta.py` for a filled-in example.
 - **Retry behavior**: Providers retry some transient failures internally; surface final failures for manual handling. There is no automatic provider fallback.
 - **Output extensions**: OpenAI and Doubao accept `.jpg`, `.jpeg`, `.png`, and `.webp`. Gemini accepts `.png`, `.jpg`, and `.jpeg`: PNG by default, while a JPEG suffix requests `IMAGE_JPEG`. Unsupported Gemini suffixes fail before credential lookup or network access. Only Gemini validates the provider-declared response MIME type. All providers validate the actual image encoding and strict 16:9 dimensions before publication.
 - **Safe reruns**: Generation refuses existing outputs without contacting a provider. Treat that as cached in batch jobs; pass `overwrite=True` or `--force` only for intentional regeneration.
-- **Safety boundaries**: Same-output work fails fast before provider access; images are limited to 50 MiB and 64 megapixels; directory replacement fails closed; transient HTTP retries honor bounded `Retry-After` guidance.
+- **Safety boundaries**: Same-output work fails fast before provider access. Generation outputs and inputs to ordinary export or editable preparation are capped at 50 MiB and 64 megapixels. Vision-check inputs have a separate 14 MiB limit. Directory replacement fails closed; transient HTTP retries honor bounded `Retry-After` guidance.
 - **First-page validation**: Generate 1 sample, visually confirm style, then batch.
 - **Pricing**: Provider pricing can change. Check the [OpenAI API pricing documentation](https://developers.openai.com/api/docs/pricing) instead of assuming a fixed per-image cost.

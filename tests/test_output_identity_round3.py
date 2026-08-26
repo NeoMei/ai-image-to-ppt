@@ -256,14 +256,22 @@ class FilesystemAliasLockTests(unittest.TestCase):
             ), mock.patch.object(
                 export_images, "_save_pptx", side_effect=fake_save_pptx
             ), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                first_source = parent / "A"
+                second_source = parent / "B"
+                first_source.write_bytes(b"A")
+                second_source.write_bytes(b"B")
                 first = threading.Thread(
                     target=lambda: results.append(
-                        export_images.export_deck(["A"], str(parent / "deck"))
+                        export_images.export_deck(
+                            [str(first_source)], str(parent / "deck")
+                        )
                     )
                 )
                 second = threading.Thread(
                     target=lambda: results.append(
-                        export_images.export_deck(["B"], str(parent / "DECK"))
+                        export_images.export_deck(
+                            [str(second_source)], str(parent / "DECK")
+                        )
                     )
                 )
                 first.start()

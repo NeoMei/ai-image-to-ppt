@@ -104,7 +104,7 @@ class RouterTests(unittest.TestCase):
         import_module.assert_not_called()
 
     def test_python_router_rejects_invalid_retry_types_before_importing(self):
-        for retries in ("2", 1.5, None, True, [], -1):
+        for retries in ("2", 1.5, None, True, [], -1, 11):
             with self.subTest(retries=retries), mock.patch.object(
                 gen_slide.importlib, "import_module"
             ) as import_module:
@@ -142,6 +142,15 @@ class RouterTests(unittest.TestCase):
             gen_slide.main(["slide.jpg", "draw a slide", "--retries", "-1"])
         self.assertEqual(raised.exception.code, 2)
         self.assertIn("non-negative", stderr.getvalue())
+        generate.assert_not_called()
+
+    def test_cli_rejects_retries_above_shared_limit_with_usage_error(self):
+        stderr = io.StringIO()
+        with redirect_stderr(stderr), self.assertRaises(SystemExit) as raised, \
+             mock.patch.object(gen_slide, "gen") as generate:
+            gen_slide.main(["slide.jpg", "draw a slide", "--retries", "11"])
+        self.assertEqual(raised.exception.code, 2)
+        self.assertIn("at most 10", stderr.getvalue())
         generate.assert_not_called()
 
     def test_cli_help_describes_provider_specific_output_behavior(self):

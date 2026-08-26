@@ -5,6 +5,8 @@ import argparse
 import importlib
 from typing import Optional, Sequence
 
+from image_output import MAX_RETRIES, ImageOutputError, validate_retries
+
 ENGINE_MODULES = {
     "openai": "gen_slide_openai",
     "gemini": "gen_slide_gemini",
@@ -14,10 +16,12 @@ DEFAULT_ENGINE = "openai"
 
 
 def _non_negative_int(value: str) -> int:
-    parsed = int(value)
-    if parsed < 0:
-        raise argparse.ArgumentTypeError("must be non-negative")
-    return parsed
+    try:
+        return validate_retries(int(value))
+    except (ValueError, ImageOutputError) as error:
+        raise argparse.ArgumentTypeError(
+            f"must be non-negative and at most {MAX_RETRIES}"
+        ) from error
 
 
 def gen(
@@ -27,8 +31,10 @@ def gen(
     retries: int = 2,
     overwrite: bool = False,
 ) -> bool:
-    if not isinstance(retries, int) or isinstance(retries, bool) or retries < 0:
-        print("  ERR: retries must be a non-negative integer")
+    try:
+        retries = validate_retries(retries)
+    except ImageOutputError as error:
+        print(f"  ERR: {error}")
         return False
     if not isinstance(overwrite, bool):
         print("  ERR: overwrite must be a boolean")

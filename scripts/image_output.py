@@ -4,6 +4,7 @@ import base64
 import binascii
 import http.client
 import io
+import json
 import os
 import stat
 import sys
@@ -37,6 +38,8 @@ MAX_ENCODED_IMAGE_BYTES = 4 * ((MAX_IMAGE_BYTES + 2) // 3)
 MAX_PROVIDER_RESPONSE_BYTES = MAX_ENCODED_IMAGE_BYTES + 1024 * 1024
 PROVIDER_RESPONSE_READ_CHUNK_BYTES = 64 * 1024
 MAX_PROVIDER_RESPONSE_READS = 4096
+MAX_RETRIES = 10
+MAX_JSON_NESTING = 100
 
 
 class ImageOutputError(ValueError):
@@ -87,9 +90,37 @@ TargetValue = Union[Path, PreparedTarget]
 
 
 def validate_retries(retries: object) -> int:
-    if isinstance(retries, bool) or not isinstance(retries, int) or retries < 0:
-        raise ImageOutputError("retries must be a non-boolean integer >= 0")
+    if (
+        isinstance(retries, bool)
+        or not isinstance(retries, int)
+        or retries < 0
+        or retries > MAX_RETRIES
+    ):
+        raise ImageOutputError(
+            f"retries must be a non-boolean integer >= 0 and at most {MAX_RETRIES}"
+        )
     return retries
+
+
+def parse_json_response(raw_response: object) -> object:
+    """Parse bounded provider JSON without leaking decoder recursion failures."""
+    try:
+        parsed = json.loads(raw_response)
+    except (TypeError, ValueError, UnicodeError, RecursionError) as error:
+        raise ImageOutputError("provider response is not valid JSON") from error
+
+    # CPython's JSON decoder recursion behavior differs by version. Enforce an
+    # explicit, iterative limit so the public error contract is deterministic.
+    pending = [(parsed, 0)]
+    while pending:
+        value, depth = pending.pop()
+        if not isinstance(value, (dict, list)):
+            continue
+        if depth > MAX_JSON_NESTING:
+            raise ImageOutputError("provider response is not valid JSON")
+        children = value.values() if isinstance(value, dict) else value
+        pending.extend((child, depth + 1) for child in children)
+    return parsed
 
 
 def output_format(out_path: str) -> str:
@@ -326,14 +357,29 @@ def _as_prepared_target(target: TargetValue) -> PreparedTarget:
     return prepare_target(Path(target))
 
 
-def preflight_output(out_path: str, overwrite: bool = False) -> PreparedTarget:
+def prepared_lock_target(
+    target: PreparedTarget,
+    basename: Optional[str] = None,
+) -> Path:
+    """Build a stable lock key from a captured real parent directory."""
+    name = target.name if basename is None else basename
+    if not isinstance(name, str) or not name or Path(name).name != name:
+        raise ImageOutputError("invalid output lock basename")
+    return target.parent.real_path / name
+
+
+def preflight_output(
+    out_path: TargetValue,
+    overwrite: bool = False,
+) -> PreparedTarget:
     if not isinstance(overwrite, bool):
         raise ImageOutputError("overwrite must be a boolean")
 
     probe_path = None
     try:
-        prepared = prepare_target(Path(out_path))
+        prepared = _as_prepared_target(out_path)
         target = prepared.path
+        verify_parent_identity(prepared.parent)
         if os.path.lexists(target):
             if not overwrite:
                 raise ImageOutputError(
@@ -344,7 +390,6 @@ def preflight_output(out_path: str, overwrite: bool = False) -> PreparedTarget:
                 raise ImageOutputError(
                     "output path exists and is not a regular file"
                 )
-        verify_parent_identity(prepared.parent)
         descriptor, probe_path = tempfile.mkstemp(
             prefix=".write-test.", dir=str(prepared.parent.path)
         )

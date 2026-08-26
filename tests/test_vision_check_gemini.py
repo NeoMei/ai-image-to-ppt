@@ -1,3 +1,4 @@
+import base64
 import io
 import json
 import os
@@ -105,6 +106,79 @@ class GeminiVisionCredentialTests(unittest.TestCase):
 
 
 class GeminiVisionInputTests(unittest.TestCase):
+    def test_python_api_rejects_invalid_retries_before_input_key_or_network(self):
+        invalid_values = (-1, "2", 1.5, None, True, 11)
+        for retries in invalid_values:
+            with self.subTest(retries=retries), mock.patch.object(
+                vision_check_gemini, "_read_image"
+            ) as read_image, mock.patch.object(
+                vision_check_gemini, "_load_api_key"
+            ) as load_key, mock.patch.object(
+                vision_check_gemini.urllib.request, "urlopen"
+            ) as urlopen:
+                with self.assertRaisesRegex(
+                    vision_check_gemini.VisionCheckError,
+                    "retries",
+                ):
+                    vision_check_gemini.check("slide.png", retries=retries)
+
+            read_image.assert_not_called()
+            load_key.assert_not_called()
+            urlopen.assert_not_called()
+
+    def test_relative_final_symlink_is_frozen_before_callbacks_change_cwd(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            approved = root / "approved"
+            redirected = root / "redirected"
+            approved.mkdir()
+            redirected.mkdir()
+            original = approved / "original.png"
+            replacement = redirected / "replacement.png"
+            Image.new("RGB", (32, 18), "red").save(original)
+            Image.new("RGB", (32, 18), "blue").save(replacement)
+            alias = approved / "source.png"
+            alias.symlink_to(original)
+            expected_original = original.resolve(strict=True)
+            original_cwd = Path.cwd()
+            real_read_image = vision_check_gemini._read_image
+            observed_paths = []
+
+            def redirect_after_path_freeze(path):
+                observed_paths.append(Path(path))
+                alias.unlink()
+                alias.symlink_to(replacement)
+                os.chdir(redirected)
+                return real_read_image(path)
+
+            try:
+                os.chdir(approved)
+                with mock.patch.object(
+                    vision_check_gemini,
+                    "_read_image",
+                    side_effect=redirect_after_path_freeze,
+                ), mock.patch.object(
+                    vision_check_gemini,
+                    "_load_api_key",
+                    return_value="mock-key",
+                ), mock.patch.object(
+                    vision_check_gemini.urllib.request,
+                    "urlopen",
+                    return_value=successful_response(),
+                ) as urlopen:
+                    self.assertEqual(
+                        vision_check_gemini.check("source.png", retries=0),
+                        "looks good",
+                    )
+            finally:
+                os.chdir(original_cwd)
+
+        self.assertEqual(observed_paths, [expected_original])
+        payload = json.loads(urlopen.call_args.args[0].data)
+        encoded = payload["contents"][0]["parts"][1]["inline_data"]["data"]
+        with Image.open(io.BytesIO(base64.b64decode(encoded))) as image:
+            self.assertEqual(image.getpixel((0, 0)), (255, 0, 0))
+
     def test_png_jpeg_and_webp_are_detected_from_content(self):
         cases = [("mystery.bin", "PNG", "image/png"),
                  ("mystery.data", "JPEG", "image/jpeg"),
@@ -303,6 +377,16 @@ class GeminiVisionResponseTests(unittest.TestCase):
                     vision_check_gemini.check(str(image_path), retries=2)
                 self.assertEqual(urlopen.call_count, 1)
 
+    def test_deep_success_json_is_a_controlled_domain_error(self):
+        response = FakeResponse(b"[" * 1500 + b"0" + b"]" * 1500)
+        image_path, urlopen = self._check_with_response(response)
+        with self.assertRaisesRegex(
+            vision_check_gemini.VisionCheckError,
+            "invalid JSON",
+        ):
+            vision_check_gemini.check(str(image_path), retries=0)
+        self.assertEqual(urlopen.call_count, 1)
+
     def test_safety_feedback_cannot_echo_api_key(self):
         response = FakeResponse({
             "promptFeedback": {"blockReason": "known-secret-key"}
@@ -486,6 +570,36 @@ class GeminiVisionCliTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, 2)
         self.assertIn("non-negative", stderr.getvalue())
         check.assert_not_called()
+
+    def test_retries_above_shared_limit_are_rejected_as_usage_error(self):
+        stderr = io.StringIO()
+        with redirect_stderr(stderr), self.assertRaises(SystemExit) as raised, \
+             mock.patch.object(vision_check_gemini, "check") as check:
+            vision_check_gemini.main(["slide.png", "--retries", "11"])
+        self.assertEqual(raised.exception.code, 2)
+        self.assertIn("at most 10", stderr.getvalue())
+        check.assert_not_called()
+
+    def test_deep_success_json_cli_has_no_traceback(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = Path(temp_dir) / "slide.png"
+            make_image(image_path)
+            response = FakeResponse(b"[" * 1500 + b"0" + b"]" * 1500)
+            stderr = io.StringIO()
+            with mock.patch.object(
+                vision_check_gemini, "_load_api_key", return_value="mock-key"
+            ), mock.patch.object(
+                vision_check_gemini.urllib.request,
+                "urlopen",
+                return_value=response,
+            ), redirect_stderr(stderr):
+                exit_code = vision_check_gemini.main(
+                    [str(image_path), "--retries", "0"]
+                )
+
+        self.assertEqual(exit_code, 1)
+        self.assertIn("invalid JSON", stderr.getvalue())
+        self.assertNotIn("Traceback", stderr.getvalue())
 
 
 if __name__ == "__main__":

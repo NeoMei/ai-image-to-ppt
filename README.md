@@ -64,14 +64,16 @@ python3 scripts/prepare_editable_input.py \
 # 视觉自检
 python3 scripts/vision_check_gemini.py out/slide_01.jpg "精确数一下卡片数量是否正确?"
 
-# 打包导出
-python3 scripts/export_images.py "deck_name" out/*.jpg
+# 打包导出：使用下方显式清单，兼容混合图片格式并固定页序
 ```
 
 The export command validates every image before publishing either artifact,
-creates missing parent directories, and publishes the PDF/PPTX pair
-transactionally. It refuses existing outputs by default; add `--force` to
-replace an existing pair with rollback protection.
+creates missing parent directories, and uses a durable same-directory journal
+to make interrupted PDF/PPTX publication recoverable on the next export. It
+refuses existing outputs by default; add `--force` to replace an existing pair
+with rollback and crash-recovery protection. One deck accepts at most 128 slides
+and 512 MiB of aggregate source image bytes; larger Python or CLI requests fail
+before image decoding or PDF/PPTX serialization.
 
 脚本内调用（批量并发生成见 [SKILL.md](SKILL.md)）：
 
@@ -82,6 +84,45 @@ from gen_slide import gen
 
 gen("<detailed prompt>", "out/slide_01.jpg")
 gen("<detailed prompt>", "out/slide_01.png", engine="gemini")
+```
+
+For a deck, use one explicit manifest as the source of truth. Its order is the
+slide order, mixed suffixes are supported, and duplicate slide IDs fail before
+export instead of producing duplicate pages. Update the paths to match the
+artifacts you actually generated; do not use a single-suffix glob.
+
+```python
+from pathlib import Path
+import subprocess
+import sys
+
+SLIDES = [
+    "out/slide_01.jpg",
+    "out/slide_02.png",
+    "out/slide_03.webp",
+]
+if len(SLIDES) != len(set(SLIDES)):
+    raise SystemExit("duplicate slide paths in SLIDES")
+SLIDE_IDS = [Path(path).stem for path in SLIDES]
+if len(SLIDE_IDS) != len(set(SLIDE_IDS)):
+    raise SystemExit("duplicate slide IDs across output suffixes")
+missing = [path for path in SLIDES if not Path(path).is_file()]
+if missing:
+    raise SystemExit(f"missing slide files: {missing}")
+
+# Keep True for the CLI route; set False to use the Python API instead.
+USE_CLI = True
+if USE_CLI:
+    subprocess.run(
+        [sys.executable, "scripts/export_images.py", "deck_name", *SLIDES],
+        check=True,
+    )
+else:
+    sys.path.insert(0, "scripts")
+    from export_images import export_pdf, export_pptx
+
+    export_pdf(SLIDES, "deck.pdf")
+    export_pptx(SLIDES, "deck.pptx")
 ```
 
 ## Scripts
@@ -107,10 +148,11 @@ publication. Generation refuses existing
 outputs by default and makes no provider request; pass `overwrite=True` in Python
 or `--force` on the CLI only when replacement is intentional.
 
-Concurrent work on the same output fails fast before contacting a provider. Generated
-and local inputs are capped at 50 MiB and 64 megapixels, parent-directory replacement
-is detected before publication, and transient HTTP retries honor a bounded
-`Retry-After` value when supplied.
+Concurrent work on the same output fails fast before contacting a provider.
+Generation outputs and inputs to ordinary export or editable preparation are
+capped at 50 MiB and 64 megapixels. Vision-check inputs have a separate 14 MiB
+limit. Parent-directory replacement is detected before publication, and
+transient HTTP retries honor a bounded `Retry-After` value when supplied.
 
 `prepare_editable_input.py` preserves the original high-resolution master, rejects input that is not strictly 16:9, and creates a new exact 1280x720 PNG. That PNG is input for the downstream `image-to-editable-pptx` converter; the standardizer does not itself create an editable PPTX, and the converter currently handles one slide at a time.
 

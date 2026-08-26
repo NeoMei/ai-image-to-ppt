@@ -251,14 +251,18 @@ class OutputOwnershipIntegrationTests(unittest.TestCase):
              mock.patch.object(export_images, "_save_pptx", side_effect=fake_save_pptx), \
              redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
             prefix = Path(temp_dir) / "deck"
+            first_source = Path(temp_dir) / "A"
+            second_source = Path(temp_dir) / "B"
+            first_source.write_bytes(b"A")
+            second_source.write_bytes(b"B")
             first = threading.Thread(
                 target=lambda: results.append(
-                    export_images.export_deck(["A"], str(prefix))
+                    export_images.export_deck([str(first_source)], str(prefix))
                 )
             )
             second = threading.Thread(
                 target=lambda: results.append(
-                    export_images.export_deck(["B"], str(prefix))
+                    export_images.export_deck([str(second_source)], str(prefix))
                 )
             )
 

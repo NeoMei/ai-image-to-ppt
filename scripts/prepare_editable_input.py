@@ -10,9 +10,11 @@ from typing import Optional, Sequence
 from PIL import Image, UnidentifiedImageError
 from image_output import (
     ImageOutputError,
+    PreparedTarget,
     capture_path_base,
     load_image,
     prepare_target,
+    prepared_lock_target,
     resolve_input_path,
     resolve_output_path,
     verify_parent_identity,
@@ -51,9 +53,9 @@ def _flatten_transparency(image: Image.Image) -> Image.Image:
     return Image.alpha_composite(background, rgba).convert("RGB")
 
 
-def _prepare_owned(input_path: str, output_path: str) -> bool:
+def _prepare_owned(input_path: str, prepared_target: PreparedTarget) -> bool:
     source = Path(input_path)
-    target = Path(output_path)
+    target = prepared_target.path
 
     if target.suffix.lower() != ".png":
         print("  ERR: editable converter input must use a .png output path")
@@ -63,7 +65,7 @@ def _prepare_owned(input_path: str, output_path: str) -> bool:
         return False
 
     try:
-        prepared_target = prepare_target(target)
+        verify_parent_identity(prepared_target.parent)
     except ImageOutputError as error:
         print(f"  ERR: failed to prepare output path: {error}")
         return False
@@ -151,8 +153,9 @@ def prepare(input_path: str, output_path: str) -> bool:
         base = capture_path_base()
         target = resolve_output_path(output_path, base=base)
         source = resolve_input_path(input_path, base=base)
-        with output_lock(target):
-            return _prepare_owned(str(source), str(target))
+        prepared_target = prepare_target(target)
+        with output_lock(prepared_lock_target(prepared_target)):
+            return _prepare_owned(str(source), prepared_target)
     except (ImageOutputError, OutputLockError) as error:
         print(f"  ERR: {error}")
         return False

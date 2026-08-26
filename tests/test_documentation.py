@@ -46,6 +46,38 @@ class DocumentationTests(unittest.TestCase):
     def test_quick_start_creates_output_directory(self):
         self.assertIn("mkdir -p out", self.readme)
 
+    def test_export_examples_use_one_explicit_mixed_format_manifest(self):
+        for document in (self.readme, self.skill):
+            self.assertNotIn("out/*.jpg", document)
+            self.assertIn("SLIDES = [", document)
+            self.assertIn('"out/slide_01.jpg"', document)
+            self.assertIn('"out/slide_02.png"', document)
+            self.assertIn('"out/slide_03.webp"', document)
+            self.assertIn("len(SLIDES) != len(set(SLIDES))", document)
+            self.assertIn("*SLIDES", document)
+            self.assertIn("USE_CLI = True", document)
+            self.assertIn("if USE_CLI:", document)
+            self.assertIn("else:", document)
+            self.assertIn('export_pdf(SLIDES, "deck.pdf")', document)
+            self.assertIn('export_pptx(SLIDES, "deck.pptx")', document)
+
+    def test_export_manifest_rejects_duplicate_slide_ids_across_suffixes(self):
+        for document in (self.readme, self.skill):
+            self.assertIn(
+                "SLIDE_IDS = [Path(path).stem for path in SLIDES]",
+                document,
+            )
+            self.assertIn(
+                "len(SLIDE_IDS) != len(set(SLIDE_IDS))",
+                document,
+            )
+
+    def test_skill_discovery_names_the_primary_openai_engine(self):
+        frontmatter = self.skill.split("---", 2)[1]
+        self.assertIn("OpenAI", frontmatter)
+        self.assertIn("GPT Image 2", frontmatter)
+        self.assertIn("gpt-image-2", frontmatter)
+
     def test_batch_example_reports_boolean_result(self):
         self.assertIn('return name, "cached"', self.skill)
         self.assertIn('return name, "done" if ok else "failed"', self.skill)
@@ -78,9 +110,27 @@ class DocumentationTests(unittest.TestCase):
         for document in (self.readme, self.skill):
             self.assertIn("--force", document)
             self.assertIn("refuses existing", document)
-            self.assertIn("50 MiB", document)
-            self.assertIn("64 megapixels", document)
+            normalized = " ".join(document.split())
+            self.assertIn(
+                "Generation outputs and inputs to ordinary export or editable "
+                "preparation are capped at 50 MiB and 64 megapixels.",
+                normalized,
+            )
+            self.assertIn(
+                "Vision-check inputs have a separate 14 MiB limit.",
+                normalized,
+            )
+            self.assertNotIn("images are limited to 50 MiB", normalized)
+            self.assertNotIn("Generated and local inputs are capped", normalized)
             self.assertIn("Retry-After", document)
+
+    def test_pair_export_is_documented_as_crash_recoverable(self):
+        for document in (self.readme, self.skill):
+            normalized = " ".join(document.split())
+            self.assertIn("recover", normalized.lower())
+            self.assertIn("next export", normalized.lower())
+            self.assertNotIn("transactionally", normalized.lower())
+            self.assertNotIn("transactional pair", normalized.lower())
 
 
 if __name__ == "__main__":

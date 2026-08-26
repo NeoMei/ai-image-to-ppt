@@ -28,6 +28,7 @@ PathValue = Union[str, os.PathLike]
 _LOCK_DIRECTORY = Path(tempfile.gettempdir()) / "ai-image-to-ppt-output-locks"
 _REGISTRY_GUARD = threading.Lock()
 _THREAD_LOCKS = {}
+_THREAD_LOCK_REFS = {}
 _SEMANTICS_GUARD = threading.Lock()
 _FILESYSTEM_SEMANTICS = {}
 
@@ -143,7 +144,22 @@ def _thread_lock(identity: str) -> threading.Lock:
         if lock is None:
             lock = threading.Lock()
             _THREAD_LOCKS[identity] = lock
+            _THREAD_LOCK_REFS[identity] = 0
+        _THREAD_LOCK_REFS[identity] += 1
         return lock
+
+
+def _release_thread_lock_reference(identity: str, lock: threading.Lock) -> None:
+    """Forget an idle registry entry after its final caller is finished."""
+    with _REGISTRY_GUARD:
+        if _THREAD_LOCKS.get(identity) is not lock:
+            return
+        remaining = _THREAD_LOCK_REFS[identity] - 1
+        if remaining <= 0 and not lock.locked():
+            _THREAD_LOCK_REFS.pop(identity, None)
+            _THREAD_LOCKS.pop(identity, None)
+        else:
+            _THREAD_LOCK_REFS[identity] = remaining
 
 
 def _open_lock_file(path: Path) -> int:
@@ -195,7 +211,13 @@ def output_lock(
     """Own one output key until the context exits, failing fast if it is busy."""
     identity = _identity(target, namespace)
     thread_lock = _thread_lock(identity)
-    if not thread_lock.acquire(blocking=False):
+    try:
+        acquired = thread_lock.acquire(blocking=False)
+    except BaseException:
+        _release_thread_lock_reference(identity, thread_lock)
+        raise
+    if not acquired:
+        _release_thread_lock_reference(identity, thread_lock)
         raise OutputLockBusy(f"output is busy: {Path(target)}")
 
     descriptor = None
@@ -223,3 +245,4 @@ def output_lock(
                 os.close(descriptor)
         finally:
             thread_lock.release()
+            _release_thread_lock_reference(identity, thread_lock)
