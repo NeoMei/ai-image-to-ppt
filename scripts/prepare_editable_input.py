@@ -12,6 +12,7 @@ from image_output import (
     ImageOutputError,
     load_image,
     prepare_target,
+    resolve_output_path,
     verify_parent_identity,
 )
 from output_lock import OutputLockError, output_lock
@@ -145,9 +146,10 @@ def _prepare_owned(input_path: str, output_path: str) -> bool:
 
 def prepare(input_path: str, output_path: str) -> bool:
     try:
-        with output_lock(output_path):
-            return _prepare_owned(input_path, output_path)
-    except OutputLockError as error:
+        target = resolve_output_path(output_path)
+        with output_lock(target):
+            return _prepare_owned(input_path, str(target))
+    except (ImageOutputError, OutputLockError) as error:
         print(f"  ERR: {error}")
         return False
 

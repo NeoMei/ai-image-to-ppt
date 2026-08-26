@@ -1,8 +1,9 @@
 import io
+import os
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import contextmanager, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -41,6 +42,40 @@ class PrepareEditableInputTests(unittest.TestCase):
                 self.assertEqual(image.format, "PNG")
                 self.assertEqual(image.size, (1280, 720))
                 self.assertEqual(image.mode, "RGB")
+
+    def test_prepare_freezes_relative_target_before_lock_yields_and_cwd_changes(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            approved = root / "approved"
+            redirected = root / "redirected"
+            approved.mkdir()
+            redirected.mkdir()
+            source = root / "master.jpg"
+            Image.new("RGB", (1600, 900), "navy").save(source, format="JPEG")
+            original_cwd = Path.cwd()
+
+            @contextmanager
+            def change_cwd_before_yield(_target, namespace="output"):
+                os.chdir(redirected)
+                yield
+
+            try:
+                os.chdir(approved)
+                with mock.patch.object(
+                    prepare_editable_input,
+                    "output_lock",
+                    change_cwd_before_yield,
+                ):
+                    self.assertTrue(
+                        prepare_editable_input.prepare(
+                            str(source), "output/slide.png"
+                        )
+                    )
+            finally:
+                os.chdir(original_cwd)
+
+            self.assertTrue((approved / "output" / "slide.png").is_file())
+            self.assertFalse((redirected / "output" / "slide.png").exists())
 
     def test_rejects_non_16_by_9_source_without_creating_output(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -97,6 +132,17 @@ class PrepareEditableInputTests(unittest.TestCase):
             self.assertFalse(result)
             self.assertEqual(source.read_bytes(), source_before)
             self.assertEqual(blocked_parent.read_bytes(), b"existing-parent-file")
+
+    def test_invalid_output_target_is_controlled_before_reading_source(self):
+        output = io.StringIO()
+        with mock.patch.object(prepare_editable_input, "load_image") as load_image, \
+             redirect_stdout(output):
+            self.assertFalse(
+                prepare_editable_input.prepare("ignored.jpg", "bad\0target.png")
+            )
+
+        load_image.assert_not_called()
+        self.assertIn("invalid output target", output.getvalue())
 
     def test_png_save_failure_removes_created_temp_file(self):
         with tempfile.TemporaryDirectory() as temp_dir:

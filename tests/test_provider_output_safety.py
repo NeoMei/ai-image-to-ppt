@@ -175,7 +175,11 @@ class GeminiContractTests(unittest.TestCase):
         self.assertEqual(request.get_header("X-goog-api-key"), "secret-key")
         self.assertEqual(
             body["generationConfig"]["responseFormat"]["image"],
-            {"aspectRatio": "16:9", "imageSize": "2K"},
+            {
+                "aspectRatio": "16:9",
+                "imageSize": "2K",
+                "mimeType": "IMAGE_JPEG",
+            },
         )
 
     def test_default_model_is_current_stable_image_model(self):

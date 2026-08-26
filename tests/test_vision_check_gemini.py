@@ -84,7 +84,7 @@ class GeminiVisionCredentialTests(unittest.TestCase):
 
     def test_secret_file_is_used_when_environment_key_is_missing(self):
         with mock.patch.dict(os.environ, {}, clear=True), \
-             mock.patch.object(Path, "read_text", return_value=" file-key\n"):
+             mock.patch.object(Path, "read_text", return_value="file-key\n"):
             self.assertEqual(vision_check_gemini._load_api_key(), "file-key")
 
     def test_unreadable_secret_file_is_reported_only_when_check_runs(self):

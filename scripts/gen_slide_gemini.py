@@ -8,6 +8,7 @@ import os
 import re
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Optional, Sequence
@@ -16,19 +17,20 @@ from image_output import (
     ImageOutputError,
     ImageStreamError,
     decode_base64,
-    expected_mime_type,
     preflight_output,
     publish_bytes,
     read_response_body,
+    resolve_output_path,
     validate_retries,
 )
 from output_lock import OutputLockError, output_lock
+from provider_credentials import APIKeyError, load_api_key, validate_api_key
 from retry_delay import retry_delay
 
 SECRET_PATH = Path("~/.secrets/gemini_api_key").expanduser()
 DEFAULT_MODEL = "gemini-3.1-flash-image"
 URL_TEMPLATE = (
-    "https://generativelanguage.googleapis.com/v1beta/models/"
+    "https://generativelanguage.googleapis.com/v1/models/"
     "{}:generateContent"
 )
 KEY_LIKE_PATTERN = re.compile(r"(?<![A-Za-z0-9_-])sk-[A-Za-z0-9_-]+")
@@ -42,13 +44,21 @@ TRANSPORT_ERRORS = (
 
 
 def _load_api_key() -> str:
-    key = os.environ.get("GEMINI_API_KEY", "").strip()
-    if key:
-        return key
-    try:
-        return SECRET_PATH.read_text(encoding="utf-8").strip()
-    except (OSError, UnicodeError):
-        return ""
+    return load_api_key("GEMINI_API_KEY", SECRET_PATH)
+
+
+def _output_config(out_path: str):
+    extension = Path(out_path).suffix.lower()
+    image_config = {"aspectRatio": "16:9", "imageSize": "2K"}
+    if extension == ".png":
+        return "image/png", image_config
+    if extension in {".jpg", ".jpeg"}:
+        image_config["mimeType"] = "IMAGE_JPEG"
+        return "image/jpeg", image_config
+    raise ImageOutputError(
+        f"Unsupported Gemini output extension '{extension or '<none>'}'. "
+        "Use: .jpeg, .jpg, .png"
+    )
 
 
 def _redact(message: object, key: str) -> str:
@@ -75,7 +85,7 @@ def _http_error_message(error: urllib.error.HTTPError, key: str) -> str:
     return _redact(error.reason or "request failed", key)
 
 
-def _extract_image(payload: object, target: Path) -> bytes:
+def _extract_image(payload: object, target: Path, expected_mime: str) -> bytes:
     if not isinstance(payload, dict):
         raise ImageOutputError("response envelope must be an object")
     candidates = payload.get("candidates")
@@ -98,10 +108,9 @@ def _extract_image(payload: object, target: Path) -> bytes:
         if not isinstance(inline, dict) or not inline.get("data"):
             continue
         declared_mime = inline.get("mimeType") or inline.get("mime_type")
-        expected_mime = expected_mime_type(str(target))
-        if declared_mime is not None and not isinstance(declared_mime, str):
-            raise ImageOutputError("response MIME type must be text")
-        if declared_mime and declared_mime.lower() != expected_mime:
+        if not isinstance(declared_mime, str) or not declared_mime:
+            raise ImageOutputError("response MIME type must be non-empty text")
+        if declared_mime.lower() != expected_mime:
             raise ImageOutputError(
                 f"response MIME type {declared_mime} does not match {target.suffix.lower()}"
             )
@@ -118,6 +127,7 @@ def _gen_owned(
     """Generate one strict 16:9 image. Return True only after atomic publication."""
     try:
         retries = validate_retries(retries)
+        expected_mime, image_config = _output_config(out_path)
         target = preflight_output(out_path, overwrite=overwrite)
     except ImageOutputError as error:
         print(f"  ERR: {error}")
@@ -130,15 +140,21 @@ def _gen_owned(
             "~/.secrets/gemini_api_key (see README.md)"
         )
         return False
+    try:
+        key = validate_api_key(key)
+    except APIKeyError as error:
+        print(f"  ERR: Gemini API key is invalid: {error}")
+        return False
 
     model = os.environ.get("GEMINI_IMAGE_MODEL", DEFAULT_MODEL).strip() or DEFAULT_MODEL
-    url = URL_TEMPLATE.format(model)
+    encoded_model = urllib.parse.quote(model, safe="")
+    url = URL_TEMPLATE.format(encoded_model)
     body = json.dumps({
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {
             "responseModalities": ["IMAGE"],
             "responseFormat": {
-                "image": {"aspectRatio": "16:9", "imageSize": "2K"}
+                "image": image_config
             },
         },
     }).encode("utf-8")
@@ -176,7 +192,7 @@ def _gen_owned(
 
         try:
             payload = json.loads(raw_response)
-            image = _extract_image(payload, target)
+            image = _extract_image(payload, target, expected_mime)
             byte_count = publish_bytes(image, target, overwrite=overwrite)
         except (TypeError, ValueError, UnicodeError, OSError) as error:
             print(f"  ERR: invalid image response or output failure: {_redact(error, key)}")
@@ -198,8 +214,13 @@ def gen(
     overwrite: bool = False,
 ) -> bool:
     try:
-        with output_lock(out_path):
-            return _gen_owned(prompt, out_path, retries, overwrite)
+        target = str(resolve_output_path(out_path))
+    except ImageOutputError as error:
+        print(f"  ERR: {error}")
+        return False
+    try:
+        with output_lock(target):
+            return _gen_owned(prompt, target, retries, overwrite)
     except OutputLockError as error:
         print(f"  ERR: {error}")
         return False
@@ -207,7 +228,7 @@ def gen(
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("output_path", help="Output .jpg, .jpeg, .png, or .webp")
+    parser.add_argument("output_path", help="Output .png (default), .jpg, or .jpeg")
     parser.add_argument("prompt", help="Slide image prompt")
     parser.add_argument(
         "--force", action="store_true", help="Atomically replace an existing output"

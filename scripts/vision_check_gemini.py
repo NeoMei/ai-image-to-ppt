@@ -18,6 +18,7 @@ from pathlib import Path
 
 from PIL import Image, UnidentifiedImageError
 
+from provider_credentials import APIKeyError, load_api_key, validate_api_key
 from retry_delay import retry_delay
 
 
@@ -47,13 +48,7 @@ class VisionCheckError(RuntimeError):
 
 
 def _load_api_key() -> str:
-    key = os.environ.get("GEMINI_API_KEY", "").strip()
-    if key:
-        return key
-    try:
-        return SECRET_PATH.read_text(encoding="utf-8").strip()
-    except (OSError, UnicodeError):
-        return ""
+    return load_api_key("GEMINI_API_KEY", SECRET_PATH)
 
 
 def _redact(value: object, key: str) -> str:
@@ -196,6 +191,10 @@ def check(img_path: str, question: str = None, retries: int = 2) -> str:
             "Gemini API key not found; set GEMINI_API_KEY or create "
             "~/.secrets/gemini_api_key"
         )
+    try:
+        key = validate_api_key(key)
+    except APIKeyError as error:
+        raise VisionCheckError(f"Gemini API key is invalid: {error}") from error
 
     model = os.environ.get("GEMINI_VISION_MODEL", DEFAULT_MODEL).strip() or DEFAULT_MODEL
     encoded_model = urllib.parse.quote(model, safe="")

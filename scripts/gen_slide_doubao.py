@@ -21,9 +21,11 @@ from image_output import (
     preflight_output,
     publish_stream,
     read_response_body,
+    resolve_output_path,
     validate_retries,
 )
 from output_lock import OutputLockError, output_lock
+from provider_credentials import APIKeyError, load_api_key, validate_api_key
 from retry_delay import retry_delay
 
 SECRET_PATH = Path("~/.secrets/doubao_api_key").expanduser()
@@ -42,13 +44,7 @@ TRANSPORT_ERRORS = (
 
 
 def _load_api_key() -> str:
-    key = os.environ.get("DOUBAO_API_KEY", "").strip()
-    if key:
-        return key
-    try:
-        return SECRET_PATH.read_text(encoding="utf-8").strip()
-    except (OSError, UnicodeError):
-        return ""
+    return load_api_key("DOUBAO_API_KEY", SECRET_PATH)
 
 
 def _redact(message: object, key: str) -> str:
@@ -154,6 +150,11 @@ def _gen_owned(
             "~/.secrets/doubao_api_key (see README.md)"
         )
         return False
+    try:
+        key = validate_api_key(key)
+    except APIKeyError as error:
+        print(f"  ERR: Doubao API key is invalid: {error}")
+        return False
 
     body = json.dumps({
         "model": os.environ.get("DOUBAO_IMAGE_MODEL", MODEL),
@@ -222,8 +223,13 @@ def gen(
     overwrite: bool = False,
 ) -> bool:
     try:
-        with output_lock(out_path):
-            return _gen_owned(prompt, out_path, retries, overwrite)
+        target = str(resolve_output_path(out_path))
+    except ImageOutputError as error:
+        print(f"  ERR: {error}")
+        return False
+    try:
+        with output_lock(target):
+            return _gen_owned(prompt, target, retries, overwrite)
     except OutputLockError as error:
         print(f"  ERR: {error}")
         return False

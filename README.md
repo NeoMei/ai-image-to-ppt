@@ -38,6 +38,8 @@ python3 -m pip install -r requirements.txt
 
 Gemini and Doubao credentials are only needed when selecting those fallback engines. A Gemini key is also required for the optional visual self-check. The commands above restore the exact secret-file paths expected by the legacy scripts. Never commit real keys.
 
+Provider API keys must be non-empty printable ASCII on one line, with no whitespace or control characters. Invalid credentials fail before any provider request and are never printed in errors.
+
 ## Quick Start
 
 ```bash
@@ -49,8 +51,8 @@ python3 scripts/gen_slide.py out/slide_01.jpg "<prompt>"
 # Existing outputs are protected. Regenerate explicitly only when intended.
 python3 scripts/gen_slide.py out/slide_01.jpg "<prompt>" --force
 
-# Explicit fallback engines
-python3 scripts/gen_slide.py out/slide_01.jpg "<prompt>" --engine gemini
+# Explicit fallback engines. Gemini defaults to PNG.
+python3 scripts/gen_slide.py out/slide_01.png "<prompt>" --engine gemini
 python3 scripts/gen_slide.py out/slide_01.jpg "<prompt>" --engine doubao
 
 # Optional handoff: prepare the exact single-slide input required by
@@ -79,7 +81,7 @@ sys.path.insert(0, "scripts")
 from gen_slide import gen
 
 gen("<detailed prompt>", "out/slide_01.jpg")
-gen("<detailed prompt>", "out/slide_01.jpg", engine="gemini")
+gen("<detailed prompt>", "out/slide_01.png", engine="gemini")
 ```
 
 ## Scripts
@@ -88,7 +90,7 @@ gen("<detailed prompt>", "out/slide_01.jpg", engine="gemini")
 |---|---|---|
 | `gen_slide.py` | Default provider router | OpenAI by default; `--engine gemini\|doubao` for explicit fallback |
 | `gen_slide_openai.py` | OpenAI GPT Image 2 | `gpt-image-2`; defaults to 2048×1152, medium quality |
-| `gen_slide_gemini.py` | Gemini nano banana | `gemini-3.1-flash-image`; 16:9, 2K |
+| `gen_slide_gemini.py` | Gemini nano banana | `gemini-3.1-flash-image`; 16:9, 2K; PNG by default or JPEG by suffix |
 | `gen_slide_doubao.py` | 方舟 doubao-seedream | OpenAI-compatible API |
 | `prepare_editable_input.py` | Editable-converter handoff | Deterministic 1280x720 PNG |
 | `vision_check_gemini.py` | Gemini visual self-check | `gemini-3.6-flash` |
@@ -96,9 +98,11 @@ gen("<detailed prompt>", "out/slide_01.jpg", engine="gemini")
 
 The router does not automatically switch providers: choose fallback engines explicitly. Provider pricing can change; consult the [OpenAI API pricing documentation](https://developers.openai.com/api/docs/pricing) instead of relying on a fixed per-image estimate.
 
-All providers support output extensions `.jpg`, `.jpeg`, `.png`, and `.webp`.
-The suffix selects the requested encoding, and the returned image's format and
-strict 16:9 dimensions are validated before publication. Generation refuses existing
+OpenAI and Doubao support output extensions `.jpg`, `.jpeg`, `.png`, and `.webp`.
+Gemini supports `.png`, `.jpg`, and `.jpeg`: PNG by default, while a JPEG suffix
+requests `IMAGE_JPEG`. Unsupported Gemini suffixes fail before credential lookup or
+network access. For every provider, the returned MIME type, actual encoding, and strict
+16:9 dimensions are validated before publication. Generation refuses existing
 outputs by default and makes no provider request; pass `overwrite=True` in Python
 or `--force` on the CLI only when replacement is intentional.
 

@@ -20,9 +20,11 @@ from image_output import (
     preflight_output,
     publish_bytes,
     read_response_body,
+    resolve_output_path,
     validate_retries,
 )
 from output_lock import OutputLockError, output_lock
+from provider_credentials import APIKeyError, load_api_key, validate_api_key
 from retry_delay import retry_delay
 
 API_URL = "https://api.openai.com/v1/images/generations"
@@ -34,13 +36,7 @@ KEY_LIKE_PATTERN = re.compile(r"(?<![A-Za-z0-9_-])sk-[A-Za-z0-9_-]+")
 
 
 def _load_api_key() -> str:
-    key = os.environ.get("OPENAI_API_KEY", "").strip()
-    if key:
-        return key
-    try:
-        return SECRET_PATH.read_text(encoding="utf-8").strip()
-    except (OSError, UnicodeError):
-        return ""
+    return load_api_key("OPENAI_API_KEY", SECRET_PATH)
 
 
 def _output_format(out_path: str) -> str:
@@ -119,6 +115,11 @@ def _gen_owned(
             "  ERR: OpenAI API key not found. Set OPENAI_API_KEY or create "
             "~/.secrets/openai_api_key"
         )
+        return False
+    try:
+        key = validate_api_key(key)
+    except APIKeyError as error:
+        print(f"  ERR: OpenAI API key is invalid: {error}")
         return False
 
     payload = {
@@ -203,8 +204,13 @@ def gen(
     overwrite: bool = False,
 ) -> bool:
     try:
-        with output_lock(out_path):
-            return _gen_owned(prompt, out_path, retries, overwrite)
+        target = str(resolve_output_path(out_path))
+    except ImageOutputError as error:
+        print(f"  ERR: {error}")
+        return False
+    try:
+        with output_lock(target):
+            return _gen_owned(prompt, target, retries, overwrite)
     except OutputLockError as error:
         print(f"  ERR: {error}")
         return False

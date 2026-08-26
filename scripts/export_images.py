@@ -20,6 +20,7 @@ from image_output import (
     ParentIdentity,
     load_image,
     prepare_target,
+    resolve_output_path,
     verify_parent_identity,
 )
 from output_lock import OutputLockError, output_lock
@@ -154,18 +155,20 @@ def _atomic_save(target_path: str, save: Callable[[str], None]) -> None:
 
 def export_pdf(files: Sequence[str], pdf_path: str) -> None:
     """Export a normalized multi-page PDF without exposing partial output."""
+    target = resolve_output_path(pdf_path)
     images = _load_all(files)
-    _atomic_save(pdf_path, lambda path: _save_pdf(images, path))
-    size_mb = os.path.getsize(pdf_path) / 1024 / 1024
-    print(f"  PDF: {pdf_path} ({len(images)} pages, {size_mb:.1f}MB)")
+    _atomic_save(str(target), lambda path: _save_pdf(images, path))
+    size_mb = target.stat().st_size / 1024 / 1024
+    print(f"  PDF: {target} ({len(images)} pages, {size_mb:.1f}MB)")
 
 
 def export_pptx(files: Sequence[str], pptx_path: str) -> None:
     """Export an exact 16:9 PPTX without exposing partial output."""
+    target = resolve_output_path(pptx_path)
     images = _load_all(files)
-    _atomic_save(pptx_path, lambda path: _save_pptx(images, path))
-    size_mb = os.path.getsize(pptx_path) / 1024 / 1024
-    print(f"  PPTX: {pptx_path} ({len(images)} slides, {size_mb:.1f}MB)")
+    _atomic_save(str(target), lambda path: _save_pptx(images, path))
+    size_mb = target.stat().st_size / 1024 / 1024
+    print(f"  PPTX: {target} ({len(images)} slides, {size_mb:.1f}MB)")
 
 
 def _backup_path(
@@ -269,7 +272,36 @@ def _publish_pair(
                 cleanup_errors.append((target, error))
 
         restore_errors = []
+        published_by_target = {
+            target: (temporary_device, temporary_inode)
+            for target, temporary_device, temporary_inode in published
+        }
         for target, backup in backups.items():
+            transaction_identity = published_by_target.get(target)
+            try:
+                target_stat = os.stat(target, follow_symlinks=False)
+            except FileNotFoundError:
+                target_stat = None
+            except OSError as error:
+                restore_errors.append((backup, target, error))
+                continue
+
+            if target_stat is not None and (
+                transaction_identity is None
+                or transaction_identity[0] != target_stat.st_dev
+                or transaction_identity[1] != target_stat.st_ino
+            ):
+                restore_errors.append(
+                    (
+                        backup,
+                        target,
+                        OSError(
+                            "output ownership changed; external target preserved"
+                        ),
+                    )
+                )
+                continue
+
             try:
                 os.replace(backup, target)
             except OSError as error:
@@ -283,7 +315,14 @@ def _publish_pair(
                 )
                 details.append(f"could not remove published outputs: {failures}")
             if restore_errors:
-                preserved = ", ".join(item[0] for item in restore_errors)
+                failures = ", ".join(
+                    f"{target} ({error})"
+                    for _backup, target, error in restore_errors
+                )
+                preserved = ", ".join(
+                    backup for backup, _target, _error in restore_errors
+                )
+                details.append(f"could not restore outputs: {failures}")
                 details.append(f"backups preserved at: {preserved}")
             raise OSError(
                 "publication failed and rollback was incomplete; "
@@ -313,6 +352,7 @@ def _export_deck_owned(
     parent = prepare_target(targets[0]).parent
     images = _load_all(files)
     temporary_paths = []
+    publication_succeeded = False
     try:
         for target in targets:
             temporary_paths.append(_temporary_path(target, parent=parent))
@@ -321,12 +361,31 @@ def _export_deck_owned(
         _save_pptx(images, temporary_paths[1])
         _sync_file(temporary_paths[1])
         _publish_pair(temporary_paths, targets, force=force, parent=parent)
+        publication_succeeded = True
     finally:
+        cleanup_errors = []
         for temporary in temporary_paths:
-            try:
-                os.unlink(temporary)
-            except FileNotFoundError:
-                pass
+            last_error = None
+            for _attempt in range(2):
+                try:
+                    os.unlink(temporary)
+                    last_error = None
+                    break
+                except FileNotFoundError:
+                    last_error = None
+                    break
+                except OSError as error:
+                    last_error = error
+            if last_error is not None:
+                cleanup_errors.append((temporary, last_error))
+        if cleanup_errors:
+            outcome = "succeeded" if publication_succeeded else "failed"
+            for temporary, error in cleanup_errors:
+                print(
+                    f"  WARN: export {outcome} but temporary file remains at "
+                    f"{temporary}: {error}",
+                    file=sys.stderr,
+                )
     for label, target in zip(("PDF", "PPTX"), targets):
         verify_parent_identity(parent)
         size_mb = target.stat().st_size / 1024 / 1024
@@ -338,10 +397,11 @@ def export_deck(
 ) -> bool:
     """Build and publish one pair while owning the complete output prefix."""
     try:
-        with output_lock(output_prefix, namespace="deck"):
-            _export_deck_owned(files, output_prefix, force=force)
+        resolved_prefix = resolve_output_path(output_prefix)
+        with output_lock(resolved_prefix, namespace="deck"):
+            _export_deck_owned(files, str(resolved_prefix), force=force)
         return True
-    except OutputLockError as error:
+    except (ImageOutputError, OutputLockError) as error:
         print(f"  ERR: export failed: {error}", file=sys.stderr)
         return False
 

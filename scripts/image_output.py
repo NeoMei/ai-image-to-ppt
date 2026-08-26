@@ -6,6 +6,7 @@ import http.client
 import io
 import os
 import stat
+import sys
 import tempfile
 import warnings
 from dataclasses import dataclass
@@ -104,6 +105,17 @@ def output_format(out_path: str) -> str:
 
 def expected_mime_type(out_path: str) -> str:
     return MIME_TYPES[output_format(out_path)]
+
+
+def resolve_output_path(target: object) -> Path:
+    """Freeze output ancestors as a real absolute path without following basename."""
+    try:
+        absolute = Path(os.path.abspath(str(Path(target).expanduser())))
+        if "\0" in str(absolute):
+            raise ValueError("embedded null byte")
+        return absolute.parent.resolve(strict=False) / absolute.name
+    except (TypeError, ValueError, OSError, RuntimeError) as error:
+        raise ImageOutputError(f"invalid output target: {error}") from error
 
 
 def decode_base64(encoded: object) -> bytes:
@@ -355,12 +367,18 @@ def _temporary_path(target: TargetValue):
 
 
 def _remove_temp(path: str) -> None:
-    try:
-        os.unlink(path)
-    except FileNotFoundError:
-        pass
-    except OSError as error:
-        raise ImageOutputError(f"failed to remove output temporary file: {error}") from error
+    last_error = None
+    for _attempt in range(2):
+        try:
+            os.unlink(path)
+            return
+        except FileNotFoundError:
+            return
+        except OSError as error:
+            last_error = error
+    raise ImageOutputError(
+        f"failed to remove output temporary file: {last_error}"
+    ) from last_error
 
 
 def _validate_temp(path: str, target: TargetValue) -> int:
@@ -392,15 +410,23 @@ def _publish_temp(temp_path: str, target: TargetValue, overwrite: bool) -> None:
         verify_parent_identity(prepared.parent)
         if overwrite:
             os.replace(temp_path, prepared.path)
-        else:
-            os.link(temp_path, prepared.path)
-            os.unlink(temp_path)
+            return
+        os.link(temp_path, prepared.path)
     except FileExistsError as error:
         raise ImageOutputError(
             f"output already exists; refusing to overwrite: {prepared.path}"
         ) from error
     except OSError as error:
         raise ImageOutputError(f"failed to publish image atomically: {error}") from error
+
+    try:
+        _remove_temp(temp_path)
+    except ImageOutputError as error:
+        print(
+            "  WARN: output was published but temporary file remains at "
+            f"{temp_path}: {error}",
+            file=sys.stderr,
+        )
 
 
 def publish_bytes(data: bytes, target: TargetValue, overwrite: bool = False) -> int:

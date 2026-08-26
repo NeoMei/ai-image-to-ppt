@@ -45,6 +45,8 @@ python3 -m pip install -r requirements.txt
 
 Add a Gemini credential only for Gemini image generation or the visual self-check. Add a Doubao credential only when explicitly selecting Doubao. The exact secret-file paths above are what the legacy scripts read. Provider selection is explicit; generation does not automatically fall back.
 
+Provider API keys must be non-empty printable ASCII on one line, with no whitespace or control characters. Invalid credentials fail before any provider request and are never printed in errors.
+
 ## Scripts
 
 All in `scripts/` directory. Copy to project or add to `PYTHONPATH`.
@@ -53,7 +55,7 @@ All in `scripts/` directory. Copy to project or add to `PYTHONPATH`.
 |---|---|---|
 | `gen_slide.py` | Default provider router | OpenAI by default; Gemini and Doubao are explicit choices |
 | `gen_slide_openai.py` | OpenAI GPT Image 2 | `gpt-image-2`; 2048×1152, medium by default |
-| `gen_slide_gemini.py` | Gemini nano banana | `gemini-3.1-flash-image`; 16:9, 2K |
+| `gen_slide_gemini.py` | Gemini nano banana | `gemini-3.1-flash-image`; 16:9, 2K; PNG by default or JPEG by suffix |
 | `gen_slide_doubao.py` | 方舟 doubao-seedream-5-0 | OpenAI-compatible API |
 | `prepare_editable_input.py` | Editable-converter handoff | Exact 1280x720 PNG |
 | `vision_check_gemini.py` | Gemini visual self-check | `gemini-3.6-flash` |
@@ -71,7 +73,7 @@ from gen_slide import gen
 gen("<detailed prompt>", "out/slide_01.jpg")
 
 # Explicit fallbacks when requested
-gen("<detailed prompt>", "out/slide_01.jpg", engine="gemini")
+gen("<detailed prompt>", "out/slide_01.png", engine="gemini")
 gen("<detailed prompt>", "out/slide_01.jpg", engine="doubao")
 ```
 
@@ -218,7 +220,7 @@ See `examples/chapters_meta.py` for a filled-in example.
 - **Concurrency sweet spot**: 4-8 workers. Higher triggers rate limits.
 - **OpenAI defaults and overrides**: Confirmed defaults are `gpt-image-2`, `2048x1152`, and `medium`. Override them with `OPENAI_IMAGE_MODEL`, `OPENAI_IMAGE_SIZE`, and `OPENAI_IMAGE_QUALITY` when needed.
 - **Retry behavior**: Providers retry some transient failures internally; surface final failures for manual handling. There is no automatic provider fallback.
-- **Output extensions**: All providers accept `.jpg`, `.jpeg`, `.png`, and `.webp`; the requested/returned encoding and strict 16:9 dimensions are validated before publication.
+- **Output extensions**: OpenAI and Doubao accept `.jpg`, `.jpeg`, `.png`, and `.webp`. Gemini accepts `.png`, `.jpg`, and `.jpeg`: PNG by default, while a JPEG suffix requests `IMAGE_JPEG`. Unsupported Gemini suffixes fail before credential lookup or network access. Every provider's returned MIME type, actual encoding, and strict 16:9 dimensions are validated before publication.
 - **Safe reruns**: Generation refuses existing outputs without contacting a provider. Treat that as cached in batch jobs; pass `overwrite=True` or `--force` only for intentional regeneration.
 - **Safety boundaries**: Same-output work fails fast before provider access; images are limited to 50 MiB and 64 megapixels; directory replacement fails closed; transient HTTP retries honor bounded `Retry-After` guidance.
 - **First-page validation**: Generate 1 sample, visually confirm style, then batch.

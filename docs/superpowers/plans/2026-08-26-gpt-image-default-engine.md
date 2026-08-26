@@ -986,9 +986,26 @@ hardening expanded their test counts and commit history.
   separate exact `1280x720 PNG` operation.
 - Provider responses and local images now have strict format, 16:9, byte, pixel,
   concurrency, directory-identity, retry, atomic-publication, and rollback tests.
-- Current automated suite: **137 tests passed** on Python 3.9 and Python 3.12;
+- At that audit checkpoint, **137 tests were reported** on Python 3.9 and Python 3.12;
   compilation and `python3 scripts/validate_skill.py .` also passed. Tests used
   mocked provider responses and made no real paid API request.
 - Audit work was performed on local branch `audit/comprehensive-completion`.
   Local `main`, audit HEAD, and `origin/main` must be reported separately after
   final integration. No push is implied by this execution record.
+
+## Provider contract hardening appendix — 2026-08-27
+
+This appendix records later hardening without rewriting the historical TDD steps
+or their checkpoint results above.
+
+- The OpenAI, Gemini, Doubao, and Gemini vision entry points now reject empty,
+  non-ASCII, whitespace-containing, or control-character API keys before any
+  request, without echoing the credential.
+- Provider router output paths are expanded and resolved once before locking, and
+  the same absolute path is used for preflight, generation, and publication.
+- Gemini generation uses the current `/v1/models/...:generateContent` endpoint,
+  URL-encodes the model, accepts only PNG/JPEG targets, explicitly requests
+  `IMAGE_JPEG` for JPEG targets, and strictly checks response MIME and encoding.
+- Regression tests use mocked provider responses and make no real paid API request.
+  The complete Python 3.9 verification result was `Ran 186 tests; OK (skipped=1)`;
+  compilation and `python3 scripts/validate_skill.py .` also passed.

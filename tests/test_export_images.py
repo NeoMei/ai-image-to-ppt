@@ -3,7 +3,7 @@ import os
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stderr
+from contextlib import contextmanager, redirect_stderr
 from pathlib import Path
 from unittest import mock
 
@@ -87,6 +87,124 @@ class ExportImagesTests(unittest.TestCase):
             self.assertFalse((redirected / "output" / "deck.pdf").exists())
             self.assertFalse((redirected / "output" / "deck.pptx").exists())
 
+    def test_export_pdf_freezes_relative_target_before_input_loading_changes_cwd(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            approved = root / "approved"
+            redirected = root / "redirected"
+            approved.mkdir()
+            redirected.mkdir()
+            original_cwd = Path.cwd()
+
+            def change_cwd_then_return(_files):
+                os.chdir(redirected)
+                return ["image"]
+
+            def save_pdf(_images, path):
+                Path(path).write_bytes(b"pdf")
+
+            try:
+                os.chdir(approved)
+                with mock.patch.object(
+                    export_images, "_load_all", side_effect=change_cwd_then_return
+                ), mock.patch.object(export_images, "_save_pdf", side_effect=save_pdf):
+                    export_images.export_pdf(["ignored"], "output/deck.pdf")
+            finally:
+                os.chdir(original_cwd)
+
+            self.assertEqual((approved / "output" / "deck.pdf").read_bytes(), b"pdf")
+            self.assertFalse((redirected / "output" / "deck.pdf").exists())
+
+    def test_export_pptx_freezes_relative_target_before_saving_changes_cwd(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            approved = root / "approved"
+            redirected = root / "redirected"
+            approved.mkdir()
+            redirected.mkdir()
+            original_cwd = Path.cwd()
+
+            def save_then_change_cwd(_images, path):
+                Path(path).write_bytes(b"pptx")
+                os.chdir(redirected)
+
+            try:
+                os.chdir(approved)
+                with mock.patch.object(
+                    export_images, "_load_all", return_value=["image"]
+                ), mock.patch.object(
+                    export_images, "_save_pptx", side_effect=save_then_change_cwd
+                ):
+                    export_images.export_pptx(["ignored"], "output/deck.pptx")
+            finally:
+                os.chdir(original_cwd)
+
+            self.assertEqual(
+                (approved / "output" / "deck.pptx").read_bytes(), b"pptx"
+            )
+            self.assertFalse((redirected / "output" / "deck.pptx").exists())
+
+    def test_export_pdf_resolves_parent_but_does_not_follow_final_symlink(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            referent = root / "referent.pdf"
+            target = root / "deck.pdf"
+            referent.write_bytes(b"referent")
+            target.symlink_to(referent)
+
+            def save_pdf(_images, path):
+                Path(path).write_bytes(b"new-pdf")
+
+            with mock.patch.object(
+                export_images, "_load_all", return_value=["image"]
+            ), mock.patch.object(export_images, "_save_pdf", side_effect=save_pdf):
+                export_images.export_pdf(["ignored"], str(target))
+
+            self.assertEqual(referent.read_bytes(), b"referent")
+            self.assertFalse(target.is_symlink())
+            self.assertEqual(target.read_bytes(), b"new-pdf")
+
+    def test_export_deck_freezes_ancestor_symlink_before_lock_yields(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            approved = root / "approved"
+            redirected = root / "redirected"
+            (approved / "sub").mkdir(parents=True)
+            (redirected / "sub").mkdir(parents=True)
+            alias = root / "current"
+            alias.symlink_to(approved, target_is_directory=True)
+            real_output_lock = export_images.output_lock
+
+            @contextmanager
+            def swap_after_lock(target, namespace="output"):
+                with real_output_lock(target, namespace=namespace):
+                    alias.unlink()
+                    alias.symlink_to(redirected, target_is_directory=True)
+                    yield
+
+            def save_pdf(_images, path):
+                Path(path).write_bytes(b"pdf")
+
+            def save_pptx(_images, path):
+                Path(path).write_bytes(b"pptx")
+
+            with mock.patch.object(export_images, "output_lock", swap_after_lock), \
+                 mock.patch.object(export_images, "_load_all", return_value=["image"]), \
+                 mock.patch.object(export_images, "_save_pdf", side_effect=save_pdf), \
+                 mock.patch.object(export_images, "_save_pptx", side_effect=save_pptx):
+                self.assertTrue(
+                    export_images.export_deck(
+                        ["ignored"], str(alias / "sub" / "deck")
+                    )
+                )
+
+            self.assertEqual((approved / "sub" / "deck.pdf").read_bytes(), b"pdf")
+            self.assertEqual(
+                (approved / "sub" / "deck.pptx").read_bytes(), b"pptx"
+            )
+            self.assertFalse((redirected / "sub" / "deck.pdf").exists())
+            self.assertFalse((redirected / "sub" / "deck.pptx").exists())
+
     def test_pptx_uses_exact_sixteen_by_nine_dimensions(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             source = Path(temp_dir) / "slide.png"
@@ -129,6 +247,15 @@ class ExportImagesTests(unittest.TestCase):
             self.assertNotIn("Traceback", stderr.getvalue())
             self.assertFalse(prefix.with_suffix(".pdf").exists())
             self.assertFalse(prefix.with_suffix(".pptx").exists())
+
+    def test_invalid_output_prefix_is_controlled_before_loading_inputs(self):
+        stderr = io.StringIO()
+        with mock.patch.object(export_images, "_load_all") as load_all, \
+             redirect_stderr(stderr):
+            self.assertFalse(export_images.export_deck(["ignored"], "bad\0prefix"))
+
+        load_all.assert_not_called()
+        self.assertIn("invalid output target", stderr.getvalue())
 
     def test_cli_pair_publication_rolls_back_if_second_publish_fails(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -191,12 +318,118 @@ class ExportImagesTests(unittest.TestCase):
             self.assertEqual(pptx.read_bytes(), b"old-pptx")
             self.assertEqual(list(Path(temp_dir).glob(".*.backup")), [])
 
+    def test_force_rollback_preserves_external_replacement_of_published_pdf(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "slide.png"
+            prefix = Path(temp_dir) / "deck"
+            pdf = prefix.with_suffix(".pdf")
+            pptx = prefix.with_suffix(".pptx")
+            self._image(source)
+            pdf.write_bytes(b"old-pdf")
+            pptx.write_bytes(b"old-pptx")
+            real_link = export_images.os.link
+            publish_count = 0
+
+            def replace_pdf_then_fail_pptx(source_path, target_path, *args, **kwargs):
+                nonlocal publish_count
+                publish_count += 1
+                target = Path(target_path)
+                if publish_count == 1:
+                    result = real_link(source_path, target_path, *args, **kwargs)
+                    target.unlink()
+                    target.write_bytes(b"external-pdf")
+                    return result
+                raise OSError("forced second publish failure")
+
+            stderr = io.StringIO()
+            with mock.patch.object(
+                export_images.os, "link", side_effect=replace_pdf_then_fail_pptx
+            ), redirect_stderr(stderr):
+                result = export_images.main(["--force", str(prefix), str(source)])
+
+            self.assertEqual(result, 1)
+            self.assertEqual(pdf.read_bytes(), b"external-pdf")
+            self.assertEqual(pptx.read_bytes(), b"old-pptx")
+            backups = list(Path(temp_dir).glob(".*.backup"))
+            self.assertEqual(len(backups), 1)
+            self.assertEqual(backups[0].read_bytes(), b"old-pdf")
+            self.assertIn("ownership changed", stderr.getvalue())
+            self.assertIn(str(backups[0]), stderr.getvalue())
+
+    def test_force_rollback_preserves_external_creation_at_unpublished_pptx(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "slide.png"
+            prefix = Path(temp_dir) / "deck"
+            pdf = prefix.with_suffix(".pdf")
+            pptx = prefix.with_suffix(".pptx")
+            self._image(source)
+            pdf.write_bytes(b"old-pdf")
+            pptx.write_bytes(b"old-pptx")
+            real_link = export_images.os.link
+            publish_count = 0
+
+            def create_external_pptx(source_path, target_path, *args, **kwargs):
+                nonlocal publish_count
+                publish_count += 1
+                if publish_count == 2:
+                    Path(target_path).write_bytes(b"external-pptx")
+                return real_link(source_path, target_path, *args, **kwargs)
+
+            stderr = io.StringIO()
+            with mock.patch.object(
+                export_images.os, "link", side_effect=create_external_pptx
+            ), redirect_stderr(stderr):
+                result = export_images.main(["--force", str(prefix), str(source)])
+
+            self.assertEqual(result, 1)
+            self.assertEqual(pdf.read_bytes(), b"old-pdf")
+            self.assertEqual(pptx.read_bytes(), b"external-pptx")
+            backups = list(Path(temp_dir).glob(".*.backup"))
+            self.assertEqual(len(backups), 1)
+            self.assertEqual(backups[0].read_bytes(), b"old-pptx")
+            self.assertIn("ownership changed", stderr.getvalue())
+            self.assertIn(str(backups[0]), stderr.getvalue())
+
+    def test_successful_deck_warns_and_returns_true_when_temp_cleanup_fails(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "slide.png"
+            prefix = Path(temp_dir) / "deck"
+            self._image(source)
+            real_unlink = export_images.os.unlink
+
+            def deny_transaction_temp(path, *args, **kwargs):
+                candidate = Path(path)
+                if (
+                    candidate.parent.resolve(strict=False)
+                    == Path(temp_dir).resolve(strict=False)
+                    and ".tmp." in candidate.name
+                ):
+                    raise PermissionError("forced temp cleanup denial")
+                return real_unlink(path, *args, **kwargs)
+
+            stderr = io.StringIO()
+            with mock.patch.object(
+                export_images.os, "unlink", side_effect=deny_transaction_temp
+            ), redirect_stderr(stderr):
+                self.assertTrue(
+                    export_images.export_deck([str(source)], str(prefix))
+                )
+
+            self.assertTrue(prefix.with_suffix(".pdf").is_file())
+            self.assertTrue(prefix.with_suffix(".pptx").is_file())
+            stale = list(Path(temp_dir).glob(".*.tmp.*"))
+            self.assertEqual(len(stale), 2)
+            self.assertIn("WARN:", stderr.getvalue())
+            for path in stale:
+                self.assertIn(str(path), stderr.getvalue())
+
     def test_cli_default_pdf_race_preserves_external_target(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             source = Path(temp_dir) / "slide.png"
             prefix = Path(temp_dir) / "deck"
             pdf = prefix.with_suffix(".pdf")
             pptx = prefix.with_suffix(".pptx")
+            resolved_pdf = export_images.resolve_output_path(pdf)
             sentinel = b"external-pdf-writer"
             self._image(source)
             real_link = export_images.os.link
@@ -204,7 +437,7 @@ class ExportImagesTests(unittest.TestCase):
 
             def inject_pdf_before_publish(source_path, target_path, *args, **kwargs):
                 nonlocal injected
-                if Path(target_path) == pdf and not injected:
+                if Path(target_path) == resolved_pdf and not injected:
                     pdf.write_bytes(sentinel)
                     injected = True
                 return real_link(source_path, target_path, *args, **kwargs)
@@ -227,6 +460,8 @@ class ExportImagesTests(unittest.TestCase):
             prefix = Path(temp_dir) / "deck"
             pdf = prefix.with_suffix(".pdf")
             pptx = prefix.with_suffix(".pptx")
+            resolved_pdf = export_images.resolve_output_path(pdf)
+            resolved_pptx = export_images.resolve_output_path(pptx)
             pdf_sentinel = b"external-pdf-replacement"
             pptx_sentinel = b"external-pptx-writer"
             self._image(source)
@@ -237,13 +472,13 @@ class ExportImagesTests(unittest.TestCase):
             def race_second_publish(source_path, target_path, *args, **kwargs):
                 nonlocal pdf_replaced, pptx_injected
                 target = Path(target_path)
-                if target == pdf:
+                if target == resolved_pdf:
                     result = real_link(source_path, target_path, *args, **kwargs)
                     pdf.unlink()
                     pdf.write_bytes(pdf_sentinel)
                     pdf_replaced = True
                     return result
-                if target == pptx and not pptx_injected:
+                if target == resolved_pptx and not pptx_injected:
                     pptx.write_bytes(pptx_sentinel)
                     pptx_injected = True
                 return real_link(source_path, target_path, *args, **kwargs)
@@ -269,6 +504,7 @@ class ExportImagesTests(unittest.TestCase):
             prefix = Path(temp_dir) / "deck"
             pdf = prefix.with_suffix(".pdf")
             pptx = prefix.with_suffix(".pptx")
+            resolved_pdf = export_images.resolve_output_path(pdf)
             self._image(source)
             pptx.write_bytes(b"old-pptx")
             real_link = export_images.os.link
@@ -285,7 +521,7 @@ class ExportImagesTests(unittest.TestCase):
                 return real_link(source_path, target_path, *args, **kwargs)
 
             def fail_published_cleanup(path, *args, **kwargs):
-                if Path(path) == pdf:
+                if Path(path) == resolved_pdf:
                     raise OSError("forced published unlink failure")
                 return real_unlink(path, *args, **kwargs)
 
@@ -312,7 +548,10 @@ class ExportImagesTests(unittest.TestCase):
                 )
 
             self.assertEqual(result, 1)
-            self.assertEqual(restore_attempts, [pptx])
+            self.assertEqual(
+                restore_attempts,
+                [export_images.resolve_output_path(pptx)],
+            )
             self.assertEqual(pptx.read_bytes(), b"old-pptx")
             self.assertTrue(pdf.is_file())
             self.assertEqual(list(Path(temp_dir).glob(".*.backup")), [])

@@ -188,6 +188,73 @@ class SharedImageLimitTests(unittest.TestCase):
             ):
                 image_output.load_image(source)
 
+    def test_publish_bytes_warns_and_succeeds_when_published_temp_cleanup_fails(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            target = root / "slide.jpg"
+            prepared = image_output.preflight_output(str(target))
+            buffer = io.BytesIO()
+            Image.new("RGB", (160, 90), "navy").save(buffer, format="JPEG")
+            real_unlink = image_output.os.unlink
+            attempts = 0
+
+            def deny_temp(path, *args, **kwargs):
+                nonlocal attempts
+                candidate = Path(path)
+                if candidate.parent == root and candidate.name.endswith(".tmp"):
+                    attempts += 1
+                    raise PermissionError("forced temp cleanup denial")
+                return real_unlink(path, *args, **kwargs)
+
+            stderr = io.StringIO()
+            with mock.patch.object(
+                image_output.os, "unlink", side_effect=deny_temp
+            ), redirect_stderr(stderr):
+                byte_count = image_output.publish_bytes(buffer.getvalue(), prepared)
+
+            self.assertGreater(byte_count, 0)
+            with Image.open(target) as image:
+                self.assertEqual(image.size, (160, 90))
+            stale = list(root.glob(".slide.jpg.*.tmp"))
+            self.assertEqual(len(stale), 1)
+            self.assertLessEqual(attempts, 2)
+            self.assertIn("WARN:", stderr.getvalue())
+            self.assertIn(str(stale[0]), stderr.getvalue())
+
+    def test_publish_stream_warns_and_succeeds_when_published_temp_cleanup_fails(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            target = root / "slide.jpg"
+            prepared = image_output.preflight_output(str(target))
+            buffer = io.BytesIO()
+            Image.new("RGB", (160, 90), "navy").save(buffer, format="JPEG")
+            response = StreamResponse(buffer.getvalue())
+            real_unlink = image_output.os.unlink
+            attempts = 0
+
+            def deny_temp(path, *args, **kwargs):
+                nonlocal attempts
+                candidate = Path(path)
+                if candidate.parent == root and candidate.name.endswith(".tmp"):
+                    attempts += 1
+                    raise PermissionError("forced temp cleanup denial")
+                return real_unlink(path, *args, **kwargs)
+
+            stderr = io.StringIO()
+            with mock.patch.object(
+                image_output.os, "unlink", side_effect=deny_temp
+            ), redirect_stderr(stderr):
+                byte_count = image_output.publish_stream(response, prepared)
+
+            self.assertGreater(byte_count, 0)
+            with Image.open(target) as image:
+                self.assertEqual(image.size, (160, 90))
+            stale = list(root.glob(".slide.jpg.*.tmp"))
+            self.assertEqual(len(stale), 1)
+            self.assertLessEqual(attempts, 2)
+            self.assertIn("WARN:", stderr.getvalue())
+            self.assertIn(str(stale[0]), stderr.getvalue())
+
 
 class ProviderResourceBoundaryTests(unittest.TestCase):
     def test_response_reader_never_falls_back_to_unbounded_read(self):
