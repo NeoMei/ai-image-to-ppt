@@ -4,7 +4,7 @@
 
 **Goal:** Add OpenAI GPT Image 2 generation as the default and provide a deterministic bridge from any 16:9 generated master image to the exact `1280x720 PNG` required by `image-to-editable-pptx`.
 
-**Architecture:** Add one focused OpenAI provider module and one lazy-loading router module. The provider owns credential/config resolution, Images API requests, retry policy, Base64 validation, and atomic output; the router owns engine selection and defaults. A separate Pillow-based standardizer preserves high-resolution master images while producing the converter's exact input contract; existing provider modules remain unchanged.
+**Architecture:** Add one focused OpenAI provider module and one lazy-loading router module. The provider owns credential/config resolution, Images API requests, retry policy, Base64 validation, and atomic output; the router owns engine selection and defaults. A separate Pillow-based standardizer preserves high-resolution master images while producing the converter's exact input contract; legacy provider public `gen(prompt, out_path, retries=2) -> bool` interfaces remain compatible while credential loading and expected-failure handling may be hardened.
 
 **Tech Stack:** Python 3 standard library (`argparse`, `base64`, `json`, `pathlib`, `tempfile`, `urllib`, `unittest`), Markdown skill documentation.
 
@@ -897,8 +897,15 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from gen_slide import gen
 
 def gen_one(name, prompt):
-    gen(prompt, f"out/{name}.jpg")
-    return name
+    ok = gen(prompt, f"out/{name}.jpg")
+    return name, ok
+
+with ThreadPoolExecutor(max_workers=8) as executor:
+    futures = [executor.submit(gen_one, name, prompt) for name, prompt in PROMPTS.items()]
+    for future in as_completed(futures):
+        name, ok = future.result()
+        status = "done" if ok else "failed"
+        print(name, status)
 ```
 
 - [ ] **Step 3: Verify default/fallback wording and inspect the complete diff**

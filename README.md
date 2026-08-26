@@ -25,14 +25,24 @@ mkdir -p ~/.secrets
 printf '%s\n' "YOUR_OPENAI_KEY" > ~/.secrets/openai_api_key
 chmod 600 ~/.secrets/openai_api_key
 
-pip install Pillow python-pptx
+# Gemini fallback and visual self-check (only if used)
+printf '%s\n' "YOUR_GEMINI_KEY" > ~/.secrets/gemini_api_key
+chmod 600 ~/.secrets/gemini_api_key
+
+# Doubao fallback (only if used)
+printf '%s\n' "YOUR_DOUBAO_KEY" > ~/.secrets/doubao_api_key
+chmod 600 ~/.secrets/doubao_api_key
+
+pip install 'Pillow>=9.1' python-pptx
 ```
 
-Gemini and Doubao credentials are only needed when selecting those fallback engines. A Gemini key is also required for the optional visual self-check. Never commit real keys.
+Gemini and Doubao credentials are only needed when selecting those fallback engines. A Gemini key is also required for the optional visual self-check. The commands above restore the exact secret-file paths expected by the legacy scripts. Never commit real keys.
 
 ## Quick Start
 
 ```bash
+mkdir -p out out/editable
+
 # Default: OpenAI GPT Image 2, 2048x1152, medium
 python3 scripts/gen_slide.py out/slide_01.jpg "<prompt>"
 
@@ -77,6 +87,8 @@ gen("<detailed prompt>", "out/slide_01.jpg", engine="gemini")
 | `export_images.py` | Local export | PDF + PPTX |
 
 The router does not automatically switch providers: choose fallback engines explicitly. Provider pricing can change; consult the [OpenAI API pricing documentation](https://developers.openai.com/api/docs/pricing) instead of relying on a fixed per-image estimate.
+
+OpenAI output extensions `.jpg`, `.jpeg`, `.png`, and `.webp` select matching API formats. The legacy Gemini and Doubao engines keep provider-returned encoding; conventionally use `.jpg` for them and do not assume that changing the suffix transcodes the response.
 
 `prepare_editable_input.py` preserves the original high-resolution master, rejects input that is not strictly 16:9, and creates a new exact 1280x720 PNG. That PNG is input for the downstream `image-to-editable-pptx` converter; the standardizer does not itself create an editable PPTX, and the converter currently handles one slide at a time.
 

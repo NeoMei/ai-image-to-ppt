@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""方舟豆包 Seedream 图像生成 (Gemini 配额耗尽时的备选, OpenAI 兼容接口).
+"""方舟豆包 Seedream 图像生成（显式备用引擎，OpenAI 兼容接口）.
 
 依赖:
   - ~/.secrets/doubao_api_key  (从 https://console.volcengine.com/ark 获取)
@@ -16,16 +16,67 @@
   from gen_slide_doubao import gen
   gen("<prompt>", "<输出路径.jpg>")
 """
-import json, os, sys, time, urllib.request, urllib.error
+import json
+import os
+import re
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
 
-KEY = open(os.path.expanduser("~/.secrets/doubao_api_key")).read().strip()
+SECRET_PATH = Path("~/.secrets/doubao_api_key").expanduser()
 URL = "https://ark.cn-beijing.volces.com/api/v3/images/generations"
 MODEL = "doubao-seedream-5-0-260128"
 SIZE = "2560x1440"  # 16:9
+KEY_LIKE_PATTERN = re.compile(r"(?<![A-Za-z0-9_-])sk-[A-Za-z0-9_-]+")
+
+
+def _load_api_key() -> str:
+    try:
+        return SECRET_PATH.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeError):
+        return ""
+
+
+def _redact(message: object, key: str) -> str:
+    text = str(message)
+    if key:
+        text = text.replace(key, "[REDACTED]")
+    return KEY_LIKE_PATTERN.sub("[REDACTED]", text)[:200]
+
+
+def _http_error_message(error: urllib.error.HTTPError, key: str) -> str:
+    if error.code in (401, 403):
+        return "authentication failed; check ~/.secrets/doubao_api_key"
+    try:
+        raw_body = error.read()
+        if isinstance(raw_body, bytes):
+            raw_body = raw_body.decode("utf-8")
+        payload = json.loads(raw_body)
+        if isinstance(payload, dict) and isinstance(payload.get("error"), dict):
+            message = payload["error"].get("message")
+            if isinstance(message, (str, int, float, bool)) and message:
+                return _redact(message, key)
+    except Exception:
+        pass
+    return _redact(error.reason or "request failed", key)
 
 
 def gen(prompt: str, out_path: str, retries: int = 2) -> bool:
-    """生成单张图. 成功返回 True. 接口跟 gen_slide_gemini.gen 一致, 可直接替换."""
+    """生成单张图. 成功返回 True."""
+    if retries < 0:
+        print("  ERR: retries must be non-negative")
+        return False
+
+    key = _load_api_key()
+    if not key:
+        print(
+            "  ERR: Doubao API key not found. Create "
+            "~/.secrets/doubao_api_key (see README.md)"
+        )
+        return False
+
     body = json.dumps({
         "model": MODEL,
         "prompt": prompt,
@@ -35,7 +86,7 @@ def gen(prompt: str, out_path: str, retries: int = 2) -> bool:
         "sequential_image_generation": "disabled",
     }).encode()
     req = urllib.request.Request(URL, data=body, headers={
-        "Authorization": f"Bearer {KEY}",
+        "Authorization": f"Bearer {key}",
         "Content-Type": "application/json",
     })
     for attempt in range(retries + 1):
@@ -48,11 +99,14 @@ def gen(prompt: str, out_path: str, retries: int = 2) -> bool:
             print(f"  OK: {out_path} ({size_kb}KB)")
             return True
         except urllib.error.HTTPError as e:
-            err = e.read().decode()[:200]
-            print(f"  HTTP {e.code}: {err} (attempt {attempt+1})")
+            print(
+                f"  HTTP {e.code}: {_http_error_message(e, key)} "
+                f"(attempt {attempt+1})"
+            )
         except Exception as e:
-            print(f"  ERR: {e} (attempt {attempt+1})")
-        time.sleep(2)
+            print(f"  ERR: {_redact(e, key)} (attempt {attempt+1})")
+        if attempt < retries:
+            time.sleep(2)
     return False
 
 

@@ -35,7 +35,7 @@
 - 只延迟导入实际选中的引擎，避免未配置备用引擎密钥时导入失败。
 - 未知引擎直接返回清晰错误，不静默回退。
 
-`gen_slide_gemini.py` 和 `gen_slide_doubao.py` 保持原有导入路径和直接调用方式。
+`gen_slide_gemini.py` 和 `gen_slide_doubao.py` 保持原有导入路径和 `gen(prompt, out_path, retries=2) -> bool` 直接调用方式；凭证改为在 `gen()` 内读取，使未配置备用凭证时仍可安全导入模块并返回清晰失败。
 
 ### 可编辑转换输入标准化
 

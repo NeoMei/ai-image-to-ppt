@@ -1,5 +1,7 @@
 import sys
+import io
 import unittest
+from contextlib import redirect_stderr
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -68,6 +70,28 @@ class RouterTests(unittest.TestCase):
         generate.assert_called_once_with(
             "draw a slide", "slide.png", engine="gemini", retries=5
         )
+
+    def test_python_router_rejects_negative_retries_before_importing(self):
+        with mock.patch.object(gen_slide.importlib, "import_module") as import_module:
+            self.assertFalse(
+                gen_slide.gen("prompt", "slide.jpg", engine="openai", retries=-1)
+            )
+        import_module.assert_not_called()
+
+    def test_cli_rejects_negative_retries_with_usage_error(self):
+        stderr = io.StringIO()
+        with redirect_stderr(stderr), self.assertRaises(SystemExit) as raised, \
+             mock.patch.object(gen_slide, "gen") as generate:
+            gen_slide.main(["slide.jpg", "draw a slide", "--retries", "-1"])
+        self.assertEqual(raised.exception.code, 2)
+        self.assertIn("non-negative", stderr.getvalue())
+        generate.assert_not_called()
+
+    def test_cli_help_describes_provider_specific_output_behavior(self):
+        help_text = gen_slide._parser().format_help()
+        self.assertIn("OpenAI", help_text)
+        self.assertIn("legacy", help_text.lower())
+        self.assertIn("provider-returned", help_text)
 
 
 if __name__ == "__main__":

@@ -7,7 +7,7 @@
   - PPTX: 13.333"×7.5" slide (标准 16:9)
 
 依赖:
-  pip install Pillow python-pptx
+  pip install 'Pillow>=9.1' python-pptx
 
 用法:
   # CLI: 传入图片列表和输出前缀

@@ -32,10 +32,18 @@ mkdir -p ~/.secrets
 printf '%s\n' "YOUR_OPENAI_KEY" > ~/.secrets/openai_api_key
 chmod 600 ~/.secrets/openai_api_key
 
-pip install Pillow python-pptx
+# Gemini fallback and visual self-check (only if used)
+printf '%s\n' "YOUR_GEMINI_KEY" > ~/.secrets/gemini_api_key
+chmod 600 ~/.secrets/gemini_api_key
+
+# Doubao fallback (only if used)
+printf '%s\n' "YOUR_DOUBAO_KEY" > ~/.secrets/doubao_api_key
+chmod 600 ~/.secrets/doubao_api_key
+
+pip install 'Pillow>=9.1' python-pptx
 ```
 
-Add a Gemini credential only for Gemini image generation or the visual self-check. Add a Doubao credential only when explicitly selecting Doubao. Provider selection is explicit; generation does not automatically fall back.
+Add a Gemini credential only for Gemini image generation or the visual self-check. Add a Doubao credential only when explicitly selecting Doubao. The exact secret-file paths above are what the legacy scripts read. Provider selection is explicit; generation does not automatically fall back.
 
 ## Scripts
 
@@ -80,13 +88,15 @@ PROMPTS = {
 }
 
 def gen_one(name, prompt):
-    gen(prompt, f"out/{name}.jpg")
-    return name
+    ok = gen(prompt, f"out/{name}.jpg")
+    return name, ok
 
 with ThreadPoolExecutor(max_workers=8) as ex:
     futures = {ex.submit(gen_one, n, p): n for n, p in PROMPTS.items()}
     for f in as_completed(futures):
-        print(f.result(), "done")
+        name, ok = f.result()
+        status = "done" if ok else "failed"
+        print(name, status)
 ```
 
 ### Step 3: Optionally prepare one editable-converter input
@@ -182,7 +192,7 @@ See `examples/chapters_meta.py` for a filled-in example.
 | OpenAI key missing | Set `OPENAI_API_KEY` or create `~/.secrets/openai_api_key` |
 | OpenAI HTTP 403 / organization verification required | Complete the required OpenAI organization verification, then retry |
 | OpenAI HTTP 429 / rate limit | Wait for capacity or quota, then retry; select another engine explicitly if desired |
-| Unsupported output extension | Use `.jpg`, `.jpeg`, `.png`, or `.webp` |
+| Unsupported OpenAI output extension | Use `.jpg`, `.jpeg`, `.png`, or `.webp` |
 | Gemini HTTP 429 (配额超) | Wait for quota or explicitly use `engine="doubao"` |
 | Items miscounted (8→9) | Add `CRITICAL: EXACTLY N` constraint, list items explicitly |
 | PDF 页大小不一致 | `export_images.py` auto-normalizes to 1920×1080 |
@@ -201,6 +211,7 @@ See `examples/chapters_meta.py` for a filled-in example.
 - **Concurrency sweet spot**: 4-8 workers. Higher triggers rate limits.
 - **OpenAI defaults and overrides**: Confirmed defaults are `gpt-image-2`, `2048x1152`, and `medium`. Override them with `OPENAI_IMAGE_MODEL`, `OPENAI_IMAGE_SIZE`, and `OPENAI_IMAGE_QUALITY` when needed.
 - **Retry behavior**: Providers retry some transient failures internally; surface final failures for manual handling. There is no automatic provider fallback.
+- **Output extensions**: OpenAI output extensions `.jpg`, `.jpeg`, `.png`, and `.webp` select matching API formats. Legacy Gemini and Doubao keep provider-returned encoding; conventionally use `.jpg` and do not assume suffix-based transcoding.
 - **Cache by file existence**: Skip already-generated files when re-running batch jobs.
 - **First-page validation**: Generate 1 sample, visually confirm style, then batch.
 - **Pricing**: Provider pricing can change. Check the [OpenAI API pricing documentation](https://developers.openai.com/api/docs/pricing) instead of assuming a fixed per-image cost.
