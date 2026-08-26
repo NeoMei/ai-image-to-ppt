@@ -5,7 +5,7 @@ description: Use when generating 16:9 presentation slide images from a topic usi
 
 # AI Image to PPT
 
-Generate 16:9 educational textbook-style slide images from any topic using AI image generation models (Gemini **nano banana 2** primary, Volcano **doubao-seedream** fallback), then package into PDF + PPTX.
+Generate 16:9 educational textbook-style slide images from any topic using OpenAI **GPT Image 2** as the primary engine, with Gemini **nano banana** and Volcano **doubao-seedream** as explicit fallback engines, then package them into PDF + PPTX.
 
 ## When to Use
 
@@ -21,31 +21,35 @@ Generate 16:9 educational textbook-style slide images from any topic using AI im
 
 ## Prerequisites
 
-Two API keys (any one suffices; both recommended for redundancy):
+One OpenAI key is sufficient for default generation:
 
 ```bash
-# Gemini (https://aistudio.google.com/apikey)
-echo "YOUR_GEMINI_KEY" > ~/.secrets/gemini_api_key
+# Preferred
+export OPENAI_API_KEY="YOUR_OPENAI_KEY"
 
-# 方舟 doubao (https://console.volcengine.com/ark)
-echo "YOUR_DOUBAO_KEY" > ~/.secrets/doubao_api_key
-chmod 600 ~/.secrets/*_api_key
+# Or the project's secret-file convention
+mkdir -p ~/.secrets
+printf '%s\n' "YOUR_OPENAI_KEY" > ~/.secrets/openai_api_key
+chmod 600 ~/.secrets/openai_api_key
 
 pip install Pillow python-pptx
 ```
+
+Add a Gemini credential only for Gemini image generation or the visual self-check. Add a Doubao credential only when explicitly selecting Doubao. Provider selection is explicit; generation does not automatically fall back.
 
 ## Scripts
 
 All in `scripts/` directory. Copy to project or add to `PYTHONPATH`.
 
-| Script | Engine | API | Cost |
-|---|---|---|---|
-| `gen_slide_gemini.py` | Gemini nano banana 2 | `gemini-3.1-flash-image-preview` | 免费 500/天 |
-| `gen_slide_doubao.py` | 方舟 doubao-seedream-5-0 | OpenAI 兼容 | 按量付费 |
-| `vision_check_gemini.py` | Gemini 2.0 Flash 视觉理解 | `gemini-2.0-flash` | 免费 |
-| `export_images.py` | Pillow + python-pptx | 本地 | 免费 |
-
-Both generators share identical interface `gen(prompt, out_path) -> bool`, swappable.
+| Script | Role / Engine | API / Output |
+|---|---|---|
+| `gen_slide.py` | Default provider router | OpenAI by default; Gemini and Doubao are explicit choices |
+| `gen_slide_openai.py` | OpenAI GPT Image 2 | `gpt-image-2`; 2048×1152, medium by default |
+| `gen_slide_gemini.py` | Gemini nano banana | `gemini-3.1-flash-image-preview` |
+| `gen_slide_doubao.py` | 方舟 doubao-seedream-5-0 | OpenAI-compatible API |
+| `prepare_editable_input.py` | Editable-converter handoff | Exact 1280x720 PNG |
+| `vision_check_gemini.py` | Gemini visual self-check | `gemini-2.0-flash` |
+| `export_images.py` | Local export | PDF + PPTX |
 
 ## Workflow
 
@@ -54,16 +58,20 @@ Both generators share identical interface `gen(prompt, out_path) -> bool`, swapp
 ```python
 import sys
 sys.path.insert(0, "<skill_path>/scripts")
-from gen_slide_gemini import gen  # or gen_slide_doubao
+from gen_slide import gen
 
 gen("<detailed prompt>", "out/slide_01.jpg")
+
+# Explicit fallbacks when requested
+gen("<detailed prompt>", "out/slide_01.jpg", engine="gemini")
+gen("<detailed prompt>", "out/slide_01.jpg", engine="doubao")
 ```
 
 ### Step 2: Batch generate with concurrency
 
 ```python
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from gen_slide_gemini import gen
+from gen_slide import gen
 
 PROMPTS = {
     "slide_01": "<prompt 1>",
@@ -81,13 +89,25 @@ with ThreadPoolExecutor(max_workers=8) as ex:
         print(f.result(), "done")
 ```
 
-### Step 3: Vision self-check (recommended for quantity-sensitive prompts)
+### Step 3: Optionally prepare one editable-converter input
+
+The downstream `image-to-editable-pptx` converter currently processes one slide at a time. Preserve the generated high-resolution master and create a separate standardized artifact:
+
+```bash
+python3 scripts/prepare_editable_input.py \
+  out/slide_01.jpg \
+  out/editable/slide_01.png
+```
+
+Before invoking the converter, verify that the new output is an exact 1280x720 PNG. The standardizer rejects non-16:9 input and existing output paths; it does not create an editable PPTX. Its PNG is only the converter's input artifact.
+
+### Step 4: Vision self-check (recommended for quantity-sensitive prompts)
 
 ```bash
 python3 scripts/vision_check_gemini.py out/slide_01.jpg "精确数一下卡片数量是否正确?"
 ```
 
-### Step 4: Export to PDF + PPTX
+### Step 5: Export to PDF + PPTX
 
 ```bash
 # CLI (glob accepts space-separated paths)
@@ -159,7 +179,11 @@ See `examples/chapters_meta.py` for a filled-in example.
 
 | Symptom | Fix |
 |---|---|
-| Gemini HTTP 429 (配额超) | Switch to `gen_slide_doubao` |
+| OpenAI key missing | Set `OPENAI_API_KEY` or create `~/.secrets/openai_api_key` |
+| OpenAI HTTP 403 / organization verification required | Complete the required OpenAI organization verification, then retry |
+| OpenAI HTTP 429 / rate limit | Wait for capacity or quota, then retry; select another engine explicitly if desired |
+| Unsupported output extension | Use `.jpg`, `.jpeg`, `.png`, or `.webp` |
+| Gemini HTTP 429 (配额超) | Wait for quota or explicitly use `engine="doubao"` |
 | Items miscounted (8→9) | Add `CRITICAL: EXACTLY N` constraint, list items explicitly |
 | PDF 页大小不一致 | `export_images.py` auto-normalizes to 1920×1080 |
 | Chinese 错字/糊字 | Run `vision_check_gemini.py` on samples, regenerate failures |
@@ -175,7 +199,8 @@ See `examples/chapters_meta.py` for a filled-in example.
 ## Tips
 
 - **Concurrency sweet spot**: 4-8 workers. Higher triggers rate limits.
-- **Retry once on failure**: Both generators retry internally; surface failures for manual retry.
+- **OpenAI defaults and overrides**: Confirmed defaults are `gpt-image-2`, `2048x1152`, and `medium`. Override them with `OPENAI_IMAGE_MODEL`, `OPENAI_IMAGE_SIZE`, and `OPENAI_IMAGE_QUALITY` when needed.
+- **Retry behavior**: Providers retry some transient failures internally; surface final failures for manual handling. There is no automatic provider fallback.
 - **Cache by file existence**: Skip already-generated files when re-running batch jobs.
 - **First-page validation**: Generate 1 sample, visually confirm style, then batch.
-- **Cost**: nano banana 2 free tier covers ~500 images/day. doubao-seedream-5-0 paid.
+- **Pricing**: Provider pricing can change. Check the [OpenAI API pricing documentation](https://developers.openai.com/api/docs/pricing) instead of assuming a fixed per-image cost.
