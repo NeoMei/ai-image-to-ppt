@@ -101,8 +101,9 @@ The router does not automatically switch providers: choose fallback engines expl
 OpenAI and Doubao support output extensions `.jpg`, `.jpeg`, `.png`, and `.webp`.
 Gemini supports `.png`, `.jpg`, and `.jpeg`: PNG by default, while a JPEG suffix
 requests `IMAGE_JPEG`. Unsupported Gemini suffixes fail before credential lookup or
-network access. For every provider, the returned MIME type, actual encoding, and strict
-16:9 dimensions are validated before publication. Generation refuses existing
+network access. Only Gemini validates the provider-declared response MIME type.
+All providers validate the actual image encoding and strict 16:9 dimensions before
+publication. Generation refuses existing
 outputs by default and makes no provider request; pass `overwrite=True` in Python
 or `--force` on the CLI only when replacement is intentional.
 

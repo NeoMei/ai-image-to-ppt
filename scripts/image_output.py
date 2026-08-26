@@ -107,15 +107,43 @@ def expected_mime_type(out_path: str) -> str:
     return MIME_TYPES[output_format(out_path)]
 
 
-def resolve_output_path(target: object) -> Path:
+def capture_path_base() -> Path:
+    """Capture one absolute CWD for resolving every path in a public call."""
+    try:
+        return Path.cwd()
+    except (OSError, ValueError, RuntimeError) as error:
+        raise ImageOutputError(
+            f"cannot capture current working directory: {error}"
+        ) from error
+
+
+def _absolute_path(value: object, base: Optional[Path]) -> Path:
+    expanded = Path(value).expanduser()
+    path_base = capture_path_base() if base is None else Path(base)
+    if not path_base.is_absolute():
+        raise ValueError("path base must be absolute")
+    combined = expanded if expanded.is_absolute() else path_base / expanded
+    absolute = Path(os.path.abspath(str(combined)))
+    if "\0" in str(absolute):
+        raise ValueError("embedded null byte")
+    return absolute
+
+
+def resolve_output_path(target: object, base: Optional[Path] = None) -> Path:
     """Freeze output ancestors as a real absolute path without following basename."""
     try:
-        absolute = Path(os.path.abspath(str(Path(target).expanduser())))
-        if "\0" in str(absolute):
-            raise ValueError("embedded null byte")
+        absolute = _absolute_path(target, base)
         return absolute.parent.resolve(strict=False) / absolute.name
     except (TypeError, ValueError, OSError, RuntimeError) as error:
         raise ImageOutputError(f"invalid output target: {error}") from error
+
+
+def resolve_input_path(source: object, base: Optional[Path] = None) -> Path:
+    """Freeze an input path, following its current final symlink referent."""
+    try:
+        return _absolute_path(source, base).resolve(strict=False)
+    except (TypeError, ValueError, OSError, RuntimeError) as error:
+        raise ImageOutputError(f"invalid input path: {error}") from error
 
 
 def decode_base64(encoded: object) -> bytes:
@@ -377,8 +405,25 @@ def _remove_temp(path: str) -> None:
         except OSError as error:
             last_error = error
     raise ImageOutputError(
-        f"failed to remove output temporary file: {last_error}"
+        f"failed to remove output temporary file {path}: {last_error}"
     ) from last_error
+
+
+def _warn_retained_temp(context: str, path: str, error: Exception) -> None:
+    try:
+        print(
+            f"  WARN: {context}; temporary file remains at {path}: {error}",
+            file=sys.stderr,
+        )
+    except Exception:
+        pass
+
+
+def _cleanup_failed_temp(path: str) -> None:
+    try:
+        _remove_temp(path)
+    except ImageOutputError as error:
+        _warn_retained_temp("output failed", path, error)
 
 
 def _validate_temp(path: str, target: TargetValue) -> int:
@@ -422,10 +467,8 @@ def _publish_temp(temp_path: str, target: TargetValue, overwrite: bool) -> None:
     try:
         _remove_temp(temp_path)
     except ImageOutputError as error:
-        print(
-            "  WARN: output was published but temporary file remains at "
-            f"{temp_path}: {error}",
-            file=sys.stderr,
+        _warn_retained_temp(
+            "output was published but cleanup failed", temp_path, error
         )
 
 
@@ -453,7 +496,7 @@ def publish_bytes(data: bytes, target: TargetValue, overwrite: bool = False) -> 
         raise ImageOutputError(f"failed to write image: {error}") from error
     finally:
         if not published and os.path.lexists(temp_path):
-            _remove_temp(temp_path)
+            _cleanup_failed_temp(temp_path)
 
 
 def publish_stream(
@@ -510,4 +553,4 @@ def publish_stream(
         raise ImageOutputError(f"failed to download image: {error}") from error
     finally:
         if not published and os.path.lexists(temp_path):
-            _remove_temp(temp_path)
+            _cleanup_failed_temp(temp_path)

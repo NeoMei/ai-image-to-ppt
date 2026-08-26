@@ -255,6 +255,103 @@ class SharedImageLimitTests(unittest.TestCase):
             self.assertIn("WARN:", stderr.getvalue())
             self.assertIn(str(stale[0]), stderr.getvalue())
 
+    def test_invalid_bytes_survive_persistent_failure_cleanup_denial(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            target = root / "slide.png"
+            real_unlink = image_output.os.unlink
+            attempts = 0
+
+            def deny_temp(path, *args, **kwargs):
+                nonlocal attempts
+                candidate = Path(path)
+                if candidate.parent == root and candidate.name.endswith(".tmp"):
+                    attempts += 1
+                    raise PermissionError("cleanup-denied")
+                return real_unlink(path, *args, **kwargs)
+
+            stderr = io.StringIO()
+            with mock.patch.object(
+                image_output.os, "unlink", side_effect=deny_temp
+            ), redirect_stderr(stderr), self.assertRaisesRegex(
+                image_output.ImageOutputError, "not a valid image"
+            ):
+                image_output.publish_bytes(b"not-an-image", target)
+
+            stale = list(root.glob(".slide.png.*.tmp"))
+            self.assertEqual(attempts, 2)
+            self.assertEqual(len(stale), 1)
+            self.assertIn("WARN:", stderr.getvalue())
+            self.assertIn(str(stale[0]), stderr.getvalue())
+
+    def test_stream_read_error_survives_persistent_failure_cleanup_denial(self):
+        class FailingResponse:
+            headers = {}
+
+            def read(self, _size):
+                raise OSError("stream-root-cause")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            target = root / "slide.png"
+            real_unlink = image_output.os.unlink
+            attempts = 0
+
+            def deny_temp(path, *args, **kwargs):
+                nonlocal attempts
+                candidate = Path(path)
+                if candidate.parent == root and candidate.name.endswith(".tmp"):
+                    attempts += 1
+                    raise PermissionError("cleanup-denied")
+                return real_unlink(path, *args, **kwargs)
+
+            stderr = io.StringIO()
+            with mock.patch.object(
+                image_output.os, "unlink", side_effect=deny_temp
+            ), redirect_stderr(stderr), self.assertRaisesRegex(
+                image_output.ImageStreamError, "stream-root-cause"
+            ):
+                image_output.publish_stream(FailingResponse(), target)
+
+            stale = list(root.glob(".slide.png.*.tmp"))
+            self.assertEqual(attempts, 2)
+            self.assertEqual(len(stale), 1)
+            self.assertIn("WARN:", stderr.getvalue())
+            self.assertIn(str(stale[0]), stderr.getvalue())
+
+    def test_publish_error_survives_persistent_failure_cleanup_denial(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            target = root / "slide.jpg"
+            buffer = io.BytesIO()
+            Image.new("RGB", (160, 90), "navy").save(buffer, format="JPEG")
+            real_unlink = image_output.os.unlink
+            attempts = 0
+
+            def deny_temp(path, *args, **kwargs):
+                nonlocal attempts
+                candidate = Path(path)
+                if candidate.parent == root and candidate.name.endswith(".tmp"):
+                    attempts += 1
+                    raise PermissionError("cleanup-denied")
+                return real_unlink(path, *args, **kwargs)
+
+            stderr = io.StringIO()
+            with mock.patch.object(
+                image_output.os, "link", side_effect=OSError("publish-root-cause")
+            ), mock.patch.object(
+                image_output.os, "unlink", side_effect=deny_temp
+            ), redirect_stderr(stderr), self.assertRaisesRegex(
+                image_output.ImageOutputError, "publish-root-cause"
+            ):
+                image_output.publish_bytes(buffer.getvalue(), target)
+
+            stale = list(root.glob(".slide.jpg.*.tmp"))
+            self.assertEqual(attempts, 2)
+            self.assertEqual(len(stale), 1)
+            self.assertIn("WARN:", stderr.getvalue())
+            self.assertIn(str(stale[0]), stderr.getvalue())
+
 
 class ProviderResourceBoundaryTests(unittest.TestCase):
     def test_response_reader_never_falls_back_to_unbounded_read(self):

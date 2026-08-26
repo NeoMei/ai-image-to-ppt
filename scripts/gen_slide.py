@@ -64,8 +64,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "out_path",
         help=(
-            "Output path. OpenAI matches .jpg/.jpeg/.png/.webp; legacy "
-            "engines keep provider-returned encoding (conventionally use .jpg)"
+            "Output path. OpenAI/Doubao: .jpg/.jpeg/.png/.webp; "
+            "Gemini: .png (default), .jpg/.jpeg (JPEG suffix requests JPEG). "
+            "All providers validate actual encoding and strict 16:9 dimensions"
         ),
     )
     parser.add_argument("prompt", help="Image generation prompt")

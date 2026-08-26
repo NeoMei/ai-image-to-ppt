@@ -77,6 +77,45 @@ class PrepareEditableInputTests(unittest.TestCase):
             self.assertTrue((approved / "output" / "slide.png").is_file())
             self.assertFalse((redirected / "output" / "slide.png").exists())
 
+    def test_prepare_freezes_relative_source_symlink_before_lock_cwd_change(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            approved = root / "approved"
+            redirected = root / "redirected"
+            approved.mkdir()
+            redirected.mkdir()
+            original_source = approved / "original.png"
+            redirected_source = redirected / "redirected.png"
+            Image.new("RGB", (1600, 900), "red").save(original_source)
+            Image.new("RGB", (1600, 900), "blue").save(redirected_source)
+            source_alias = approved / "source.png"
+            source_alias.symlink_to(original_source)
+            original_cwd = Path.cwd()
+
+            @contextmanager
+            def redirect_after_lock(_target, namespace="output"):
+                source_alias.unlink()
+                source_alias.symlink_to(redirected_source)
+                os.chdir(redirected)
+                yield
+
+            try:
+                os.chdir(approved)
+                with mock.patch.object(
+                    prepare_editable_input,
+                    "output_lock",
+                    redirect_after_lock,
+                ):
+                    self.assertTrue(
+                        prepare_editable_input.prepare("source.png", "output.png")
+                    )
+            finally:
+                os.chdir(original_cwd)
+
+            with Image.open(approved / "output.png") as image:
+                self.assertEqual(image.getpixel((100, 100)), (255, 0, 0))
+            self.assertFalse((redirected / "output.png").exists())
+
     def test_rejects_non_16_by_9_source_without_creating_output(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             source = Path(temp_dir) / "square.png"

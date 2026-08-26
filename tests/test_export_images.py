@@ -41,6 +41,66 @@ class ExportImagesTests(unittest.TestCase):
 
             self.assertEqual(target.read_bytes(), b"existing")
 
+    def test_standalone_failure_cleanup_warns_without_masking_primary_error(self):
+        for phase in ("serializer", "sync", "publish"):
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir)
+                target = root / "deck.pdf"
+                resolved_target = export_images.resolve_output_path(target)
+                real_sync = export_images._sync_file
+                real_replace = export_images.os.replace
+                real_unlink = export_images.os.unlink
+                cleanup_attempts = 0
+
+                def save(_images, path):
+                    if phase == "serializer":
+                        raise OSError("serializer-root-cause")
+                    Path(path).write_bytes(b"pdf")
+
+                def sync(path):
+                    if phase == "sync":
+                        raise OSError("sync-root-cause")
+                    return real_sync(path)
+
+                def replace(source, destination, *args, **kwargs):
+                    if phase == "publish" and Path(destination) == resolved_target:
+                        raise OSError("publish-root-cause")
+                    return real_replace(source, destination, *args, **kwargs)
+
+                def deny_temp_cleanup(path, *args, **kwargs):
+                    nonlocal cleanup_attempts
+                    candidate = Path(path)
+                    if (
+                        candidate.parent.resolve(strict=False)
+                        == root.resolve(strict=False)
+                        and ".tmp.pdf" in candidate.name
+                    ):
+                        cleanup_attempts += 1
+                        raise PermissionError("cleanup-denied")
+                    return real_unlink(path, *args, **kwargs)
+
+                stderr = io.StringIO()
+                with mock.patch.object(
+                    export_images, "_load_all", return_value=["image"]
+                ), mock.patch.object(
+                    export_images, "_save_pdf", side_effect=save
+                ), mock.patch.object(
+                    export_images, "_sync_file", side_effect=sync
+                ), mock.patch.object(
+                    export_images.os, "replace", side_effect=replace
+                ), mock.patch.object(
+                    export_images.os, "unlink", side_effect=deny_temp_cleanup
+                ), redirect_stderr(stderr), self.assertRaisesRegex(
+                    OSError, f"{phase}-root-cause"
+                ):
+                    export_images.export_pdf(["ignored"], str(target))
+
+                stale = list(root.glob(".deck.pdf.*.tmp.pdf"))
+                self.assertEqual(cleanup_attempts, 2)
+                self.assertEqual(len(stale), 1)
+                self.assertIn("WARN:", stderr.getvalue())
+                self.assertIn(str(stale[0]), stderr.getvalue())
+
     def test_nested_output_parent_is_created(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             source = Path(temp_dir) / "slide.png"
@@ -143,6 +203,104 @@ class ExportImagesTests(unittest.TestCase):
                 (approved / "output" / "deck.pptx").read_bytes(), b"pptx"
             )
             self.assertFalse((redirected / "output" / "deck.pptx").exists())
+
+    def test_standalone_exports_freeze_relative_input_symlink_before_callbacks(self):
+        cases = (
+            (export_images.export_pdf, "_save_pdf", ".pdf"),
+            (export_images.export_pptx, "_save_pptx", ".pptx"),
+        )
+        for export, serializer_name, suffix in cases:
+            with self.subTest(suffix=suffix), tempfile.TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir)
+                approved = root / "approved"
+                redirected = root / "redirected"
+                approved.mkdir()
+                redirected.mkdir()
+                original_source = approved / "original.png"
+                redirected_source = redirected / "redirected.png"
+                self._image(original_source, color="red")
+                self._image(redirected_source, color="blue")
+                source_alias = approved / "source.png"
+                source_alias.symlink_to(original_source)
+                observed_files = []
+                original_cwd = Path.cwd()
+
+                def load_after_freeze(files):
+                    observed_files.extend(files)
+                    source_alias.unlink()
+                    source_alias.symlink_to(redirected_source)
+                    os.chdir(redirected)
+                    return ["image"]
+
+                def save(_images, path):
+                    Path(path).write_bytes(b"artifact")
+
+                try:
+                    os.chdir(approved)
+                    with mock.patch.object(
+                        export_images, "_load_all", side_effect=load_after_freeze
+                    ), mock.patch.object(
+                        export_images, serializer_name, side_effect=save
+                    ):
+                        export(["source.png"], f"output/deck{suffix}")
+                finally:
+                    os.chdir(original_cwd)
+
+                self.assertEqual(
+                    observed_files,
+                    [str(original_source.resolve(strict=True))],
+                )
+                self.assertEqual(
+                    (approved / "output" / f"deck{suffix}").read_bytes(),
+                    b"artifact",
+                )
+
+    def test_export_deck_freezes_all_relative_inputs_before_lock_cwd_change(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            approved = root / "approved"
+            redirected = root / "redirected"
+            approved.mkdir()
+            redirected.mkdir()
+            self._image(approved / "one.png", color="red")
+            self._image(approved / "two.png", color="green")
+            self._image(redirected / "one.png", color="blue")
+            self._image(redirected / "two.png", color="yellow")
+            original_cwd = Path.cwd()
+
+            @contextmanager
+            def change_cwd_before_yield(_target, namespace="output"):
+                os.chdir(redirected)
+                yield
+
+            def save_markers(images, path):
+                markers = b"".join(bytes(image.getpixel((0, 0))) for image in images)
+                Path(path).write_bytes(markers)
+
+            try:
+                os.chdir(approved)
+                with mock.patch.object(
+                    export_images, "output_lock", change_cwd_before_yield
+                ), mock.patch.object(
+                    export_images, "_save_pdf", side_effect=save_markers
+                ), mock.patch.object(
+                    export_images, "_save_pptx", side_effect=save_markers
+                ):
+                    self.assertTrue(
+                        export_images.export_deck(
+                            ["one.png", "two.png"], "output/deck"
+                        )
+                    )
+            finally:
+                os.chdir(original_cwd)
+
+            expected = bytes((255, 0, 0)) + bytes((0, 128, 0))
+            self.assertEqual(
+                (approved / "output" / "deck.pdf").read_bytes(), expected
+            )
+            self.assertEqual(
+                (approved / "output" / "deck.pptx").read_bytes(), expected
+            )
 
     def test_export_pdf_resolves_parent_but_does_not_follow_final_symlink(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -317,6 +475,65 @@ class ExportImagesTests(unittest.TestCase):
             self.assertEqual(pdf.read_bytes(), b"old-pdf")
             self.assertEqual(pptx.read_bytes(), b"old-pptx")
             self.assertEqual(list(Path(temp_dir).glob(".*.backup")), [])
+
+    def test_force_backup_identity_race_preserves_external_member_and_aborts(self):
+        for raced_suffix in (".pdf", ".pptx"):
+            with self.subTest(raced_suffix=raced_suffix), \
+                 tempfile.TemporaryDirectory() as temp_dir:
+                source = Path(temp_dir) / "slide.png"
+                prefix = Path(temp_dir) / "deck"
+                pdf = prefix.with_suffix(".pdf")
+                pptx = prefix.with_suffix(".pptx")
+                self._image(source)
+                pdf.write_bytes(b"old-pdf")
+                pptx.write_bytes(b"old-pptx")
+                raced_target = export_images.resolve_output_path(
+                    prefix.with_suffix(raced_suffix)
+                )
+                external = f"external-{raced_suffix[1:]}".encode()
+                real_replace = export_images.os.replace
+                injected = False
+
+                def replace_after_identity_check(
+                    source_path, destination, *args, **kwargs
+                ):
+                    nonlocal injected
+                    if Path(source_path) == raced_target and not injected:
+                        injected = True
+                        raced_target.unlink()
+                        raced_target.write_bytes(external)
+                    return real_replace(source_path, destination, *args, **kwargs)
+
+                stderr = io.StringIO()
+                with mock.patch.object(
+                    export_images.os,
+                    "replace",
+                    side_effect=replace_after_identity_check,
+                ), redirect_stderr(stderr):
+                    result = export_images.main(
+                        ["--force", str(prefix), str(source)]
+                    )
+
+                self.assertTrue(injected)
+                self.assertEqual(result, 1)
+                self.assertEqual(raced_target.read_bytes(), external)
+                untouched = (
+                    export_images.resolve_output_path(pptx)
+                    if raced_suffix == ".pdf"
+                    else export_images.resolve_output_path(pdf)
+                )
+                untouched_expected = (
+                    b"old-pptx" if raced_suffix == ".pdf" else b"old-pdf"
+                )
+                self.assertEqual(untouched.read_bytes(), untouched_expected)
+                preserved = [
+                    path
+                    for path in Path(temp_dir).glob(".*.backup")
+                    if path.read_bytes() == external
+                ]
+                self.assertEqual(len(preserved), 1)
+                self.assertIn("identity changed", stderr.getvalue())
+                self.assertIn(str(preserved[0]), stderr.getvalue())
 
     def test_force_rollback_preserves_external_replacement_of_published_pdf(self):
         with tempfile.TemporaryDirectory() as temp_dir:

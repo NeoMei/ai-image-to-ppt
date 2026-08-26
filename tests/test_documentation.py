@@ -53,8 +53,18 @@ class DocumentationTests(unittest.TestCase):
 
     def test_output_extension_claim_is_provider_specific(self):
         for document in (self.readme, self.skill):
+            normalized = " ".join(document.split())
             self.assertIn("`.jpg`, `.jpeg`, `.png`, and `.webp`", document)
-            self.assertIn("validated before publication", document)
+            self.assertIn(
+                "Only Gemini validates the provider-declared response MIME type.",
+                normalized,
+            )
+            self.assertIn(
+                "All providers validate the actual image encoding and strict "
+                "16:9 dimensions before publication.",
+                normalized,
+            )
+            self.assertNotIn("every provider's returned MIME type", document.lower())
             self.assertNotIn("provider-returned encoding", document)
 
     def test_current_gemini_models_are_consistent(self):

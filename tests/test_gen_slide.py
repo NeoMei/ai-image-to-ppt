@@ -145,10 +145,13 @@ class RouterTests(unittest.TestCase):
         generate.assert_not_called()
 
     def test_cli_help_describes_provider_specific_output_behavior(self):
-        help_text = gen_slide._parser().format_help()
-        self.assertIn("OpenAI", help_text)
-        self.assertIn("legacy", help_text.lower())
-        self.assertIn("provider-returned", help_text)
+        help_text = " ".join(gen_slide._parser().format_help().split())
+        self.assertIn("OpenAI/Doubao: .jpg/.jpeg/.png/.webp", help_text)
+        self.assertIn("Gemini: .png (default), .jpg/.jpeg", help_text)
+        self.assertIn("JPEG suffix requests JPEG", help_text)
+        self.assertIn("actual encoding and strict 16:9", help_text)
+        self.assertNotIn("legacy", help_text.lower())
+        self.assertNotIn("provider-returned", help_text)
 
 
 if __name__ == "__main__":

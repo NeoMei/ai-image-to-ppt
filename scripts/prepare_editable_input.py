@@ -10,8 +10,10 @@ from typing import Optional, Sequence
 from PIL import Image, UnidentifiedImageError
 from image_output import (
     ImageOutputError,
+    capture_path_base,
     load_image,
     prepare_target,
+    resolve_input_path,
     resolve_output_path,
     verify_parent_identity,
 )
@@ -146,9 +148,11 @@ def _prepare_owned(input_path: str, output_path: str) -> bool:
 
 def prepare(input_path: str, output_path: str) -> bool:
     try:
-        target = resolve_output_path(output_path)
+        base = capture_path_base()
+        target = resolve_output_path(output_path, base=base)
+        source = resolve_input_path(input_path, base=base)
         with output_lock(target):
-            return _prepare_owned(input_path, str(target))
+            return _prepare_owned(str(source), str(target))
     except (ImageOutputError, OutputLockError) as error:
         print(f"  ERR: {error}")
         return False

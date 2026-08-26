@@ -234,7 +234,7 @@ class OutputOwnershipIntegrationTests(unittest.TestCase):
         results = []
 
         def fake_load_all(files):
-            return list(files)
+            return [Path(path).name for path in files]
 
         def fake_save_pdf(images, path):
             Path(path).write_bytes(f"{images[0]}-PDF".encode("ascii"))

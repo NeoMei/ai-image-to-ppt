@@ -6,6 +6,7 @@ Install runtime dependencies with ``python3 -m pip install -r requirements.txt``
 
 import argparse
 import os
+import stat
 import sys
 import tempfile
 from io import BytesIO
@@ -18,8 +19,10 @@ from pptx.util import Emu
 from image_output import (
     ImageOutputError,
     ParentIdentity,
+    capture_path_base,
     load_image,
     prepare_target,
+    resolve_input_path,
     resolve_output_path,
     verify_parent_identity,
 )
@@ -139,6 +142,30 @@ def _sync_file(path: str) -> None:
         os.fsync(stream.fileno())
 
 
+def _warn_retained_temp(context: str, path: str, error: object) -> None:
+    try:
+        print(
+            f"  WARN: {context}; temporary file remains at {path}: {error}",
+            file=sys.stderr,
+        )
+    except Exception:
+        pass
+
+
+def _cleanup_temp(path: str, context: str) -> None:
+    last_error = None
+    for _attempt in range(2):
+        try:
+            os.unlink(path)
+            return
+        except FileNotFoundError:
+            return
+        except OSError as error:
+            last_error = error
+    if last_error is not None:
+        _warn_retained_temp(context, path, last_error)
+
+
 def _atomic_save(target_path: str, save: Callable[[str], None]) -> None:
     target = Path(target_path)
     temporary = _temporary_path(target)
@@ -147,16 +174,19 @@ def _atomic_save(target_path: str, save: Callable[[str], None]) -> None:
         _sync_file(temporary)
         os.replace(temporary, target)
     finally:
-        try:
-            os.unlink(temporary)
-        except FileNotFoundError:
-            pass
+        _cleanup_temp(temporary, "standalone export cleanup failed")
+
+
+def _freeze_inputs(files: Iterable[str], base: Path) -> List[str]:
+    return [str(resolve_input_path(path, base=base)) for path in files]
 
 
 def export_pdf(files: Sequence[str], pdf_path: str) -> None:
     """Export a normalized multi-page PDF without exposing partial output."""
-    target = resolve_output_path(pdf_path)
-    images = _load_all(files)
+    base = capture_path_base()
+    target = resolve_output_path(pdf_path, base=base)
+    frozen_files = _freeze_inputs(files, base)
+    images = _load_all(frozen_files)
     _atomic_save(str(target), lambda path: _save_pdf(images, path))
     size_mb = target.stat().st_size / 1024 / 1024
     print(f"  PDF: {target} ({len(images)} pages, {size_mb:.1f}MB)")
@@ -164,8 +194,10 @@ def export_pdf(files: Sequence[str], pdf_path: str) -> None:
 
 def export_pptx(files: Sequence[str], pptx_path: str) -> None:
     """Export an exact 16:9 PPTX without exposing partial output."""
-    target = resolve_output_path(pptx_path)
-    images = _load_all(files)
+    base = capture_path_base()
+    target = resolve_output_path(pptx_path, base=base)
+    frozen_files = _freeze_inputs(files, base)
+    images = _load_all(frozen_files)
     _atomic_save(str(target), lambda path: _save_pptx(images, path))
     size_mb = target.stat().st_size / 1024 / 1024
     print(f"  PPTX: {target} ({len(images)} slides, {size_mb:.1f}MB)")
@@ -224,10 +256,32 @@ def _publish_pair(
         for target in existing:
             if parent is not None:
                 verify_parent_identity(parent)
-            if target.is_symlink() or not target.is_file():
+            target_stat = os.stat(target, follow_symlinks=False)
+            if not stat.S_ISREG(target_stat.st_mode):
                 raise OSError(f"refusing non-regular output target: {target}")
+            target_identity = (target_stat.st_dev, target_stat.st_ino)
             backup = _backup_path(target, parent=parent)
             os.replace(target, backup)
+            try:
+                backup_stat = os.stat(backup, follow_symlinks=False)
+            except OSError as error:
+                raise OSError(
+                    "cannot verify forced-output backup identity; "
+                    f"backup preserved at: {backup}: {error}"
+                ) from error
+            backup_identity = (backup_stat.st_dev, backup_stat.st_ino)
+            if backup_identity != target_identity:
+                try:
+                    os.link(backup, target, follow_symlinks=False)
+                    restoration = "restored without clobbering the target"
+                except FileExistsError:
+                    restoration = "target was recreated; both objects preserved"
+                except (OSError, TypeError, NotImplementedError) as error:
+                    restoration = f"no-clobber restore failed ({error})"
+                raise OSError(
+                    "forced-output identity changed during backup; "
+                    f"external object {restoration}; backup preserved at: {backup}"
+                )
             backups[target] = backup
         for temporary, target in zip(temporary_paths, targets):
             if parent is not None:
@@ -363,29 +417,9 @@ def _export_deck_owned(
         _publish_pair(temporary_paths, targets, force=force, parent=parent)
         publication_succeeded = True
     finally:
-        cleanup_errors = []
+        outcome = "succeeded" if publication_succeeded else "failed"
         for temporary in temporary_paths:
-            last_error = None
-            for _attempt in range(2):
-                try:
-                    os.unlink(temporary)
-                    last_error = None
-                    break
-                except FileNotFoundError:
-                    last_error = None
-                    break
-                except OSError as error:
-                    last_error = error
-            if last_error is not None:
-                cleanup_errors.append((temporary, last_error))
-        if cleanup_errors:
-            outcome = "succeeded" if publication_succeeded else "failed"
-            for temporary, error in cleanup_errors:
-                print(
-                    f"  WARN: export {outcome} but temporary file remains at "
-                    f"{temporary}: {error}",
-                    file=sys.stderr,
-                )
+            _cleanup_temp(temporary, f"export {outcome} cleanup failed")
     for label, target in zip(("PDF", "PPTX"), targets):
         verify_parent_identity(parent)
         size_mb = target.stat().st_size / 1024 / 1024
@@ -397,9 +431,13 @@ def export_deck(
 ) -> bool:
     """Build and publish one pair while owning the complete output prefix."""
     try:
-        resolved_prefix = resolve_output_path(output_prefix)
+        base = capture_path_base()
+        resolved_prefix = resolve_output_path(output_prefix, base=base)
+        frozen_files = _freeze_inputs(files, base)
         with output_lock(resolved_prefix, namespace="deck"):
-            _export_deck_owned(files, str(resolved_prefix), force=force)
+            _export_deck_owned(
+                frozen_files, str(resolved_prefix), force=force
+            )
         return True
     except (ImageOutputError, OutputLockError) as error:
         print(f"  ERR: export failed: {error}", file=sys.stderr)
