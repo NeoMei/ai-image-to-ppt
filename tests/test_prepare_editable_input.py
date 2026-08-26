@@ -1,7 +1,10 @@
+import io
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
+from unittest import mock
 
 from PIL import Image
 
@@ -64,6 +67,119 @@ class PrepareEditableInputTests(unittest.TestCase):
             self.assertFalse(prepare_editable_input.prepare(str(source), str(target)))
             self.assertEqual(target.read_bytes(), b"existing-output")
             self.assertEqual(list(Path(temp_dir).glob(f".{target.name}.*.tmp")), [])
+
+    def test_output_setup_failure_returns_false_without_damage(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "master.jpg"
+            blocked_parent = Path(temp_dir) / "not-a-directory"
+            target = blocked_parent / "slide.png"
+            Image.new("RGB", (1920, 1080), "navy").save(source, format="JPEG")
+            source_before = source.read_bytes()
+            blocked_parent.write_bytes(b"existing-parent-file")
+
+            try:
+                result = prepare_editable_input.prepare(str(source), str(target))
+            except OSError as error:
+                self.fail(f"prepare raised instead of returning False: {error}")
+
+            self.assertFalse(result)
+            self.assertEqual(source.read_bytes(), source_before)
+            self.assertEqual(blocked_parent.read_bytes(), b"existing-parent-file")
+
+    def test_png_save_failure_removes_created_temp_file(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "master.jpg"
+            target = Path(temp_dir) / "slide.png"
+            Image.new("RGB", (1920, 1080), "navy").save(source, format="JPEG")
+            source_before = source.read_bytes()
+
+            with mock.patch.object(
+                Image.Image,
+                "save",
+                side_effect=OSError("forced PNG save failure"),
+            ):
+                self.assertFalse(
+                    prepare_editable_input.prepare(str(source), str(target))
+                )
+
+            self.assertEqual(source.read_bytes(), source_before)
+            self.assertFalse(target.exists())
+            self.assertEqual(list(Path(temp_dir).glob(f".{target.name}.*.tmp")), [])
+
+    def test_publish_race_preserves_target_and_removes_temp_file(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "master.jpg"
+            target = Path(temp_dir) / "slide.png"
+            Image.new("RGB", (1920, 1080), "navy").save(source, format="JPEG")
+
+            def create_racing_target(_temp_path, output_path):
+                Path(output_path).write_bytes(b"racing-output")
+                raise FileExistsError("forced publish race")
+
+            with mock.patch.object(
+                prepare_editable_input.os,
+                "link",
+                side_effect=create_racing_target,
+            ):
+                self.assertFalse(
+                    prepare_editable_input.prepare(str(source), str(target))
+                )
+
+            self.assertEqual(target.read_bytes(), b"racing-output")
+            self.assertEqual(list(Path(temp_dir).glob(f".{target.name}.*.tmp")), [])
+
+    def test_transient_post_publish_cleanup_failure_is_retried(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "master.jpg"
+            target = Path(temp_dir) / "slide.png"
+            Image.new("RGB", (1920, 1080), "navy").save(source, format="JPEG")
+            real_unlink = prepare_editable_input.os.unlink
+            attempts = 0
+
+            def fail_once_then_unlink(path):
+                nonlocal attempts
+                attempts += 1
+                if attempts == 1:
+                    raise OSError("transient cleanup failure")
+                real_unlink(path)
+
+            with mock.patch.object(
+                prepare_editable_input.os,
+                "unlink",
+                side_effect=fail_once_then_unlink,
+            ):
+                self.assertTrue(
+                    prepare_editable_input.prepare(str(source), str(target))
+                )
+
+            self.assertEqual(attempts, 2)
+            with Image.open(target) as image:
+                self.assertEqual(image.format, "PNG")
+                self.assertEqual(image.size, (1280, 720))
+                self.assertEqual(image.mode, "RGB")
+            self.assertEqual(list(Path(temp_dir).glob(f".{target.name}.*.tmp")), [])
+
+    def test_unavoidable_post_publish_cleanup_failure_warns_but_succeeds(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "master.jpg"
+            target = Path(temp_dir) / "slide.png"
+            Image.new("RGB", (1920, 1080), "navy").save(source, format="JPEG")
+            output = io.StringIO()
+
+            with mock.patch.object(
+                prepare_editable_input.os,
+                "unlink",
+                side_effect=OSError("persistent cleanup failure"),
+            ), redirect_stdout(output):
+                try:
+                    result = prepare_editable_input.prepare(str(source), str(target))
+                except OSError as error:
+                    self.fail(f"prepare raised after publishing target: {error}")
+
+            self.assertTrue(result)
+            self.assertTrue(target.exists())
+            self.assertIn("WARN:", output.getvalue())
+            self.assertNotIn("failed to write normalized PNG", output.getvalue())
 
 
 if __name__ == "__main__":

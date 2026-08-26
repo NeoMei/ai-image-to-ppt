@@ -16,6 +16,19 @@ def _same_path(left: Path, right: Path) -> bool:
     return left.resolve(strict=False) == right.resolve(strict=False)
 
 
+def _remove_temp(temp_path: str) -> Optional[OSError]:
+    last_error = None
+    for _attempt in range(2):
+        try:
+            os.unlink(temp_path)
+            return None
+        except FileNotFoundError:
+            return None
+        except OSError as error:
+            last_error = error
+    return last_error
+
+
 def prepare(input_path: str, output_path: str) -> bool:
     source = Path(input_path)
     target = Path(output_path)
@@ -47,34 +60,50 @@ def prepare(input_path: str, output_path: str) -> bool:
         print(f"  ERR: cannot read source image: {error}")
         return False
 
-    target.parent.mkdir(parents=True, exist_ok=True)
-    fd, temp_path = tempfile.mkstemp(
-        prefix=f".{target.name}.",
-        suffix=".tmp",
-        dir=str(target.parent),
-    )
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        fd, temp_path = tempfile.mkstemp(
+            prefix=f".{target.name}.",
+            suffix=".tmp",
+            dir=str(target.parent),
+        )
+    except OSError as error:
+        print(f"  ERR: failed to prepare output path: {error}")
+        return False
+
     try:
         with os.fdopen(fd, "wb") as temp_file:
             prepared.save(temp_file, format="PNG", optimize=True)
             temp_file.flush()
             os.fsync(temp_file.fileno())
-        os.link(temp_path, target)
-        os.unlink(temp_path)
-    except FileExistsError:
-        print(f"  ERR: output already exists; refusing to overwrite: {target}")
-        try:
-            os.unlink(temp_path)
-        except FileNotFoundError:
-            pass
-        return False
     except OSError as error:
         print(f"  ERR: failed to write normalized PNG: {error}")
-        try:
-            os.unlink(temp_path)
-        except FileNotFoundError:
-            pass
+        cleanup_error = _remove_temp(temp_path)
+        if cleanup_error is not None:
+            print(f"  WARN: could not remove temporary file: {cleanup_error}")
         return False
 
+    try:
+        os.link(temp_path, target)
+    except FileExistsError:
+        print(f"  ERR: output already exists; refusing to overwrite: {target}")
+        cleanup_error = _remove_temp(temp_path)
+        if cleanup_error is not None:
+            print(f"  WARN: could not remove temporary file: {cleanup_error}")
+        return False
+    except OSError as error:
+        print(f"  ERR: failed to publish normalized PNG: {error}")
+        cleanup_error = _remove_temp(temp_path)
+        if cleanup_error is not None:
+            print(f"  WARN: could not remove temporary file: {cleanup_error}")
+        return False
+
+    cleanup_error = _remove_temp(temp_path)
+    if cleanup_error is not None:
+        print(
+            "  WARN: output was published but temporary file cleanup failed: "
+            f"{cleanup_error}"
+        )
     print(f"  OK: {target} (1280x720 PNG, editable-converter input)")
     return True
 
