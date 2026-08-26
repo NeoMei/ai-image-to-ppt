@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Add OpenAI GPT Image 2 generation to `ai-image-to-ppt` and make it the programmatic and documented default without breaking direct Gemini or Doubao usage.
+**Goal:** Add OpenAI GPT Image 2 generation as the default and provide a deterministic bridge from any 16:9 generated master image to the exact `1280x720 PNG` required by `image-to-editable-pptx`.
 
-**Architecture:** Add one focused OpenAI provider module and one lazy-loading router module. The provider owns credential/config resolution, Images API requests, retry policy, Base64 validation, and atomic output; the router owns engine selection and defaults. Existing provider modules remain unchanged.
+**Architecture:** Add one focused OpenAI provider module and one lazy-loading router module. The provider owns credential/config resolution, Images API requests, retry policy, Base64 validation, and atomic output; the router owns engine selection and defaults. A separate Pillow-based standardizer preserves high-resolution master images while producing the converter's exact input contract; existing provider modules remain unchanged.
 
 **Tech Stack:** Python 3 standard library (`argparse`, `base64`, `json`, `pathlib`, `tempfile`, `urllib`, `unittest`), Markdown skill documentation.
 
@@ -17,6 +17,9 @@
 - Existing `scripts/gen_slide_gemini.py` and `scripts/gen_slide_doubao.py` interfaces remain compatible.
 - Automatic tests must not contact a real API or incur image-generation charges.
 - Do not migrate Gemini visual self-checking in this change.
+- Keep OpenAI master generation at `2048x1152` and normal PDF/PPTX export at `1920x1080`.
+- Editable-converter input must be a real PNG at exactly `1280x720` pixels.
+- Reject non-16:9 input instead of silently cropping or padding it.
 
 ## File Structure
 
@@ -24,6 +27,8 @@
 - Create `scripts/gen_slide.py`: lazy engine router and CLI; OpenAI is the default.
 - Create `tests/test_gen_slide_openai.py`: isolated provider behavior tests with fake HTTP responses.
 - Create `tests/test_gen_slide.py`: default selection, explicit selection, and CLI routing tests.
+- Create `scripts/prepare_editable_input.py`: strict 16:9 validation and atomic `1280x720 PNG` preparation.
+- Create `tests/test_prepare_editable_input.py`: format, dimensions, rejection, and preservation tests.
 - Modify `README.md`: user-facing setup, quick start, engine table, and fallback instructions.
 - Modify `SKILL.md`: agent workflow defaults, prerequisites, examples, costs, and troubleshooting.
 
@@ -595,14 +600,240 @@ git commit -m "feat: default slide generation to OpenAI"
 
 ---
 
-### Task 3: Make GPT Image the documented skill default and verify the package
+### Task 3: Prepare exact input for Image to Editable PPTX
+
+**Files:**
+- Create: `scripts/prepare_editable_input.py`
+- Create: `tests/test_prepare_editable_input.py`
+
+**Interfaces:**
+- Consumes: one Pillow-decodable source image whose pixel dimensions are strictly 16:9.
+- Produces: `prepare(input_path: str, output_path: str) -> bool`.
+- Produces: a real RGB PNG at exactly `1280x720`, without changing the source or an existing target.
+- Produces: CLI `prepare_editable_input.py <input_image> <output.png>`.
+
+- [ ] **Step 1: Write failing standardization tests**
+
+Create `tests/test_prepare_editable_input.py`:
+
+```python
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+from PIL import Image
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "scripts"))
+
+import prepare_editable_input
+
+
+class PrepareEditableInputTests(unittest.TestCase):
+    def test_converts_16_by_9_jpeg_to_exact_1280_by_720_png(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "master.jpg"
+            target = Path(temp_dir) / "editable" / "slide.png"
+            Image.new("RGB", (2048, 1152), "navy").save(source, format="JPEG")
+            source_before = source.read_bytes()
+
+            self.assertTrue(prepare_editable_input.prepare(str(source), str(target)))
+
+            self.assertEqual(source.read_bytes(), source_before)
+            with Image.open(target) as image:
+                self.assertEqual(image.format, "PNG")
+                self.assertEqual(image.size, (1280, 720))
+                self.assertEqual(image.mode, "RGB")
+
+    def test_rejects_non_16_by_9_source_without_creating_output(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "square.png"
+            target = Path(temp_dir) / "slide.png"
+            Image.new("RGB", (1024, 1024), "white").save(source)
+
+            self.assertFalse(prepare_editable_input.prepare(str(source), str(target)))
+            self.assertFalse(target.exists())
+
+    def test_rejects_non_png_output_path(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "master.jpg"
+            target = Path(temp_dir) / "slide.jpg"
+            Image.new("RGB", (1920, 1080), "white").save(source)
+
+            self.assertFalse(prepare_editable_input.prepare(str(source), str(target)))
+            self.assertFalse(target.exists())
+
+    def test_rejects_source_and_target_as_the_same_path(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "slide.png"
+            Image.new("RGB", (1280, 720), "white").save(source)
+            source_before = source.read_bytes()
+
+            self.assertFalse(prepare_editable_input.prepare(str(source), str(source)))
+            self.assertEqual(source.read_bytes(), source_before)
+
+    def test_existing_target_is_preserved_and_no_temp_file_remains(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "master.jpg"
+            target = Path(temp_dir) / "slide.png"
+            Image.new("RGB", (2560, 1440), "white").save(source)
+            target.write_bytes(b"existing-output")
+
+            self.assertFalse(prepare_editable_input.prepare(str(source), str(target)))
+            self.assertEqual(target.read_bytes(), b"existing-output")
+            self.assertEqual(list(Path(temp_dir).glob(f".{target.name}.*.tmp")), [])
+
+
+if __name__ == "__main__":
+    unittest.main()
+```
+
+- [ ] **Step 2: Run the standardization tests and verify the missing module failure**
+
+Run:
+
+```bash
+python3 -m unittest tests/test_prepare_editable_input.py -v
+```
+
+Expected: FAIL with `ModuleNotFoundError: No module named 'prepare_editable_input'`.
+
+- [ ] **Step 3: Implement strict, non-overwriting PNG standardization**
+
+Create `scripts/prepare_editable_input.py`:
+
+```python
+#!/usr/bin/env python3
+"""Prepare one exact 1280x720 PNG for image-to-editable-pptx."""
+
+import argparse
+import os
+import tempfile
+from pathlib import Path
+from typing import Optional, Sequence
+
+from PIL import Image, UnidentifiedImageError
+
+TARGET_SIZE = (1280, 720)
+
+
+def _same_path(left: Path, right: Path) -> bool:
+    return left.resolve(strict=False) == right.resolve(strict=False)
+
+
+def prepare(input_path: str, output_path: str) -> bool:
+    source = Path(input_path)
+    target = Path(output_path)
+
+    if target.suffix.lower() != ".png":
+        print("  ERR: editable converter input must use a .png output path")
+        return False
+    if _same_path(source, target):
+        print("  ERR: source and output paths must be different")
+        return False
+    if os.path.lexists(target):
+        print(f"  ERR: output already exists; refusing to overwrite: {target}")
+        return False
+
+    try:
+        with Image.open(source) as image:
+            image.load()
+            width, height = image.size
+            if width * 9 != height * 16:
+                print(
+                    f"  ERR: source must be exactly 16:9; received {width}x{height}"
+                )
+                return False
+            prepared = image.convert("RGB").resize(
+                TARGET_SIZE,
+                Image.Resampling.LANCZOS,
+            )
+    except (OSError, UnidentifiedImageError) as error:
+        print(f"  ERR: cannot read source image: {error}")
+        return False
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_path = tempfile.mkstemp(
+        prefix=f".{target.name}.",
+        suffix=".tmp",
+        dir=str(target.parent),
+    )
+    try:
+        with os.fdopen(fd, "wb") as temp_file:
+            prepared.save(temp_file, format="PNG", optimize=True)
+            temp_file.flush()
+            os.fsync(temp_file.fileno())
+        os.link(temp_path, target)
+        os.unlink(temp_path)
+    except FileExistsError:
+        print(f"  ERR: output already exists; refusing to overwrite: {target}")
+        try:
+            os.unlink(temp_path)
+        except FileNotFoundError:
+            pass
+        return False
+    except OSError as error:
+        print(f"  ERR: failed to write normalized PNG: {error}")
+        try:
+            os.unlink(temp_path)
+        except FileNotFoundError:
+            pass
+        return False
+
+    print(f"  OK: {target} (1280x720 PNG, editable-converter input)")
+    return True
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Prepare an exact 1280x720 PNG for image-to-editable-pptx."
+    )
+    parser.add_argument("input_path", help="Strict 16:9 source image")
+    parser.add_argument("output_path", help="New .png output path")
+    return parser
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    args = _parser().parse_args(argv)
+    return 0 if prepare(args.input_path, args.output_path) else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+```
+
+- [ ] **Step 4: Run standardizer tests and CLI help**
+
+Run:
+
+```bash
+python3 -m unittest tests/test_prepare_editable_input.py -v
+python3 scripts/prepare_editable_input.py --help
+git diff --check
+```
+
+Expected: 5 tests PASS; CLI help exits 0 and states `1280x720 PNG`; whitespace check produces no output.
+
+- [ ] **Step 5: Commit the standardizer**
+
+Run:
+
+```bash
+git add scripts/prepare_editable_input.py tests/test_prepare_editable_input.py
+git commit -m "feat: prepare editable PPTX converter input"
+```
+
+---
+
+### Task 4: Make GPT Image the documented skill default and verify the package
 
 **Files:**
 - Modify: `README.md`
 - Modify: `SKILL.md`
 
 **Interfaces:**
-- Consumes: `scripts/gen_slide.py`, its default `openai` engine, and the provider configuration from Task 1.
+- Consumes: `scripts/gen_slide.py`, its default `openai` engine, the provider configuration from Task 1, and `scripts/prepare_editable_input.py` from Task 3.
 - Produces: copy-pasteable default and fallback instructions for humans and agents.
 
 - [ ] **Step 1: Update README setup and default quick start**
@@ -624,6 +855,12 @@ python3 scripts/gen_slide.py out/slide_01.jpg "<prompt>"
 # Explicit fallback engines
 python3 scripts/gen_slide.py out/slide_01.jpg "<prompt>" --engine gemini
 python3 scripts/gen_slide.py out/slide_01.jpg "<prompt>" --engine doubao
+
+# Optional handoff: prepare the exact single-slide input required by
+# image-to-editable-pptx. This PNG is converter input, not an editable PPTX.
+python3 scripts/prepare_editable_input.py \
+  out/slide_01.jpg \
+  out/editable/slide_01.png
 ```
 
 Use the unified Python import in default and batch examples:
@@ -637,7 +874,7 @@ gen("<detailed prompt>", "out/slide_01.jpg")
 gen("<detailed prompt>", "out/slide_01.jpg", engine="gemini")
 ```
 
-Update the script table to list `gen_slide.py` first as the default router and `gen_slide_openai.py` as GPT Image 2. Do not label Gemini as primary or free-default. State that pricing can change and link to the OpenAI pricing/documentation rather than hard-coding a stale per-image promise.
+Update the script table to list `gen_slide.py` first as the default router, `gen_slide_openai.py` as GPT Image 2, and `prepare_editable_input.py` as the deterministic `1280x720 PNG` handoff tool. Do not label Gemini as primary or free-default. State that pricing can change and link to the OpenAI pricing/documentation rather than hard-coding a stale per-image promise. State that the standardizer preserves the high-resolution master, rejects non-16:9 input, and does not itself create an editable PPTX.
 
 - [ ] **Step 2: Update SKILL prerequisites and workflow**
 
@@ -650,6 +887,8 @@ Make these semantic changes in `SKILL.md`:
 - Fallback examples: use `engine="gemini"` or `engine="doubao"`.
 - Pitfall table: add missing OpenAI key, OpenAI organization verification/403, rate limit/429, and unsupported output extension; do not promise automatic fallback.
 - Tips: describe `OPENAI_IMAGE_MODEL`, `OPENAI_IMAGE_SIZE`, and `OPENAI_IMAGE_QUALITY` overrides and keep the confirmed defaults explicit.
+- Add an optional step after generation that runs `prepare_editable_input.py` and verifies the output is an exact `1280x720 PNG` before invoking `image-to-editable-pptx`.
+- Preserve the downstream converter boundary: it currently handles one slide at a time, and a standardized PNG is only its input artifact.
 
 The default batch pattern must use:
 
@@ -667,7 +906,7 @@ def gen_one(name, prompt):
 Run:
 
 ```bash
-rg -n "GPT Image 2|gpt-image-2|gen_slide.py|OPENAI_API_KEY|engine=\"gemini\"|engine=\"doubao\"" README.md SKILL.md
+rg -n "GPT Image 2|gpt-image-2|gen_slide.py|OPENAI_API_KEY|engine=\"gemini\"|engine=\"doubao\"|prepare_editable_input|1280x720 PNG" README.md SKILL.md
 rg -n "Gemini.*primary|nano banana.*primary|Gemini.*首选|免费额度.*主" README.md SKILL.md
 git diff -- README.md SKILL.md
 git diff --check
@@ -683,15 +922,16 @@ Run:
 python3 -m unittest discover -s tests -v
 python3 -m compileall -q scripts tests
 python3 scripts/gen_slide.py --help
+python3 scripts/prepare_editable_input.py --help
 python3 /Users/neomei/.codex/skills/.system/skill-creator/scripts/quick_validate.py .
 git status --short
 ```
 
 Expected:
 
-- All 14 unit tests PASS with no real API calls.
+- All 19 unit tests PASS with no real API calls.
 - Compile check exits 0.
-- CLI help exits 0 and identifies OpenAI as default.
+- Both CLI help commands exit 0; generation identifies OpenAI as default and standardization identifies exact `1280x720 PNG` output.
 - Skill validation reports success.
 - Git status lists only the intended README/SKILL changes before their commit.
 
@@ -712,10 +952,11 @@ Run:
 python3 -m unittest discover -s tests -v
 python3 -m compileall -q scripts tests
 python3 scripts/gen_slide.py --help
+python3 scripts/prepare_editable_input.py --help
 python3 /Users/neomei/.codex/skills/.system/skill-creator/scripts/quick_validate.py .
 git diff --check origin/main...HEAD
 git status --short --branch
 git log --oneline --decorate origin/main..HEAD
 ```
 
-Expected: every validation exits 0; working tree is clean; local `main` is ahead only by the design, provider, router, documentation, and implementation-plan commits. Do not push without separate user authorization.
+Expected: every validation exits 0; working tree is clean; local `main` is ahead only by the design, revised plan, provider, router, editable-input standardizer, and documentation commits. Do not push without separate user authorization.
