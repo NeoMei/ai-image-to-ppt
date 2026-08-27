@@ -148,10 +148,10 @@ class LocalParentIdentityTests(unittest.TestCase):
             real_load_all = export_images._load_all
             original = None
 
-            def swap_then_load(files):
+            def swap_then_load(files, **kwargs):
                 nonlocal original
                 original = swap_parent(approved, redirected)
-                return real_load_all(files)
+                return real_load_all(files, **kwargs)
 
             with mock.patch.object(
                 export_images,

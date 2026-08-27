@@ -1,10 +1,12 @@
 import gc
 import io
 import json
+import os
 import sys
 import tempfile
 import tracemalloc
 import unittest
+import urllib.error
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
@@ -154,6 +156,113 @@ class JsonResponseLimitTests(unittest.TestCase):
 
 
 class ProviderJsonResponseLimitTests(unittest.TestCase):
+    def test_generator_http_error_json_limits_fall_back_without_leaking(self):
+        key = "known-http-error-key"
+        unsafe = f"should-not-surface {key} sk-httpErrorEcho123"
+        bodies = (
+            (
+                "wide",
+                json.dumps({
+                    "error": {"message": unsafe},
+                    "wide": [0, 1, 2],
+                }).encode("utf-8"),
+            ),
+            (
+                "deep",
+                json.dumps({
+                    "error": {"message": unsafe},
+                    "deep": [[[[0]]]],
+                }).encode("utf-8"),
+            ),
+            (
+                "duplicate",
+                (
+                    '{"error":{"message":"first"},'
+                    f'"error":{{"message":{json.dumps(unsafe)}}}}}'
+                ).encode("utf-8"),
+            ),
+        )
+        providers = (
+            (gen_slide_openai, "slide.jpg"),
+            (gen_slide_gemini, "slide.png"),
+            (gen_slide_doubao, "slide.jpg"),
+        )
+
+        with mock.patch.object(
+            image_output, "MAX_JSON_CONTAINER_ITEMS", 2
+        ), mock.patch.object(image_output, "MAX_JSON_NESTING", 2):
+            for provider, filename in providers:
+                for label, body in bodies:
+                    with self.subTest(provider=provider.__name__, body=label), \
+                         tempfile.TemporaryDirectory() as temp_dir, \
+                         mock.patch.dict(os.environ, {}, clear=True), \
+                         mock.patch.object(
+                             provider, "_load_api_key", return_value=key
+                         ), mock.patch.object(
+                             provider.urllib.request,
+                             "urlopen",
+                             side_effect=urllib.error.HTTPError(
+                                 "https://provider.invalid",
+                                 400,
+                                 "bad request",
+                                 {},
+                                 io.BytesIO(body),
+                             ),
+                         ):
+                        output = io.StringIO()
+                        with redirect_stdout(output), redirect_stderr(output):
+                            exit_code = provider.main(
+                                [str(Path(temp_dir) / filename), "prompt"]
+                            )
+
+                    rendered = output.getvalue()
+                    self.assertEqual(exit_code, 1)
+                    self.assertIn("bad request", rendered)
+                    self.assertNotIn("should-not-surface", rendered)
+                    self.assertNotIn(key, rendered)
+                    self.assertNotIn("sk-httpErrorEcho123", rendered)
+                    self.assertNotIn("Traceback", rendered)
+
+    def test_generator_http_error_preserves_safe_bounded_message(self):
+        key = "known-http-error-key"
+        message = f"provider details include {key} and sk-httpErrorEcho123"
+        body = json.dumps({"error": {"message": message}}).encode("utf-8")
+        providers = (
+            (gen_slide_openai, "slide.jpg"),
+            (gen_slide_gemini, "slide.png"),
+            (gen_slide_doubao, "slide.jpg"),
+        )
+
+        for provider, filename in providers:
+            with self.subTest(provider=provider.__name__), \
+                 tempfile.TemporaryDirectory() as temp_dir, \
+                 mock.patch.dict(os.environ, {}, clear=True), \
+                 mock.patch.object(provider, "_load_api_key", return_value=key), \
+                 mock.patch.object(
+                     provider.urllib.request,
+                     "urlopen",
+                     side_effect=urllib.error.HTTPError(
+                         "https://provider.invalid",
+                         400,
+                         "bad request",
+                         {},
+                         io.BytesIO(body),
+                     ),
+                 ):
+                    output = io.StringIO()
+                    with redirect_stdout(output), redirect_stderr(output):
+                        exit_code = provider.main(
+                            [str(Path(temp_dir) / filename), "prompt"]
+                        )
+
+            rendered = output.getvalue()
+            self.assertEqual(exit_code, 1)
+            self.assertIn("provider details include", rendered)
+            self.assertIn("[REDACTED]", rendered)
+            self.assertNotIn(key, rendered)
+            self.assertNotIn("sk-httpErrorEcho123", rendered)
+            self.assertNotIn("Traceback", rendered)
+
     def test_generator_clis_control_wide_json_with_mocked_transport(self):
         response_body = json.dumps({"wide": [None] * 5}).encode("utf-8")
         providers = (

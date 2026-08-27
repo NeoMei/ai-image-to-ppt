@@ -74,8 +74,10 @@ POSIX, file and directory fsync cover process crashes and power-loss metadata
 recovery. On Windows, recovery covers process crashes only and does not promise
 power-loss durability. It refuses existing outputs by default; add `--force` to
 replace an existing pair with rollback and crash-recovery protection. One deck
-accepts at most 128 slides and 512 MiB of aggregate source image bytes; larger
-Python or CLI requests fail before image decoding or PDF/PPTX serialization.
+accepts at most 128 slides and 512 MiB of aggregate source image bytes. Clearly
+over-limit manifests are rejected during path preflight, before image decoding.
+If source files change after preflight, actual loaded bytes are accumulated
+after each image load and rejected before PDF/PPTX serialization.
 
 脚本内调用（批量并发生成见 [SKILL.md](SKILL.md)）：
 

@@ -233,7 +233,7 @@ class OutputOwnershipIntegrationTests(unittest.TestCase):
         release_save = threading.Event()
         results = []
 
-        def fake_load_all(files):
+        def fake_load_all(files, **_kwargs):
             return [Path(path).name for path in files]
 
         def fake_save_pdf(images, path):

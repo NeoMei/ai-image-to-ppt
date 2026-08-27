@@ -67,7 +67,6 @@ class ForceRestoreCrashTests(unittest.TestCase):
             source = sys.argv[2]
             prefix = sys.argv[3]
             real_link = export_images.os.link
-            real_rename = export_images.os.rename
             failed_publish = False
 
             def fail_second_publish(source_path, target_path, *args, **kwargs):
@@ -79,16 +78,12 @@ class ForceRestoreCrashTests(unittest.TestCase):
                 ):
                     failed_publish = True
                     raise OSError("forced second publish failure")
-                return real_link(source_path, target_path, *args, **kwargs)
-
-            def crash_after_backup_name_retired(source_path, target_path):
-                result = real_rename(source_path, target_path)
-                if str(source_path).endswith(".backup"):
+                result = real_link(source_path, target_path, *args, **kwargs)
+                if str(target_path).endswith(".backup.retired"):
                     os._exit(77)
                 return result
 
             export_images.os.link = fail_second_publish
-            export_images.os.rename = crash_after_backup_name_retired
             export_images.export_deck([source], prefix, force=True)
             raise SystemExit(3)
             """

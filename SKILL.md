@@ -170,8 +170,10 @@ fsync cover process crashes and power-loss metadata recovery. On Windows,
 recovery covers process crashes only and does not promise power-loss durability.
 Existing outputs are preserved unless `--force` is supplied. Transparent pixels
 are composited onto the style's cream `#f8f5f0` background rather than black. A
-deck is limited to 128 slides and 512 MiB of aggregate source bytes; over-limit
-Python or CLI calls stop before image decoding or PDF/PPTX serialization.
+deck is limited to 128 slides and 512 MiB of aggregate source bytes. Clearly
+over-limit manifests are rejected during path preflight, before image decoding.
+If source files change after preflight, actual loaded bytes are accumulated
+after each image load and rejected before PDF/PPTX serialization.
 
 Stable hashed lock files intentionally persist because automatically unlinking a
 lock file can split ownership between processes. Optional cleanup never runs

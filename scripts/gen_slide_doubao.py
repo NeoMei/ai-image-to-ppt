@@ -64,7 +64,7 @@ def _http_error_message(error: urllib.error.HTTPError, key: str) -> str:
         raw_body = read_response_body(error)
         if isinstance(raw_body, bytes):
             raw_body = raw_body.decode("utf-8")
-        payload = json.loads(raw_body)
+        payload = parse_json_response(raw_body)
         if isinstance(payload, dict) and isinstance(payload.get("error"), dict):
             message = payload["error"].get("message")
             if isinstance(message, (str, int, float, bool)) and message:

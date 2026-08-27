@@ -45,28 +45,30 @@ class ExportImagesTests(unittest.TestCase):
             force = sys.argv[5] == "true"
             pdf = prefix.with_suffix(".pdf").resolve(strict=False)
             pptx = prefix.with_suffix(".pptx").resolve(strict=False)
-            real_replace = os.replace
             real_link = os.link
-
-            def crash_after_backup(source_path, target_path, *args, **kwargs):
-                result = real_replace(source_path, target_path, *args, **kwargs)
-                source_target = Path(source_path).resolve(strict=False)
-                if phase == "backup-pdf" and source_target == pdf:
-                    os._exit(77)
-                if phase == "backup-pptx" and source_target == pptx:
-                    os._exit(77)
-                return result
 
             def crash_after_link(source_path, target_path, *args, **kwargs):
                 result = real_link(source_path, target_path, *args, **kwargs)
+                source_target = Path(source_path).resolve(strict=False)
                 published_target = Path(target_path).resolve(strict=False)
+                if (
+                    phase == "backup-pdf"
+                    and source_target == pdf
+                    and str(target_path).endswith(".backup")
+                ):
+                    os._exit(77)
+                if (
+                    phase == "backup-pptx"
+                    and source_target == pptx
+                    and str(target_path).endswith(".backup")
+                ):
+                    os._exit(77)
                 if phase == "link-pdf" and published_target == pdf:
                     os._exit(77)
                 if phase == "link-pptx" and published_target == pptx:
                     os._exit(77)
                 return result
 
-            export_images.os.replace = crash_after_backup
             export_images.os.link = crash_after_link
             result = export_images.export_deck([source], str(prefix), force=force)
             raise SystemExit(0 if result else 2)
@@ -193,9 +195,9 @@ class ExportImagesTests(unittest.TestCase):
             real_load_all = export_images._load_all
             original_cwd = Path.cwd()
 
-            def change_cwd_then_load(files):
+            def change_cwd_then_load(files, **kwargs):
                 os.chdir(redirected)
-                return real_load_all(files)
+                return real_load_all(files, **kwargs)
 
             try:
                 os.chdir(approved)
@@ -887,24 +889,28 @@ class ExportImagesTests(unittest.TestCase):
                     prefix.with_suffix(raced_suffix)
                 )
                 external = f"external-{raced_suffix[1:]}".encode()
-                real_replace = export_images.os.replace
+                real_link = export_images.os.link
                 injected = False
 
-                def replace_after_identity_check(
+                def link_after_identity_check(
                     source_path, destination, *args, **kwargs
                 ):
                     nonlocal injected
-                    if Path(source_path) == raced_target and not injected:
+                    if (
+                        Path(source_path) == raced_target
+                        and str(destination).endswith(".backup")
+                        and not injected
+                    ):
                         injected = True
                         raced_target.unlink()
                         raced_target.write_bytes(external)
-                    return real_replace(source_path, destination, *args, **kwargs)
+                    return real_link(source_path, destination, *args, **kwargs)
 
                 stderr = io.StringIO()
                 with mock.patch.object(
                     export_images.os,
-                    "replace",
-                    side_effect=replace_after_identity_check,
+                    "link",
+                    side_effect=link_after_identity_check,
                 ), redirect_stderr(stderr):
                     result = export_images.main(
                         ["--force", str(prefix), str(source)]
@@ -1159,7 +1165,8 @@ class ExportImagesTests(unittest.TestCase):
                 nonlocal publish_count
                 source_name = Path(source_path).name
                 if source_name.endswith(".backup"):
-                    restore_attempts.append(Path(target_path))
+                    if Path(target_path) == export_images.resolve_output_path(pptx):
+                        restore_attempts.append(Path(target_path))
                     return real_link(source_path, target_path, *args, **kwargs)
                 if source_name.endswith(".owner") and Path(target_path) in (
                     export_images.resolve_output_path(pdf),

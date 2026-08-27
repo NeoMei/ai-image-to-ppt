@@ -40,6 +40,8 @@ JOURNAL_VERSION = 1
 JOURNAL_SUFFIX = ".ai-image-to-ppt-export-journal.json"
 COMMIT_MARKER_SUFFIX = ".commit"
 PREPARATION_SUFFIX = ".prepare"
+PREPARATION_OWNER_SUFFIX = ".owner"
+PREPARATION_OWNER_ANCHOR_SUFFIX = ".owner.anchor"
 JOURNAL_WRITE_NAME = "rollback.journal-write"
 COMMIT_WRITE_NAME = "commit.journal-write"
 MAX_JOURNAL_BYTES = 64 * 1024
@@ -96,11 +98,26 @@ def _load(path: str) -> Image.Image:
         raise OSError(str(error)) from error
 
 
-def _load_all(files: Iterable[str]) -> List[Image.Image]:
+def _load_all(
+    files: Iterable[str],
+    max_total_bytes: Optional[int] = None,
+) -> List[Image.Image]:
     paths = list(files)
     if not paths:
         raise ValueError("at least one input image is required")
-    return [_load(path) for path in paths]
+    images = []
+    total_bytes = 0
+    for path in paths:
+        image = _load(path)
+        if max_total_bytes is not None:
+            total_bytes += image.info.get("ai_image_to_ppt_source_bytes", 0)
+            if total_bytes > max_total_bytes:
+                raise ValueError(
+                    "deck aggregate source bytes exceed maximum of "
+                    f"{max_total_bytes} bytes"
+                )
+        images.append(image)
+    return images
 
 
 def _save_pdf(images: Sequence[Image.Image], path: str) -> None:
@@ -307,6 +324,15 @@ def _preparation_path(journal: Path) -> Path:
     return journal.with_name(journal.name + PREPARATION_SUFFIX)
 
 
+def _preparation_owner_paths(preparation: Path) -> tuple:
+    return (
+        preparation.with_name(preparation.name + PREPARATION_OWNER_SUFFIX),
+        preparation.with_name(
+            preparation.name + PREPARATION_OWNER_ANCHOR_SUFFIX
+        ),
+    )
+
+
 def _file_identity(path: Path) -> Optional[tuple]:
     try:
         current = os.stat(path, follow_symlinks=False)
@@ -352,9 +378,74 @@ def _directory_identity(path: Path, context: str) -> tuple:
     return metadata.st_dev, metadata.st_ino
 
 
+def _preparation_owner_state(
+    journal: Path,
+    preparation_identity: tuple,
+    parent: ParentIdentity,
+) -> object:
+    return {
+        "version": JOURNAL_VERSION,
+        "journal": str(journal),
+        "preparation_identity": _identity_list(preparation_identity),
+        "parent_identity": [int(parent.device), int(parent.inode)],
+    }
+
+
+def _write_preparation_owner(
+    journal: Path,
+    preparation: Path,
+    preparation_identity: tuple,
+    parent: ParentIdentity,
+) -> tuple:
+    owner, anchor = _preparation_owner_paths(preparation)
+    encoded = json.dumps(
+        _preparation_owner_state(journal, preparation_identity, parent),
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    descriptor = None
+    owner_identity = None
+    try:
+        verify_parent_identity(parent)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        flags |= getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(str(owner), flags, 0o600)
+        metadata = os.fstat(descriptor)
+        owner_identity = (metadata.st_dev, metadata.st_ino)
+        # Establish the identity pair before writing. A process crash during the
+        # subsequent full-record fsync then leaves two names for the same inode;
+        # recovery still validates the complete record before trusting it.
+        os.link(owner, anchor, follow_symlinks=False)
+        with os.fdopen(descriptor, "wb") as stream:
+            descriptor = None
+            stream.write(encoded)
+            stream.flush()
+            os.fsync(stream.fileno())
+        _sync_directory(parent.path)
+        return owner_identity
+    except BaseException:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        if owner_identity is not None:
+            for path in (anchor, owner):
+                _remove_owned_file(path, owner_identity, "preparation owner")
+        raise
+
+
 def _begin_preparation(journal: Path, parent: ParentIdentity) -> tuple:
     preparation = _preparation_path(journal)
+    owner_paths = _preparation_owner_paths(preparation)
     verify_parent_identity(parent)
+    if any(os.path.lexists(path) for path in owner_paths):
+        raise OSError(
+            "unfinished export preparation ownership already exists: "
+            f"{next(path for path in owner_paths if os.path.lexists(path))}"
+        )
     try:
         os.mkdir(preparation, 0o700)
     except FileExistsError as error:
@@ -363,10 +454,12 @@ def _begin_preparation(journal: Path, parent: ParentIdentity) -> tuple:
         ) from error
     identity = _directory_identity(preparation, "export preparation")
     try:
+        _write_preparation_owner(journal, preparation, identity, parent)
         _sync_directory(parent.path)
     except BaseException:
         try:
-            os.rmdir(preparation)
+            if _directory_identity(preparation, "export preparation") == identity:
+                os.rmdir(preparation)
         except OSError:
             pass
         raise
@@ -434,6 +527,7 @@ def _write_record(
         else record.with_name(record.name[: -len(COMMIT_MARKER_SUFFIX)])
     )
     writer = preparation / write_name
+    owner = writer.with_name(writer.name + ".owner")
     descriptor = None
     identity = None
     installed = False
@@ -445,6 +539,7 @@ def _write_record(
         descriptor = os.open(str(writer), flags, 0o600)
         writer_stat = os.fstat(descriptor)
         identity = (writer_stat.st_dev, writer_stat.st_ino)
+        os.link(writer, owner, follow_symlinks=False)
         with os.fdopen(descriptor, "wb") as stream:
             descriptor = None
             stream.write(encoded)
@@ -462,7 +557,8 @@ def _write_record(
             except OSError:
                 pass
         if not installed and identity is not None:
-            _remove_owned_file(writer, identity, "recovery record writer")
+            for path in (writer, owner):
+                _remove_owned_file(path, identity, "recovery record writer")
         raise
 
 
@@ -701,20 +797,118 @@ def _remove_owned_file(
     )
 
 
+def _load_preparation_owner(
+    preparation: Path,
+    parent: ParentIdentity,
+) -> tuple:
+    owner, anchor = _preparation_owner_paths(preparation)
+    descriptor = None
+    try:
+        owner_metadata = owner.lstat()
+        anchor_metadata = anchor.lstat()
+        if not stat.S_ISREG(owner_metadata.st_mode) or not stat.S_ISREG(
+            anchor_metadata.st_mode
+        ):
+            raise OSError("preparation owner pair is not regular files")
+        owner_identity = (owner_metadata.st_dev, owner_metadata.st_ino)
+        if owner_identity != (anchor_metadata.st_dev, anchor_metadata.st_ino):
+            raise OSError("preparation owner pair identity does not match")
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(str(owner), flags)
+        opened = os.fstat(descriptor)
+        if (opened.st_dev, opened.st_ino) != owner_identity:
+            raise OSError("preparation owner identity changed while opening")
+        with os.fdopen(descriptor, "rb") as stream:
+            descriptor = None
+            raw = stream.read(MAX_JOURNAL_BYTES + 1)
+        if len(raw) > MAX_JOURNAL_BYTES:
+            raise OSError("preparation owner record exceeds its size limit")
+        state = parse_json_response(raw)
+    except FileNotFoundError as error:
+        raise OSError("preparation owner pair is missing") from error
+    except (ImageOutputError, OSError, ValueError) as error:
+        if isinstance(error, OSError) and str(error).startswith("preparation owner"):
+            raise
+        raise OSError(f"cannot read preparation owner record: {_bounded_error(error)}") from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+    expected_journal = preparation.with_name(
+        preparation.name[: -len(PREPARATION_SUFFIX)]
+    )
+    if (
+        not isinstance(state, dict)
+        or state.get("version") != JOURNAL_VERSION
+        or state.get("journal") != str(expected_journal)
+        or _validated_identity(
+            state.get("parent_identity"), "preparation parent identity"
+        )
+        != (parent.device, parent.inode)
+    ):
+        raise OSError("invalid preparation owner record")
+    preparation_identity = _validated_identity(
+        state.get("preparation_identity"), "preparation identity"
+    )
+    return preparation_identity, owner_identity
+
+
+def _preparation_entry_base_allowed(path: Path, targets: Sequence[Path]) -> bool:
+    if path.name in (JOURNAL_WRITE_NAME, COMMIT_WRITE_NAME):
+        return True
+    for target in targets:
+        if (
+            path.name.startswith(f".{target.name}.")
+            and path.name.endswith(f".tmp{target.suffix}")
+        ):
+            return True
+    return False
+
+
 def _cleanup_preparation(
     preparation: Path,
     parent: ParentIdentity,
+    targets: Sequence[Path],
     expected_identity: Optional[tuple] = None,
 ) -> List[str]:
+    owner_paths = _preparation_owner_paths(preparation)
+    try:
+        recorded_identity, owner_identity = _load_preparation_owner(
+            preparation, parent
+        )
+    except OSError as error:
+        return [
+            _recovery_error(
+                "cannot verify preparation ownership; directory preserved for "
+                "offline cleanup",
+                preparation,
+                error,
+            )
+        ]
     try:
         current_identity = _directory_identity(
             preparation, "export preparation"
         )
     except FileNotFoundError:
-        return []
+        errors = []
+        for owner_path in owner_paths:
+            error = _remove_owned_file(
+                owner_path, owner_identity, "preparation owner"
+            )
+            if error is not None:
+                errors.append(
+                    _recovery_error(
+                        "cannot remove preparation owner", owner_path, error
+                    )
+                )
+        return errors
     except OSError as error:
         return [_recovery_error("cannot inspect preparation", preparation, error)]
-    if expected_identity is not None and current_identity != expected_identity:
+    trusted_identity = (
+        recorded_identity if expected_identity is None else expected_identity
+    )
+    if recorded_identity != trusted_identity or current_identity != trusted_identity:
         return [
             _recovery_error(
                 "cannot remove preparation",
@@ -723,48 +917,111 @@ def _cleanup_preparation(
             )
         ]
 
-    errors = []
     try:
         children = list(preparation.iterdir())
     except OSError as error:
         return [_recovery_error("cannot scan preparation", preparation, error)]
+
+    metadata_by_name = {}
     for child in children:
         try:
             metadata = child.lstat()
         except FileNotFoundError:
             continue
         except OSError as error:
-            errors.append(_recovery_error("cannot inspect preparation file", child, error))
-            continue
+            return [
+                _recovery_error("cannot inspect preparation file", child, error)
+            ]
         if not stat.S_ISREG(metadata.st_mode):
-            errors.append(
+            return [
                 _recovery_error(
                     "cannot remove preparation file",
                     child,
                     OSError("unexpected non-regular preparation entry preserved"),
                 )
-            )
+            ]
+        metadata_by_name[child.name] = metadata
+
+    pairs = []
+    for name, metadata in metadata_by_name.items():
+        if name.endswith(".owner"):
             continue
-        error = _remove_owned_file(
-            child,
-            (metadata.st_dev, metadata.st_ino),
-            "preparation file",
-        )
-        if error is not None:
-            errors.append(
-                _recovery_error("cannot remove preparation file", child, error)
-            )
+        child = preparation / name
+        if not _preparation_entry_base_allowed(child, targets):
+            return [
+                _recovery_error(
+                    "cannot remove preparation file",
+                    child,
+                    OSError("unknown preparation entry preserved for offline cleanup"),
+                )
+            ]
+        owner_name = name + ".owner"
+        owner_metadata = metadata_by_name.get(owner_name)
+        identity = (metadata.st_dev, metadata.st_ino)
+        if owner_metadata is None or identity != (
+            owner_metadata.st_dev,
+            owner_metadata.st_ino,
+        ):
+            return [
+                _recovery_error(
+                    "cannot remove preparation file",
+                    child,
+                    OSError(
+                        "preparation file owner identity is unavailable; "
+                        "entry preserved for offline cleanup"
+                    ),
+                )
+            ]
+        pairs.append((child, preparation / owner_name, identity))
+
+    for name in metadata_by_name:
+        if name.endswith(".owner") and name[: -len(".owner")] not in metadata_by_name:
+            return [
+                _recovery_error(
+                    "cannot remove preparation file",
+                    preparation / name,
+                    OSError("orphan preparation owner preserved for offline cleanup"),
+                )
+            ]
+
+    try:
+        if _directory_identity(preparation, "export preparation") != trusted_identity:
+            raise OSError("preparation ownership changed; directory preserved")
+    except OSError as error:
+        return [
+            _recovery_error("cannot remove preparation", preparation, error)
+        ]
+
+    errors = []
+    for child, child_owner, identity in pairs:
+        for path, context in (
+            (child, "preparation file"),
+            (child_owner, "preparation file owner"),
+        ):
+            error = _remove_owned_file(path, identity, context)
+            if error is not None:
+                errors.append(
+                    _recovery_error("cannot remove preparation file", path, error)
+                )
     if errors:
         return errors
     try:
         verify_parent_identity(parent)
+        if _directory_identity(preparation, "export preparation") != trusted_identity:
+            raise OSError("preparation ownership changed; directory preserved")
         os.rmdir(preparation)
         _sync_directory(parent.path)
     except FileNotFoundError:
         return []
     except OSError as error:
         return [_recovery_error("cannot remove preparation", preparation, error)]
-    return []
+    for owner_path in owner_paths:
+        error = _remove_owned_file(owner_path, owner_identity, "preparation owner")
+        if error is not None:
+            errors.append(
+                _recovery_error("cannot remove preparation owner", owner_path, error)
+            )
+    return errors
 
 
 def _remove_journal(
@@ -825,6 +1082,41 @@ def _retired_backup_path(backup: Path) -> Path:
     return backup.with_name(backup.name + ".retired")
 
 
+def _install_backup_no_clobber(
+    target: Path,
+    backup: Path,
+    expected_identity: tuple,
+    parent: ParentIdentity,
+) -> None:
+    try:
+        if _file_identity(target) != expected_identity:
+            raise OSError(
+                "forced-output ownership changed before backup; external file "
+                "preserved"
+            )
+        os.link(target, backup, follow_symlinks=False)
+        _sync_directory(parent.path)
+    except FileExistsError as error:
+        raise OSError(
+            "forced-output backup destination appeared; external file preserved "
+            f"at: {backup}"
+        ) from error
+    backup_identity = _file_identity(backup)
+    if backup_identity != expected_identity:
+        raise OSError(
+            "forced-output identity changed during no-clobber backup; external "
+            f"object preserved at: {backup}"
+        )
+    removal_error = _remove_owned_file(
+        target, expected_identity, "forced output target"
+    )
+    if removal_error is not None:
+        raise OSError(
+            f"cannot retire forced output target; backup preserved at: {backup}: "
+            f"{_bounded_error(removal_error)}"
+        )
+
+
 def _retire_backup(backup: Path, expected_identity: tuple) -> Optional[OSError]:
     retired = _retired_backup_path(backup)
     try:
@@ -837,21 +1129,33 @@ def _retire_backup(backup: Path, expected_identity: tuple) -> Optional[OSError]:
     if backup_identity is not None:
         if backup_identity != expected_identity:
             return OSError("backup ownership changed; external file preserved")
-        if retired_identity is not None:
-            return OSError("both backup recovery names exist; files preserved")
-        try:
-            os.rename(backup, retired)
-            _sync_directory(backup.parent)
-        except OSError as error:
+        if retired_identity is None:
+            try:
+                os.link(backup, retired, follow_symlinks=False)
+                _sync_directory(backup.parent)
+            except FileExistsError:
+                try:
+                    retired_identity = _file_identity(retired)
+                except OSError as error:
+                    return error
+                if retired_identity != expected_identity:
+                    return OSError(
+                        "retired backup destination appeared; external file preserved"
+                    )
+            except (OSError, TypeError, NotImplementedError) as error:
+                return error
+            try:
+                retired_identity = _file_identity(retired)
+            except OSError as error:
+                return error
+            if retired_identity != expected_identity:
+                return OSError(
+                    "backup ownership changed while retiring; stable recovery "
+                    "files preserved"
+                )
+        error = _remove_owned_file(backup, expected_identity, "backup")
+        if error is not None:
             return error
-        try:
-            retired_identity = _file_identity(retired)
-        except OSError as error:
-            return error
-        if retired_identity != expected_identity:
-            return OSError(
-                "backup ownership changed while retiring; stable recovery file preserved"
-            )
     if retired_identity is None:
         return None
     return _remove_owned_file(retired, expected_identity, "retired backup")
@@ -1104,7 +1408,9 @@ def _recover_state(
                 _recovery_error("cannot remove commit marker", marker, error)
             ]
     preparation_errors = _cleanup_preparation(
-        _preparation_path(journal), parent
+        _preparation_path(journal),
+        parent,
+        [Path(record["target"]) for record in records],
     )
     if preparation_errors:
         return preparation_errors
@@ -1122,9 +1428,11 @@ def _recover_transaction(
     journal_exists = os.path.lexists(journal)
     marker_exists = os.path.lexists(marker)
     preparation_exists = os.path.lexists(preparation)
+    owner_paths = _preparation_owner_paths(preparation)
+    owner_exists = any(os.path.lexists(path) for path in owner_paths)
     if not journal_exists and not marker_exists:
-        if preparation_exists:
-            errors = _cleanup_preparation(preparation, parent)
+        if preparation_exists or owner_exists:
+            errors = _cleanup_preparation(preparation, parent, targets)
             if errors:
                 raise OSError(
                     "unfinished export preparation cleanup was incomplete; "
@@ -1161,7 +1469,7 @@ def _recover_transaction(
             )
             if error is not None:
                 raise error
-            errors = _cleanup_preparation(preparation, parent)
+            errors = _cleanup_preparation(preparation, parent, targets)
             if errors:
                 raise OSError("; ".join(errors))
             return
@@ -1280,6 +1588,22 @@ def _begin_transaction(
     preparation = _preparation_path(journal)
     if not os.path.lexists(preparation):
         _begin_preparation(journal, parent)
+    else:
+        try:
+            recorded_identity, _owner_identity = _load_preparation_owner(
+                preparation, parent
+            )
+            if (
+                _directory_identity(preparation, "export preparation")
+                != recorded_identity
+            ):
+                raise OSError("preparation ownership changed")
+        except OSError as error:
+            raise OSError(
+                "cannot verify export preparation ownership; directory "
+                f"preserved for offline cleanup: {preparation}: "
+                f"{_bounded_error(error)}"
+            ) from error
     journal_identity = _write_journal(journal, state, parent)
     return state, journal, journal_identity
 
@@ -1369,28 +1693,9 @@ def _publish_pair(
                 record["original_identity"], "original identity"
             )
             verify_parent_identity(parent)
-            os.replace(target, backup)
-            _sync_directory(parent.path)
-            try:
-                backup_stat = os.stat(backup, follow_symlinks=False)
-            except OSError as error:
-                raise OSError(
-                    "cannot verify forced-output backup identity; "
-                    f"backup preserved at: {backup}: {error}"
-                ) from error
-            backup_identity = (backup_stat.st_dev, backup_stat.st_ino)
-            if backup_identity != target_identity:
-                try:
-                    os.link(backup, target, follow_symlinks=False)
-                    restoration = "restored without clobbering the target"
-                except FileExistsError:
-                    restoration = "target was recreated; both objects preserved"
-                except (OSError, TypeError, NotImplementedError) as error:
-                    restoration = f"no-clobber restore failed ({error})"
-                raise OSError(
-                    "forced-output identity changed during backup; "
-                    f"external object {restoration}; backup preserved at: {backup}"
-                )
+            _install_backup_no_clobber(
+                target, backup, target_identity, parent
+            )
         for record in records:
             temporary = Path(record["temporary"])
             target = Path(record["target"])
@@ -1485,17 +1790,10 @@ def _export_deck_owned(
     output_prefix = os.path.abspath(output_prefix)
     targets = (Path(f"{output_prefix}.pdf"), Path(f"{output_prefix}.pptx"))
     verify_parent_identity(parent)
-    images = _load_all(files)
-    actual_source_bytes = sum(
-        image.info.get("ai_image_to_ppt_source_bytes", 0)
-        for image in images
-        if isinstance(image, Image.Image)
+    images = _load_all(
+        files,
+        max_total_bytes=MAX_DECK_SOURCE_BYTES,
     )
-    if actual_source_bytes > MAX_DECK_SOURCE_BYTES:
-        raise ValueError(
-            "deck aggregate source bytes exceed maximum of "
-            f"{MAX_DECK_SOURCE_BYTES} bytes"
-        )
     temporary_paths = []
     owner_paths = []
     transaction = None

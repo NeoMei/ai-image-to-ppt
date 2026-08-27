@@ -60,7 +60,7 @@ def _error_message(error: urllib.error.HTTPError, key: str) -> str:
             raw_body = raw_body.decode("utf-8")
         if not isinstance(raw_body, str):
             raise TypeError("HTTP error body must be text or bytes")
-        payload = json.loads(raw_body)
+        payload = parse_json_response(raw_body)
         if not isinstance(payload, dict):
             raise TypeError("HTTP error envelope must be an object")
         details = payload.get("error")
