@@ -193,7 +193,7 @@ def _gen_owned(
     """Generate while the caller owns a prepared output lock."""
     try:
         expected_mime, image_config = _output_config(str(target))
-        preflight_output(target, overwrite=overwrite)
+        target = preflight_output(target, overwrite=overwrite)
     except ImageOutputError:
         return _result(GenerationStatus.LOCAL_FAILURE, "unable to prepare output target")
 
@@ -313,7 +313,7 @@ def _gen_owned(
             )
         try:
             byte_count = publish_bytes(image, target, overwrite=overwrite)
-        except (ImageOutputError, OSError) as error:
+        except (ImageOutputError, OSError, TypeError, NotImplementedError) as error:
             return _result(
                 GenerationStatus.LOCAL_FAILURE,
                 f"output failure: {_redact(error, key)}",
@@ -355,7 +355,14 @@ def _generate_result_with_lock(
         target = prepare_target(resolve_output_path(out_path))
         with output_lock(prepared_lock_target(target)):
             result = _gen_owned(prompt, target, retries, overwrite, progress)
-    except (ImageOutputError, OutputLockError, OSError, TypeError, ValueError):
+    except (
+        ImageOutputError,
+        OutputLockError,
+        OSError,
+        TypeError,
+        ValueError,
+        NotImplementedError,
+    ):
         return _result(GenerationStatus.LOCAL_FAILURE, "unable to prepare output target")
 
     if not isinstance(result, GenerationResult):
@@ -387,16 +394,16 @@ def gen(
         out_path,
         retries=retries,
         overwrite=overwrite,
-        progress=print,
+        progress=None,
     )
     if result.ok:
         redaction_secrets = _environment_redaction_secrets()
         print(
             f"  OK: {safe_message(result.output_path, redaction_secrets)} "
-            f"({result.safe_message})"
+            f"({safe_message(result.safe_message)})"
         )
     else:
-        print(f"  ERR: {result.safe_message}")
+        print(f"  ERR: {safe_message(result.safe_message)}")
     return result.ok
 
 

@@ -169,7 +169,10 @@ class PreparedTargetLockBoundaryTests(unittest.TestCase):
             ):
                 result = image_output.preflight_output(prepared)
 
-            self.assertIs(result, prepared)
+            self.assertEqual(result.path, prepared.path)
+            self.assertEqual(result.parent, prepared.parent)
+            self.assertTrue(result.expectation_captured)
+            self.assertIsNone(result.expected_identity)
 
     def test_preflight_verifies_parent_before_inspecting_target(self):
         with tempfile.TemporaryDirectory() as temp_dir:

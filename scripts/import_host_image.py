@@ -104,7 +104,7 @@ def _read_local_path(value: object) -> bytes:
             raise OSError("host local path is not a regular file")
     except ImageOutputError as error:
         raise OSError("could not resolve host local path") from error
-    except (OSError, ValueError) as error:
+    except (OSError, ValueError, TypeError, NotImplementedError) as error:
         raise OSError("could not open host local image") from error
     if before.st_size <= 0:
         raise ImageOutputError("host local image is empty")
@@ -112,7 +112,7 @@ def _read_local_path(value: object) -> bytes:
         raise ImageOutputError("host local image exceeds maximum size")
     try:
         descriptor = os.open(str(source), os.O_RDONLY)
-    except (OSError, ValueError) as error:
+    except (OSError, ValueError, TypeError, NotImplementedError) as error:
         raise OSError("could not open host local image") from error
 
     try:
@@ -230,7 +230,7 @@ def _identity(path: Path) -> Optional[Tuple[int, int]]:
         current = path.lstat()
     except FileNotFoundError:
         return None
-    except OSError as error:
+    except (OSError, TypeError, NotImplementedError) as error:
         raise ImageOutputError("could not inspect transaction output") from error
     if not stat.S_ISREG(current.st_mode):
         raise ImageOutputError("transaction output identity is unsafe")
@@ -241,6 +241,8 @@ def _snapshot_output(target: PreparedTarget) -> _OutputSnapshot:
     """Capture an existing bounded output before a two-file host publication."""
     verify_parent_identity(target.parent)
     identity = _identity(target.path)
+    if target.expectation_captured and identity != target.expected_identity:
+        raise ImageOutputError("transaction output identity changed after preflight")
     if identity is None:
         return _OutputSnapshot(target, None, None)
     descriptor = None
@@ -258,7 +260,13 @@ def _snapshot_output(target: PreparedTarget) -> _OutputSnapshot:
         after = os.fstat(descriptor)
         if (after.st_dev, after.st_ino) != identity:
             raise ImageOutputError("transaction output identity changed during reading")
-    except (ImageOutputError, OSError, ValueError) as error:
+    except (
+        ImageOutputError,
+        OSError,
+        ValueError,
+        TypeError,
+        NotImplementedError,
+    ) as error:
         raise ImageOutputError("could not snapshot transaction output") from error
     finally:
         if descriptor is not None:
@@ -293,7 +301,7 @@ def _remove_owned_output(target: PreparedTarget, expected: Tuple[int, int]) -> N
         ):
             raise ImageOutputError("transaction output identity changed during rollback")
         os.unlink(target.name, dir_fd=descriptor)
-    except OSError as error:
+    except (OSError, TypeError, NotImplementedError) as error:
         raise ImageOutputError("could not remove transaction output") from error
     finally:
         if descriptor is not None:
@@ -488,7 +496,13 @@ def import_host_artifact(
                     provider,
                     message,
                 )
-    except (ImageOutputError, OutputLockError):
+    except (
+        ImageOutputError,
+        OutputLockError,
+        OSError,
+        TypeError,
+        NotImplementedError,
+    ):
         return _failure(
             GenerationStatus.LOCAL_FAILURE,
             provider,

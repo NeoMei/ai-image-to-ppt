@@ -48,8 +48,16 @@ python3 scripts/import_host_image.py \
 
 The importer first copies the accepted host bytes unchanged to the absolute
 workspace path `out/raw/<filename>` (for this example,
-`/absolute/workspace/out/raw/slide_01.png`). That raw artifact is recoverable;
-it is never resized or overwritten by the master-normalization step.
+`/absolute/workspace/out/raw/slide_01.png`). That raw artifact is preserved on a
+successful import; it is never resized by the master-normalization step.
+
+The host raw/master pair has compensating rollback only for ordinary failures
+while the importer process and both locks remain alive; it is not a crash-atomic
+two-file transaction. Import and API publication require POSIX secure output
+primitives (directory-descriptor/no-follow checks, hard links, and
+same-directory rename). If those ownership-preserving primitives are missing,
+the candidate fails closed as `local_failure`; do not substitute a pathname-only
+write.
 
 Host artifacts alone may be within a 0.5% relative 16:9 error, evaluated with
 integer cross-products. Exact 16:9 host bytes retain the existing master

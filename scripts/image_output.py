@@ -11,9 +11,9 @@ import stat
 import sys
 import tempfile
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import NamedTuple, Optional, Union
+from typing import NamedTuple, Optional, Tuple, Union
 
 from PIL import Image, UnidentifiedImageError
 
@@ -44,6 +44,17 @@ MAX_RETRIES = 10
 MAX_JSON_NESTING = 100
 MAX_JSON_NODES = 100_000
 MAX_JSON_CONTAINER_ITEMS = 10_000
+
+
+_SECURE_PUBLICATION_SUPPORTED = (
+    os.name == "posix"
+    and all(
+        function in getattr(os, "supports_dir_fd", set())
+        for function in (os.open, os.stat, os.unlink, os.rename, os.link)
+    )
+    and os.stat in getattr(os, "supports_follow_symlinks", set())
+    and os.link in getattr(os, "supports_follow_symlinks", set())
+)
 
 
 class ImageOutputError(ValueError):
@@ -93,6 +104,8 @@ class ParentIdentity:
 class PreparedTarget:
     path: Path
     parent: ParentIdentity
+    expected_identity: Optional[Tuple[int, int]] = None
+    expectation_captured: bool = False
 
     def __fspath__(self) -> str:
         return str(self.path)
@@ -135,6 +148,19 @@ class PublishedOutput:
 
 
 TargetValue = Union[Path, PreparedTarget]
+
+
+def require_secure_publication_primitives() -> None:
+    """Fail closed when identity-bound publication is unavailable.
+
+    The implementation requires POSIX directory-descriptor operations,
+    no-follow metadata checks, hard links, and same-directory rename. A weaker
+    pathname-only fallback would lose the documented ownership guarantees.
+    """
+    if not _SECURE_PUBLICATION_SUPPORTED:
+        raise ImageOutputError(
+            "secure output publication primitives are unavailable on this platform"
+        )
 
 
 def validate_retries(retries: object) -> int:
@@ -723,19 +749,15 @@ def preflight_output(
 
     probe_path = None
     try:
+        require_secure_publication_primitives()
         prepared = _as_prepared_target(out_path)
         target = prepared.path
         verify_parent_identity(prepared.parent)
-        if os.path.lexists(target):
-            mode = target.lstat().st_mode
-            if not stat.S_ISREG(mode):
-                raise ImageOutputError(
-                    "output path exists and is not a regular file"
-                )
-            if not overwrite:
-                raise ImageOutputError(
-                    f"output already exists; refusing to overwrite: {target}"
-                )
+        initial_identity = _capture_target_identity(prepared)
+        if initial_identity is not None and not overwrite:
+            raise ImageOutputError(
+                f"output already exists; refusing to overwrite: {target}"
+            )
         descriptor, probe_path = tempfile.mkstemp(
             prefix=".write-test.", dir=str(prepared.parent.path)
         )
@@ -743,6 +765,9 @@ def preflight_output(
         verify_parent_identity(prepared.parent)
         os.unlink(probe_path)
         probe_path = None
+        final_identity = _capture_target_identity(prepared)
+        if final_identity != initial_identity:
+            raise ImageOutputError("output identity changed during preflight")
     except ImageOutputError:
         raise
     except (OSError, ValueError) as error:
@@ -753,7 +778,11 @@ def preflight_output(
                 os.unlink(probe_path)
             except OSError:
                 pass
-    return prepared
+    return replace(
+        prepared,
+        expected_identity=final_identity,
+        expectation_captured=True,
+    )
 
 
 def _open_verified_parent(prepared: PreparedTarget) -> int:
@@ -777,7 +806,7 @@ def _open_verified_parent(prepared: PreparedTarget) -> int:
             except OSError:
                 pass
         raise
-    except OSError as error:
+    except (OSError, TypeError, NotImplementedError) as error:
         if descriptor is not None:
             try:
                 os.close(descriptor)
@@ -787,6 +816,35 @@ def _open_verified_parent(prepared: PreparedTarget) -> int:
             f"cannot open output parent directory: {error}"
         ) from error
     return descriptor
+
+
+def _identity_at_parent_fd(parent_fd: int, name: str) -> Optional[Tuple[int, int]]:
+    """Read one no-follow regular-file identity through a verified parent fd."""
+    try:
+        current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    except (OSError, TypeError, NotImplementedError) as error:
+        raise ImageOutputError("cannot inspect output identity securely") from error
+    if not stat.S_ISREG(current.st_mode):
+        raise ImageOutputError("output path exists and is not a regular file")
+    return current.st_dev, current.st_ino
+
+
+def _capture_target_identity(prepared: PreparedTarget) -> Optional[Tuple[int, int]]:
+    """Capture a target identity under its already-captured parent identity."""
+    parent_fd = None
+    try:
+        parent_fd = _open_verified_parent(prepared)
+        identity = _identity_at_parent_fd(parent_fd, prepared.name)
+    finally:
+        if parent_fd is not None:
+            try:
+                os.close(parent_fd)
+            except OSError:
+                pass
+    verify_parent_identity(prepared.parent)
+    return identity
 
 
 def _verify_temporary_identity(temporary: TemporaryOutput) -> None:
@@ -825,7 +883,7 @@ def _verify_temporary_name(temporary: TemporaryOutput) -> None:
             raise ImageOutputError("output temporary file identity changed")
     except ImageOutputError:
         raise
-    except OSError as error:
+    except (OSError, TypeError, NotImplementedError) as error:
         raise ImageOutputError(
             f"cannot verify output temporary file name: {error}"
         ) from error
@@ -879,7 +937,7 @@ def _temporary_path(target: TargetValue) -> TemporaryOutput:
         )
         verify_parent_identity(prepared.parent)
         return temporary
-    except (ImageOutputError, OSError) as error:
+    except (ImageOutputError, OSError, TypeError, NotImplementedError) as error:
         if temporary is not None:
             try:
                 _remove_temp(temporary)
@@ -926,7 +984,7 @@ def _remove_temp(path: Union[str, TemporaryOutput]) -> None:
                 return
             except ImageOutputError:
                 raise
-            except OSError as error:
+            except (OSError, TypeError, NotImplementedError) as error:
                 last_error = error
         raise ImageOutputError(
             f"failed to remove output temporary file {path}: {last_error}"
@@ -939,7 +997,7 @@ def _remove_temp(path: Union[str, TemporaryOutput]) -> None:
             return
         except FileNotFoundError:
             return
-        except OSError as error:
+        except (OSError, TypeError, NotImplementedError) as error:
             last_error = error
     raise ImageOutputError(
         f"failed to remove output temporary file {path}: {last_error}"
@@ -1034,7 +1092,7 @@ def _remove_published_target(
         return True
     except FileNotFoundError:
         return False
-    except OSError:
+    except (OSError, TypeError, NotImplementedError):
         return False
 
 
@@ -1043,6 +1101,7 @@ def _publish_temp(
     target: TargetValue,
     overwrite: bool,
     expected_existing_identity: Optional[tuple] = None,
+    expectation_captured: Optional[bool] = None,
 ) -> tuple:
     prepared = _as_prepared_target(target)
     if not isinstance(temp_path, TemporaryOutput):
@@ -1052,18 +1111,18 @@ def _publish_temp(
         verify_parent_identity(prepared.parent)
         _verify_temporary_identity(temp_path)
         _verify_temporary_name(temp_path)
-        if overwrite:
-            if expected_existing_identity is not None:
-                current = os.stat(
-                    prepared.name,
-                    dir_fd=temp_path.parent_fd,
-                    follow_symlinks=False,
-                )
-                if (
-                    not stat.S_ISREG(current.st_mode)
-                    or (current.st_dev, current.st_ino) != expected_existing_identity
-                ):
-                    raise ImageOutputError("output identity changed before replacement")
+        if expectation_captured is None:
+            expectation_captured = prepared.expectation_captured
+            expected_existing_identity = prepared.expected_identity
+        if not expectation_captured:
+            raise ImageOutputError("output publication expectation was not captured")
+        current_identity = _identity_at_parent_fd(
+            temp_path.parent_fd,
+            prepared.name,
+        )
+        if current_identity != expected_existing_identity:
+            raise ImageOutputError("output identity changed before publication")
+        if overwrite and expected_existing_identity is not None:
             os.rename(
                 temp_path.name,
                 prepared.name,
@@ -1113,7 +1172,7 @@ def _publish_temp(
                 *installed_identity,
             ) from error
         raise
-    except OSError as error:
+    except (OSError, TypeError, NotImplementedError) as error:
         if installed_identity is not None:
             raise PublishedOutputError(
                 "published output could not be verified",
@@ -1136,6 +1195,7 @@ def _publish_image_bytes(
     overwrite: bool,
     validator,
     expected_existing_identity: Optional[tuple] = None,
+    expected_missing: bool = False,
     allow_empty: bool = False,
 ) -> PublishedOutput:
     if not isinstance(data, bytes) or (not data and not allow_empty):
@@ -1144,7 +1204,24 @@ def _publish_image_bytes(
         raise ImageOutputError(
             f"image data exceeds maximum size of {MAX_IMAGE_BYTES} bytes"
         )
-    temporary = _temporary_path(target)
+    prepared = _as_prepared_target(target)
+    if expected_missing:
+        prepared = replace(
+            prepared,
+            expected_identity=None,
+            expectation_captured=True,
+        )
+    elif expected_existing_identity is not None:
+        prepared = replace(
+            prepared,
+            expected_identity=_validate_expected_existing_identity(
+                expected_existing_identity
+            ),
+            expectation_captured=True,
+        )
+    elif not prepared.expectation_captured:
+        prepared = preflight_output(prepared, overwrite=overwrite)
+    temporary = _temporary_path(prepared)
     published = False
     try:
         with os.fdopen(os.dup(temporary.descriptor), "wb") as output:
@@ -1152,23 +1229,15 @@ def _publish_image_bytes(
             output.flush()
             os.fsync(output.fileno())
         if validator is validate_image_bytes:
-            byte_count = _validate_temp(temporary, target)
+            byte_count = _validate_temp(temporary, prepared)
         else:
-            byte_count = _validate_temp(temporary, target, validator)
-        if expected_existing_identity is None:
-            identity = _publish_temp(temporary, target, overwrite)
-        else:
-            identity = _publish_temp(
-                temporary,
-                target,
-                overwrite,
-                expected_existing_identity=expected_existing_identity,
-            )
+            byte_count = _validate_temp(temporary, prepared, validator)
+        identity = _publish_temp(temporary, prepared, overwrite)
         published = True
         return PublishedOutput(byte_count, *identity)
     except ImageOutputError:
         raise
-    except OSError as error:
+    except (OSError, TypeError, NotImplementedError) as error:
         raise ImageOutputError(f"failed to write image: {error}") from error
     finally:
         if not published:
@@ -1258,6 +1327,7 @@ def publish_opaque_bytes_if_missing(
         target,
         False,
         _validate_opaque_bytes,
+        expected_missing=True,
         allow_empty=True,
     )
 
@@ -1300,7 +1370,10 @@ def publish_stream(
                 f"download exceeds maximum image size of {max_bytes} bytes"
             )
 
-    temporary = _temporary_path(target)
+    prepared = _as_prepared_target(target)
+    if not prepared.expectation_captured:
+        prepared = preflight_output(prepared, overwrite=overwrite)
+    temporary = _temporary_path(prepared)
     published = False
     try:
         byte_count = 0
@@ -1322,13 +1395,13 @@ def publish_stream(
                 output.write(chunk)
             output.flush()
             os.fsync(output.fileno())
-        byte_count = _validate_temp(temporary, target)
-        _publish_temp(temporary, target, overwrite)
+        byte_count = _validate_temp(temporary, prepared)
+        _publish_temp(temporary, prepared, overwrite)
         published = True
         return byte_count
     except ImageOutputError:
         raise
-    except OSError as error:
+    except (OSError, TypeError, NotImplementedError) as error:
         raise ImageOutputError(f"failed to download image: {error}") from error
     finally:
         if not published:

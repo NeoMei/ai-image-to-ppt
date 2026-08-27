@@ -149,7 +149,7 @@ def _download_with_retries(image_url: str, target: PreparedTarget, retries: int,
             return _result(GenerationStatus.INVALID_OUTPUT, f"invalid downloaded image: {_redact(error, key)}", secrets=secrets)
         try:
             byte_count = publish_bytes(image, target, overwrite=overwrite)
-        except (ImageOutputError, OSError) as error:
+        except (ImageOutputError, OSError, TypeError, NotImplementedError) as error:
             return _result(GenerationStatus.LOCAL_FAILURE, f"output failure: {_redact(error, key)}", secrets=secrets)
         return _result(GenerationStatus.SUCCESS, f"{byte_count // 1024}KB, Doubao", str(target.path), secrets=secrets)
     return _result(GenerationStatus.RETRYABLE_EXHAUSTED, "download retries exhausted", secrets=secrets)
@@ -163,7 +163,7 @@ def _gen_owned(prompt: str, target: PreparedTarget, retries: int = 2, overwrite:
     """Generate while the caller owns a prepared output lock."""
     try:
         requested_format = output_format(str(target))
-        preflight_output(target, overwrite=overwrite)
+        target = preflight_output(target, overwrite=overwrite)
     except ImageOutputError:
         return _result(GenerationStatus.LOCAL_FAILURE, "unable to prepare output target")
 
@@ -229,7 +229,14 @@ def _generate_result_with_lock(prompt: str, out_path: str, retries: int, overwri
         target = prepare_target(resolve_output_path(out_path))
         with output_lock(prepared_lock_target(target)):
             result = _gen_owned(prompt, target, retries, overwrite, progress)
-    except (ImageOutputError, OutputLockError, OSError, TypeError, ValueError):
+    except (
+        ImageOutputError,
+        OutputLockError,
+        OSError,
+        TypeError,
+        ValueError,
+        NotImplementedError,
+    ):
         return _result(GenerationStatus.LOCAL_FAILURE, "unable to prepare output target")
     if not isinstance(result, GenerationResult):
         return _result(GenerationStatus.LOCAL_FAILURE, "internal generator returned an invalid result")
@@ -241,11 +248,11 @@ def generate_result(prompt: str, out_path: str, retries: int = 2, overwrite: boo
 
 
 def gen(prompt: str, out_path: str, retries: int = 2, overwrite: bool = False) -> bool:
-    result = generate_result(prompt, out_path, retries=retries, overwrite=overwrite, progress=print)
+    result = generate_result(prompt, out_path, retries=retries, overwrite=overwrite, progress=None)
     if result.ok:
-        print(f"  OK: {safe_message(result.output_path, _environment_redaction_secrets())} ({result.safe_message})")
+        print(f"  OK: {safe_message(result.output_path, _environment_redaction_secrets())} ({safe_message(result.safe_message)})")
     else:
-        print(f"  ERR: {result.safe_message}")
+        print(f"  ERR: {safe_message(result.safe_message)}")
     return result.ok
 
 

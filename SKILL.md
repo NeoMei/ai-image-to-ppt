@@ -66,6 +66,10 @@ Gemini accepts `.png`, `.jpg`, and `.jpeg` and uses PNG by default. For a
 low-level Python API call, keep the same explicit selection:
 
 ```python
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path.cwd() / "scripts"))
 from gen_slide import gen
 
 gen("<prompt>", "out/slide_01.png", engine="gemini")
@@ -132,6 +136,10 @@ Generation refuses existing outputs unless `--force` is explicit. Inputs and
 generated images are capped at 50 MiB and 64 MP; vision inputs have a separate
 14 MiB cap. Export validates input, writes PDF/PPTX with recovery on the next
 export, and accepts at most 128 slides or 512 MiB aggregate source bytes.
+Generation and host import require POSIX secure publication primitives
+(directory-descriptor/no-follow checks, hard links, and same-directory rename);
+unsupported platforms fail closed as `local_failure` instead of weakening
+output ownership checks.
 Clearly over-limit manifests are rejected during path preflight, before image
 decoding. If source files change after preflight, actual loaded bytes are
 accumulated after each image load and rejected before PDF/PPTX serialization.

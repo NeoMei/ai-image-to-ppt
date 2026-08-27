@@ -6,6 +6,37 @@ import re
 from typing import AbstractSet, Iterable, Optional
 
 
+_ANSI_ESCAPE = re.compile(
+    r"\x1b(?:\][^\x1b\x07]*(?:\x07|\x1b\\)|[@-_][0-?]*[ -/]*[@-~]|[0-?]*[ -/]*[@-~])"
+)
+_TERMINAL_CONTROLS = re.compile(r"[\x00-\x1f\x7f-\x9f]+")
+
+
+def safe_message(message: object, secrets: Iterable[str] = ()) -> str:
+    """Return bounded, redacted text that is safe for one terminal line/JSON.
+
+    Provider diagnostics are untrusted. Normalize terminal escape sequences,
+    line/control characters, and invalid Unicode before any caller prints or
+    serializes them.
+    """
+    try:
+        text = str(message)
+    except Exception:
+        text = "diagnostic unavailable"
+    for secret in sorted(
+        (secret for secret in secrets if isinstance(secret, str) and secret),
+        key=len,
+        reverse=True,
+    ):
+        text = text.replace(secret, "[REDACTED]")
+    text = re.sub(r"(?<![A-Za-z0-9_-])sk-[A-Za-z0-9_-]+", "[REDACTED]", text)
+    text = re.sub(r"(?i)Bearer[ ]+[A-Za-z0-9._~+/-]+", "Bearer [REDACTED]", text)
+    text = _ANSI_ESCAPE.sub(" ", text)
+    text = _TERMINAL_CONTROLS.sub(" ", text)
+    text = text.encode("utf-8", errors="replace").decode("utf-8")
+    return " ".join(text.split())[:300]
+
+
 class GenerationStatus(str, Enum):
     SUCCESS = "success"
     UNAVAILABLE = "unavailable"
@@ -47,6 +78,9 @@ class GenerationResult:
                 raise ValueError("success requires an absolute output_path")
         elif self.output_path is not None:
             raise ValueError("only success may carry output_path")
+        if not isinstance(self.safe_message, str):
+            raise ValueError("safe_message must be text")
+        object.__setattr__(self, "safe_message", safe_message(self.safe_message))
 
     @property
     def ok(self) -> bool:
@@ -59,7 +93,7 @@ class GenerationResult:
     def to_json(self) -> str:
         payload = asdict(self)
         payload["status"] = self.status.value
-        return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        return json.dumps(payload, ensure_ascii=True, sort_keys=True)
 
 
 def classify_http_failure(
@@ -78,12 +112,3 @@ def classify_http_failure(
     if status_code == 429 or status_code >= 500:
         return GenerationStatus.RETRYABLE_EXHAUSTED
     return GenerationStatus.INVALID_INPUT
-
-
-def safe_message(message: object, secrets: Iterable[str] = ()) -> str:
-    text = str(message)
-    for secret in sorted((secret for secret in secrets if secret), key=len, reverse=True):
-        text = text.replace(secret, "[REDACTED]")
-    text = re.sub(r"(?<![A-Za-z0-9_-])sk-[A-Za-z0-9_-]+", "[REDACTED]", text)
-    text = re.sub(r"(?i)Bearer[ ]+[A-Za-z0-9._~+/-]+", "Bearer [REDACTED]", text)
-    return text[:300]

@@ -315,24 +315,25 @@ class SharedParentIdentityTests(unittest.TestCase):
             parent.mkdir()
             prepared = image_output.preflight_output(parent / "slide.jpg")
             original = parent.with_name("approved-original")
-            rename_called = False
+            link_called = False
             real_rename = image_output.os.rename
+            real_link = image_output.os.link
 
-            def swap_then_rename(*args, **kwargs):
-                nonlocal rename_called
-                rename_called = True
+            def swap_then_link(*args, **kwargs):
+                nonlocal link_called
+                link_called = True
                 real_rename(str(parent), str(original))
                 parent.mkdir()
-                return real_rename(*args, **kwargs)
+                return real_link(*args, **kwargs)
 
             with mock.patch.object(
                 image_output.os,
-                "rename",
-                side_effect=swap_then_rename,
+                "link",
+                side_effect=swap_then_link,
             ), self.assertRaisesRegex(image_output.ImageOutputError, "parent directory"):
                 image_output.publish_bytes(image_bytes(), prepared, overwrite=True)
 
-            self.assertTrue(rename_called)
+            self.assertTrue(link_called)
             self.assertFalse((parent / "slide.jpg").exists())
             self.assertFalse((original / "slide.jpg").exists())
             assert_no_transaction_files(self, parent)

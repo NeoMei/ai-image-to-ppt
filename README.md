@@ -66,14 +66,19 @@ workspace sibling path `raw/<filename>`. The host importer alone may accept a
 near-16:9 image within a 0.5% integer cross-product tolerance, center-crop it
 (never stretch it) to the largest strict 16:9 master, and strictly revalidate
 the encoded master. API adapters never receive that tolerance or crop. Existing
-outputs are protected unless `--force` is explicit; use `--force` only for
-intentional replacement with rollback and crash-recovery protection. Image
-inputs and generation outputs are capped at 50 MiB and 64 MP. Vision-check
-inputs have a separate 14 MiB limit. Transient provider retries honor bounded
-`Retry-After` guidance. Parent-directory replacement is detected before
-publication and fails closed. The paired host raw/master publication uses
-compensating rollback for ordinary process-time failures while both output locks
-are held; it is not a crash-atomic two-file commit.
+outputs are protected unless `--force` is explicit. API single-image outputs
+use conditional atomic replacement: publication proceeds only while the target
+still matches the inode (or missing state) captured during locked preflight.
+The paired host raw/master publication uses process-time compensating rollback
+while both output locks are held; it is not a crash-atomic two-file commit.
+Only deck export has an export journal for recovery after interruption. These
+generation/import paths require POSIX secure publication primitives:
+directory-descriptor and no-follow checks, hard links, and same-directory
+rename. Platforms without those primitives fail closed with `local_failure`;
+no weaker pathname-only publication is attempted. Image inputs and generation
+outputs are capped at 50 MiB and 64 MP. Vision-check inputs have a separate
+14 MiB limit. Transient provider retries honor bounded `Retry-After` guidance.
+Parent-directory replacement is detected before publication and fails closed.
 
 ## Editable-converter handoff
 
