@@ -5,14 +5,19 @@ import argparse
 import http.client
 import json
 import os
-import re
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Callable, Optional, Sequence
 
+from generation_result import (
+    GenerationResult,
+    GenerationStatus,
+    classify_http_failure,
+    safe_message,
+)
 from image_output import (
     ImageOutputError,
     ImageStreamError,
@@ -24,6 +29,7 @@ from image_output import (
     publish_bytes,
     read_response_body,
     resolve_output_path,
+    validate_image_bytes,
     validate_retries,
 )
 from output_lock import OutputLockError, output_lock
@@ -36,7 +42,18 @@ URL_TEMPLATE = (
     "https://generativelanguage.googleapis.com/v1/models/"
     "{}:generateContent"
 )
-KEY_LIKE_PATTERN = re.compile(r"(?<![A-Za-z0-9_-])sk-[A-Za-z0-9_-]+")
+GEMINI_POLICY_REASONS = frozenset({
+    "BLOCKLIST",
+    "IMAGE_SAFETY",
+    "PROHIBITED_CONTENT",
+    "SAFETY",
+})
+GEMINI_POLICY_CODES = frozenset({"blocked", "safety"})
+GEMINI_RETRYABLE_CODES = frozenset({
+    "quota_exceeded",
+    "rate_limit_exceeded",
+    "resource_exhausted",
+})
 TRANSPORT_ERRORS = (
     ImageStreamError,
     urllib.error.URLError,
@@ -65,27 +82,72 @@ def _output_config(out_path: str):
 
 
 def _redact(message: object, key: str) -> str:
-    text = str(message)
-    if key:
-        text = text.replace(key, "[REDACTED]")
-    return KEY_LIKE_PATTERN.sub("[REDACTED]", text)[:300]
+    return safe_message(message, (key,))
 
 
-def _http_error_message(error: urllib.error.HTTPError, key: str) -> str:
-    if error.code in (401, 403):
-        return "authentication failed; check GEMINI_API_KEY or ~/.secrets/gemini_api_key"
+def _environment_redaction_secrets() -> Sequence[str]:
+    """Collect the configured environment key after local validation succeeds."""
+    key = os.environ.get("GEMINI_API_KEY")
+    return (key,) if isinstance(key, str) and key else ()
+
+
+def _result(
+    status: GenerationStatus,
+    message: object,
+    output_path: Optional[str] = None,
+    secrets: Sequence[str] = (),
+) -> GenerationResult:
+    return GenerationResult(
+        status,
+        "gemini",
+        "api",
+        output_path=output_path,
+        safe_message=safe_message(message, secrets),
+    )
+
+
+def _http_error_details(error: urllib.error.HTTPError, key: str):
+    code = None
+    message = None
     try:
         raw_body = read_response_body(error)
         if isinstance(raw_body, bytes):
             raw_body = raw_body.decode("utf-8")
         payload = parse_json_response(raw_body)
         if isinstance(payload, dict) and isinstance(payload.get("error"), dict):
-            message = payload["error"].get("message")
-            if isinstance(message, (str, int, float, bool)) and message:
-                return _redact(message, key)
+            details = payload["error"]
+            candidate_code = details.get("code")
+            if isinstance(candidate_code, str) and candidate_code:
+                code = candidate_code
+            candidate_message = details.get("message")
+            if isinstance(candidate_message, (str, int, float, bool)) and candidate_message:
+                message = candidate_message
     except Exception:
         pass
-    return _redact(error.reason or "request failed", key)
+    return code, _redact(message or error.reason or "request failed", key)
+
+
+def _http_error_message(error: urllib.error.HTTPError, key: str) -> str:
+    return _http_error_details(error, key)[1]
+
+
+def _policy_reason(payload: object) -> Optional[str]:
+    if not isinstance(payload, dict):
+        return None
+    feedback = payload.get("promptFeedback")
+    if isinstance(feedback, dict):
+        reason = feedback.get("blockReason")
+        if isinstance(reason, str) and reason.upper() in GEMINI_POLICY_REASONS:
+            return reason.upper()
+    candidates = payload.get("candidates")
+    if isinstance(candidates, list):
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            reason = candidate.get("finishReason")
+            if isinstance(reason, str) and reason.upper() in GEMINI_POLICY_REASONS:
+                return reason.upper()
+    return None
 
 
 def _extract_image(payload: object, target: Path, expected_mime: str) -> bytes:
@@ -123,31 +185,36 @@ def _extract_image(payload: object, target: Path, expected_mime: str) -> bytes:
 
 def _gen_owned(
     prompt: str,
-    out_path: str,
+    target,
     retries: int = 2,
     overwrite: bool = False,
-) -> bool:
-    """Generate one strict 16:9 image. Return True only after atomic publication."""
+    progress: Optional[Callable[[str], None]] = None,
+) -> GenerationResult:
+    """Generate while the caller owns a prepared output lock."""
     try:
-        retries = validate_retries(retries)
-        expected_mime, image_config = _output_config(out_path)
-        target = preflight_output(out_path, overwrite=overwrite)
-    except ImageOutputError as error:
-        print(f"  ERR: {error}")
-        return False
+        expected_mime, image_config = _output_config(str(target))
+        preflight_output(target, overwrite=overwrite)
+    except ImageOutputError:
+        return _result(GenerationStatus.LOCAL_FAILURE, "unable to prepare output target")
 
+    redaction_secrets = _environment_redaction_secrets()
     key = _load_api_key()
+    secrets = tuple(redaction_secrets) + ((key,) if isinstance(key, str) and key else ())
     if not key:
-        print(
-            "  ERR: Gemini API key not found. Set GEMINI_API_KEY or create "
-            "~/.secrets/gemini_api_key (see README.md)"
+        return _result(
+            GenerationStatus.AUTH_UNAVAILABLE,
+            "Gemini API key not found. Set GEMINI_API_KEY or create "
+            "~/.secrets/gemini_api_key (see README.md)",
+            secrets=secrets,
         )
-        return False
     try:
         key = validate_api_key(key)
     except APIKeyError as error:
-        print(f"  ERR: Gemini API key is invalid: {error}")
-        return False
+        return _result(
+            GenerationStatus.AUTH_UNAVAILABLE,
+            f"Gemini API key is invalid: {error}",
+            secrets=secrets,
+        )
 
     model = os.environ.get("GEMINI_IMAGE_MODEL", DEFAULT_MODEL).strip() or DEFAULT_MODEL
     encoded_model = urllib.parse.quote(model, safe="")
@@ -175,39 +242,138 @@ def _gen_owned(
             with urllib.request.urlopen(request, timeout=120) as response:
                 raw_response = read_response_body(response)
         except urllib.error.HTTPError as error:
-            print(
-                f"  HTTP {error.code}: {_http_error_message(error, key)} "
-                f"(attempt {attempt + 1})"
+            error_code, remote_message = _http_error_details(error, key)
+            status = classify_http_failure(
+                error.code,
+                error_code,
+                GEMINI_POLICY_CODES,
+                GEMINI_RETRYABLE_CODES,
             )
-            if (error.code == 429 or error.code >= 500) and attempt < retries:
+            if status is GenerationStatus.AUTH_UNAVAILABLE:
+                message = (
+                    "authentication failed; check GEMINI_API_KEY; provider says: "
+                    f"{remote_message}"
+                )
+            else:
+                message = remote_message
+            should_retry = (
+                status is GenerationStatus.RETRYABLE_EXHAUSTED
+                and (error.code == 429 or error.code >= 500)
+                and attempt < retries
+            )
+            if should_retry:
+                if progress is not None:
+                    progress(f"  HTTP {error.code}: {message} (attempt {attempt + 1})")
                 time.sleep(retry_delay(attempt, error.headers))
                 continue
-            return False
+            return _result(status, message, secrets=secrets)
         except TRANSPORT_ERRORS as error:
-            print(f"  ERR: {_redact(error, key)} (attempt {attempt + 1})")
+            message = _redact(error, key)
             if attempt < retries:
+                if progress is not None:
+                    progress(f"  ERR: {message} (attempt {attempt + 1})")
                 time.sleep(retry_delay(attempt))
                 continue
-            return False
+            return _result(
+                GenerationStatus.RETRYABLE_EXHAUSTED,
+                message,
+                secrets=secrets,
+            )
         except ImageOutputError as error:
-            print(f"  ERR: invalid provider response: {_redact(error, key)}")
-            return False
+            return _result(
+                GenerationStatus.INVALID_OUTPUT,
+                f"invalid provider response: {_redact(error, key)}",
+                secrets=secrets,
+            )
 
         try:
             payload = parse_json_response(raw_response)
+        except ImageOutputError:
+            return _result(
+                GenerationStatus.INVALID_OUTPUT,
+                "invalid JSON response from Gemini",
+                secrets=secrets,
+            )
+
+        if _policy_reason(payload) is not None:
+            return _result(
+                GenerationStatus.POLICY_REFUSED,
+                "Gemini declined the image request due to policy",
+                secrets=secrets,
+            )
+
+        try:
             image = _extract_image(payload, target, expected_mime)
+            validate_image_bytes(image, target)
+        except (ImageOutputError, KeyError, IndexError, TypeError, ValueError) as error:
+            return _result(
+                GenerationStatus.INVALID_OUTPUT,
+                f"invalid image response: {_redact(error, key)}",
+                secrets=secrets,
+            )
+        try:
             byte_count = publish_bytes(image, target, overwrite=overwrite)
-        except (TypeError, ValueError, UnicodeError, OSError) as error:
-            print(f"  ERR: invalid image response or output failure: {_redact(error, key)}")
-            return False
+        except (ImageOutputError, OSError) as error:
+            return _result(
+                GenerationStatus.LOCAL_FAILURE,
+                f"output failure: {_redact(error, key)}",
+                secrets=secrets,
+            )
 
-        print(
-            f"  OK: {_redact(target, key)} "
-            f"({byte_count // 1024}KB, Gemini {_redact(model, key)})"
+        return _result(
+            GenerationStatus.SUCCESS,
+            f"{byte_count // 1024}KB, Gemini {_redact(model, key)}",
+            str(target.path),
+            secrets=secrets,
         )
-        return True
 
-    return False
+    return _result(
+        GenerationStatus.RETRYABLE_EXHAUSTED,
+        "request retries exhausted",
+        secrets=secrets,
+    )
+
+
+def _generate_result_with_lock(
+    prompt: str,
+    out_path: str,
+    retries: int,
+    overwrite: bool,
+    progress: Optional[Callable[[str], None]],
+) -> GenerationResult:
+    try:
+        retries = validate_retries(retries)
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise ImageOutputError("prompt must be non-empty text")
+        if not isinstance(overwrite, bool):
+            raise ImageOutputError("overwrite must be a boolean")
+        _output_config(out_path)
+    except (ImageOutputError, TypeError, ValueError):
+        return _result(GenerationStatus.INVALID_INPUT, "invalid generation arguments")
+
+    try:
+        target = prepare_target(resolve_output_path(out_path))
+        with output_lock(prepared_lock_target(target)):
+            result = _gen_owned(prompt, target, retries, overwrite, progress)
+    except (ImageOutputError, OutputLockError, OSError, TypeError, ValueError):
+        return _result(GenerationStatus.LOCAL_FAILURE, "unable to prepare output target")
+
+    if not isinstance(result, GenerationResult):
+        return _result(
+            GenerationStatus.LOCAL_FAILURE,
+            "internal generator returned an invalid result",
+        )
+    return result
+
+
+def generate_result(
+    prompt: str,
+    out_path: str,
+    retries: int = 2,
+    overwrite: bool = False,
+    progress: Optional[Callable[[str], None]] = None,
+) -> GenerationResult:
+    return _generate_result_with_lock(prompt, out_path, retries, overwrite, progress)
 
 
 def gen(
@@ -216,22 +382,22 @@ def gen(
     retries: int = 2,
     overwrite: bool = False,
 ) -> bool:
-    try:
-        retries = validate_retries(retries)
-    except ImageOutputError as error:
-        print(f"  ERR: {error}")
-        return False
-    try:
-        target = prepare_target(resolve_output_path(out_path))
-    except ImageOutputError as error:
-        print(f"  ERR: {error}")
-        return False
-    try:
-        with output_lock(prepared_lock_target(target)):
-            return _gen_owned(prompt, target, retries, overwrite)
-    except OutputLockError as error:
-        print(f"  ERR: {error}")
-        return False
+    result = generate_result(
+        prompt,
+        out_path,
+        retries=retries,
+        overwrite=overwrite,
+        progress=print,
+    )
+    if result.ok:
+        redaction_secrets = _environment_redaction_secrets()
+        print(
+            f"  OK: {safe_message(result.output_path, redaction_secrets)} "
+            f"({result.safe_message})"
+        )
+    else:
+        print(f"  ERR: {result.safe_message}")
+    return result.ok
 
 
 def _parser() -> argparse.ArgumentParser:

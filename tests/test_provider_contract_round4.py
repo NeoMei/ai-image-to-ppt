@@ -175,10 +175,10 @@ class ProviderAbsoluteOutputTests(unittest.TestCase):
                 os.chdir(temp)
                 try:
                     owned_result = True
-                    if provider is gen_slide_openai:
+                    if provider in (gen_slide_openai, gen_slide_gemini):
                         owned_result = GenerationResult(
                             GenerationStatus.SUCCESS,
-                            "openai",
+                            "openai" if provider is gen_slide_openai else "gemini",
                             "api",
                             str(expected),
                             "generated",
@@ -223,7 +223,7 @@ class ProviderAbsoluteOutputTests(unittest.TestCase):
                 self.assertFalse(result)
                 expected_message = (
                     "unable to prepare output target"
-                    if provider is gen_slide_openai
+                    if provider in (gen_slide_openai, gen_slide_gemini)
                     else "not a regular file"
                 )
                 self.assertIn(expected_message, output.getvalue())
