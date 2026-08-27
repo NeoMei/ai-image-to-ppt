@@ -278,6 +278,7 @@ class HostImageImportTests(unittest.TestCase):
                 )
 
             self.assertEqual(failed.status, GenerationStatus.LOCAL_FAILURE)
+            self.assertIn("rollback was incomplete", failed.safe_message)
             self.assertIsNotNone(replacement_identity)
             self.assertEqual(master.read_bytes(), replacement_bytes)
             self.assertEqual(

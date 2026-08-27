@@ -437,11 +437,14 @@ def import_host_artifact(
                     target,
                     overwrite,
                 )
-            except ImageOutputError:
+            except ImageOutputError as error:
+                message = "host artifact could not be published"
+                if "rollback was incomplete" in str(error):
+                    message = "host artifact transaction rollback was incomplete"
                 return _failure(
                     GenerationStatus.LOCAL_FAILURE,
                     provider,
-                    "host artifact could not be published",
+                    message,
                 )
     except (ImageOutputError, OutputLockError):
         return _failure(
