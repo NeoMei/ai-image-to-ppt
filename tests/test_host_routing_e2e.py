@@ -184,27 +184,46 @@ class HostRoutingEndToEndTests(unittest.TestCase):
 
     def test_cached_page_after_selection_preserves_route_for_the_next_generation(self):
         router = SerialStickyRouter()
-        selected = TranscriptExecutor({"host-openai": "success"})
+        selected = TranscriptExecutor(
+            {
+                "host-openai": "unavailable",
+                "api-openai": "auth_unavailable",
+                "host-gemini": "success",
+            }
+        )
         cached_calls = []
-        continued = TranscriptExecutor({"host-openai": "success"})
+        continued = TranscriptExecutor({"host-gemini": "success"})
 
-        router.route_page(1, selected)
-        sticky_before = router.sticky_candidate
-        search_before = router.search_candidate
-        switches_before = router.switches
+        selected_page = router.route_page(1, selected)
+        report_before_cache = router.report()
         cached = router.route_page(
             2,
             lambda candidate: cached_calls.append(candidate.key) or self.fail("must not execute"),
             cached=True,
         )
-        router.route_page(3, continued)
+        report_after_cache = router.report()
 
         self.assertEqual(cached.outcome, "cached")
         self.assertEqual(cached_calls, [])
-        self.assertIs(router.sticky_candidate, sticky_before)
-        self.assertIs(router.search_candidate, search_before)
-        self.assertEqual(router.switches, switches_before)
-        self.assertEqual(continued.calls, [("host-openai", "success")])
+        self.assertEqual(
+            report_after_cache["sticky_candidate"],
+            report_before_cache["sticky_candidate"],
+        )
+        self.assertEqual(
+            report_after_cache["search_candidate"],
+            report_before_cache["search_candidate"],
+        )
+        self.assertEqual(report_after_cache["switches"], report_before_cache["switches"])
+        self.assertEqual(report_after_cache["pages"][:-1], report_before_cache["pages"])
+        self.assertEqual(
+            report_after_cache["pages"][-1],
+            {"page": 2, "outcome": "cached", "candidate": None, "summary": ""},
+        )
+        self.assertIs(router.pages[0], selected_page)
+        self.assertEqual(router.sticky_candidate.key, "host-gemini")
+        router.route_page(3, continued)
+
+        self.assertEqual(continued.calls, [("host-gemini", "success")])
 
     def test_cross_provider_sticky_candidate_never_retries_earlier_candidates(self):
         router = SerialStickyRouter()
