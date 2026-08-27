@@ -5,13 +5,18 @@ import argparse
 import http.client
 import json
 import os
-import re
 import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Callable, Optional, Sequence
 
+from generation_result import (
+    GenerationResult,
+    GenerationStatus,
+    classify_http_failure,
+    safe_message,
+)
 from image_output import (
     ImageOutputError,
     ImageStreamError,
@@ -24,6 +29,7 @@ from image_output import (
     publish_bytes,
     read_response_body,
     resolve_output_path,
+    validate_image_bytes,
     validate_retries,
 )
 from output_lock import OutputLockError, output_lock
@@ -35,7 +41,15 @@ DEFAULT_MODEL = "gpt-image-2"
 DEFAULT_SIZE = "2048x1152"
 DEFAULT_QUALITY = "medium"
 SECRET_PATH = Path("~/.secrets/openai_api_key").expanduser()
-KEY_LIKE_PATTERN = re.compile(r"(?<![A-Za-z0-9_-])sk-[A-Za-z0-9_-]+")
+OPENAI_POLICY_CODES = frozenset({
+    "content_policy_violation",
+    "moderation_blocked",
+})
+OPENAI_RETRYABLE_CODES = frozenset({
+    "billing_hard_limit_reached",
+    "insufficient_quota",
+    "rate_limit_exceeded",
+})
 
 
 def _load_api_key() -> str:
@@ -47,13 +61,12 @@ def _output_format(out_path: str) -> str:
 
 
 def _redact(message: object, key: str) -> str:
-    text = str(message)
-    if key:
-        text = text.replace(key, "[REDACTED]")
-    return KEY_LIKE_PATTERN.sub("[REDACTED]", text)[:300]
+    return safe_message(message, (key,))
 
 
-def _error_message(error: urllib.error.HTTPError, key: str) -> str:
+def _error_details(error: urllib.error.HTTPError, key: str):
+    code = None
+    message = None
     try:
         raw_body = read_response_body(error)
         if isinstance(raw_body, bytes):
@@ -66,21 +79,19 @@ def _error_message(error: urllib.error.HTTPError, key: str) -> str:
         details = payload.get("error")
         if not isinstance(details, dict):
             raise TypeError("HTTP error details must be an object")
-        message = details.get("message")
-        if isinstance(message, (str, int, float, bool)) and message:
-            return _redact(message, key)
+        candidate_code = details.get("code")
+        if isinstance(candidate_code, str) and candidate_code:
+            code = candidate_code
+        candidate_message = details.get("message")
+        if isinstance(candidate_message, (str, int, float, bool)) and candidate_message:
+            message = candidate_message
     except Exception:
         pass
-    return _redact(error.reason or "request failed", key)
+    return code, _redact(message or error.reason or "request failed", key)
 
 
-def _preflight_output(out_path: str, key: str, overwrite: bool = False) -> bool:
-    try:
-        preflight_output(out_path, overwrite=overwrite)
-    except ImageOutputError as error:
-        print(f"  ERR: {_redact(error, key)}")
-        return False
-    return True
+def _error_message(error: urllib.error.HTTPError, key: str) -> str:
+    return _error_details(error, key)[1]
 
 
 def _decode_image_response(result: object) -> bytes:
@@ -98,32 +109,48 @@ def _decode_image_response(result: object) -> bytes:
     return decode_base64(encoded)
 
 
+def _result(
+    status: GenerationStatus,
+    message: object,
+    output_path: Optional[str] = None,
+) -> GenerationResult:
+    return GenerationResult(
+        status,
+        "openai",
+        "api",
+        output_path=output_path,
+        safe_message=safe_message(message),
+    )
+
+
 def _gen_owned(
     prompt: str,
-    out_path: str,
+    target,
     retries: int = 2,
     overwrite: bool = False,
-) -> bool:
+    progress: Optional[Callable[[str], None]] = None,
+) -> GenerationResult:
+    """Generate while the caller owns a prepared output lock."""
     try:
-        retries = validate_retries(retries)
-        output_format_value = _output_format(out_path)
-        target = preflight_output(out_path, overwrite=overwrite)
+        output_format_value = _output_format(str(target))
+        preflight_output(target, overwrite=overwrite)
     except ImageOutputError as error:
-        print(f"  ERR: {error}")
-        return False
+        return _result(GenerationStatus.LOCAL_FAILURE, error)
 
     key = _load_api_key()
     if not key:
-        print(
-            "  ERR: OpenAI API key not found. Set OPENAI_API_KEY or create "
-            "~/.secrets/openai_api_key"
+        return _result(
+            GenerationStatus.AUTH_UNAVAILABLE,
+            "OpenAI API key not found. Set OPENAI_API_KEY or create "
+            "~/.secrets/openai_api_key",
         )
-        return False
     try:
         key = validate_api_key(key)
     except APIKeyError as error:
-        print(f"  ERR: OpenAI API key is invalid: {error}")
-        return False
+        return _result(
+            GenerationStatus.AUTH_UNAVAILABLE,
+            f"OpenAI API key is invalid: {error}",
+        )
 
     payload = {
         "model": os.environ.get("OPENAI_IMAGE_MODEL", DEFAULT_MODEL),
@@ -147,18 +174,30 @@ def _gen_owned(
             with urllib.request.urlopen(request, timeout=180) as response:
                 raw_response = read_response_body(response)
         except urllib.error.HTTPError as error:
-            if error.code in (401, 403):
+            error_code, remote_message = _error_details(error, key)
+            status = classify_http_failure(
+                error.code,
+                error_code,
+                OPENAI_POLICY_CODES,
+                OPENAI_RETRYABLE_CODES,
+            )
+            if status is GenerationStatus.AUTH_UNAVAILABLE:
                 message = (
                     "authentication failed; check OPENAI_API_KEY; provider says: "
-                    f"{_error_message(error, key)}"
+                    f"{remote_message}"
                 )
             else:
-                message = _error_message(error, key)
-            print(f"  HTTP {error.code}: {message} (attempt {attempt + 1})")
-            if (error.code == 429 or error.code >= 500) and attempt < retries:
+                message = remote_message
+            if progress is not None:
+                progress(f"  HTTP {error.code}: {message} (attempt {attempt + 1})")
+            if (
+                status is GenerationStatus.RETRYABLE_EXHAUSTED
+                and (error.code == 429 or error.code >= 500)
+                and attempt < retries
+            ):
                 time.sleep(retry_delay(attempt, error.headers))
                 continue
-            return False
+            return _result(status, message)
         except (
             ImageStreamError,
             urllib.error.URLError,
@@ -166,38 +205,93 @@ def _gen_owned(
             OSError,
             http.client.HTTPException,
         ) as error:
-            print(f"  ERR: {_redact(error, key)} (attempt {attempt + 1})")
+            message = _redact(error, key)
+            if progress is not None:
+                progress(f"  ERR: {message} (attempt {attempt + 1})")
             if attempt < retries:
                 time.sleep(retry_delay(attempt))
                 continue
-            return False
+            return _result(GenerationStatus.RETRYABLE_EXHAUSTED, message)
         except ImageOutputError as error:
-            print(f"  ERR: invalid provider response: {_redact(error, key)}")
-            return False
+            return _result(
+                GenerationStatus.INVALID_OUTPUT,
+                f"invalid provider response: {_redact(error, key)}",
+            )
 
         try:
             result = parse_json_response(raw_response)
         except ImageOutputError:
-            print("  ERR: invalid JSON response from OpenAI")
-            return False
+            return _result(
+                GenerationStatus.INVALID_OUTPUT,
+                "invalid JSON response from OpenAI",
+            )
 
         try:
             image = _decode_image_response(result)
-            byte_count = publish_bytes(image, target, overwrite=overwrite)
-        except (KeyError, IndexError, TypeError, ValueError, OSError) as error:
-            print(
-                "  ERR: invalid image response or output failure: "
-                f"{_redact(error, key)}"
+            validate_image_bytes(image, target)
+        except (ImageOutputError, KeyError, IndexError, TypeError, ValueError) as error:
+            return _result(
+                GenerationStatus.INVALID_OUTPUT,
+                f"invalid image response: {_redact(error, key)}",
             )
-            return False
+        try:
+            byte_count = publish_bytes(image, target, overwrite=overwrite)
+        except (ImageOutputError, OSError) as error:
+            return _result(
+                GenerationStatus.LOCAL_FAILURE,
+                f"output failure: {_redact(error, key)}",
+            )
 
-        size_kb = byte_count // 1024
-        safe_path = _redact(out_path, key)
-        safe_model = _redact(payload["model"], key)
-        print(f"  OK: {safe_path} ({size_kb}KB, OpenAI {safe_model})")
-        return True
+        return _result(
+            GenerationStatus.SUCCESS,
+            f"generated {byte_count // 1024}KB with OpenAI {_redact(payload['model'], key)}",
+            str(target.path),
+        )
 
-    return False
+    return _result(GenerationStatus.RETRYABLE_EXHAUSTED, "request retries exhausted")
+
+
+def _generate_result_with_lock(
+    prompt: str,
+    out_path: str,
+    retries: int,
+    overwrite: bool,
+    progress: Optional[Callable[[str], None]],
+) -> GenerationResult:
+    try:
+        retries = validate_retries(retries)
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise ImageOutputError("prompt must be non-empty text")
+        if not isinstance(overwrite, bool):
+            raise ImageOutputError("overwrite must be a boolean")
+        _output_format(out_path)
+    except (ImageOutputError, TypeError, ValueError) as error:
+        return _result(GenerationStatus.INVALID_INPUT, error)
+
+    try:
+        target = prepare_target(resolve_output_path(out_path))
+        with output_lock(prepared_lock_target(target)):
+            result = _gen_owned(prompt, target, retries, overwrite, progress)
+    except (ImageOutputError, OutputLockError, OSError, TypeError, ValueError) as error:
+        return _result(GenerationStatus.LOCAL_FAILURE, error)
+
+    if not isinstance(result, GenerationResult):
+        return _result(
+            GenerationStatus.SUCCESS if result else GenerationStatus.LOCAL_FAILURE,
+            "generated" if result else "generation failed",
+            str(target.path) if result else None,
+        )
+    return result
+
+
+def generate_result(
+    prompt: str,
+    out_path: str,
+    retries: int = 2,
+    overwrite: bool = False,
+    progress: Optional[Callable[[str], None]] = None,
+) -> GenerationResult:
+    return _generate_result_with_lock(prompt, out_path, retries, overwrite, progress)
 
 
 def gen(
@@ -206,22 +300,18 @@ def gen(
     retries: int = 2,
     overwrite: bool = False,
 ) -> bool:
-    try:
-        retries = validate_retries(retries)
-    except ImageOutputError as error:
-        print(f"  ERR: {error}")
-        return False
-    try:
-        target = prepare_target(resolve_output_path(out_path))
-    except ImageOutputError as error:
-        print(f"  ERR: {error}")
-        return False
-    try:
-        with output_lock(prepared_lock_target(target)):
-            return _gen_owned(prompt, target, retries, overwrite)
-    except OutputLockError as error:
-        print(f"  ERR: {error}")
-        return False
+    result = generate_result(
+        prompt,
+        out_path,
+        retries=retries,
+        overwrite=overwrite,
+        progress=print,
+    )
+    if result.ok:
+        print(f"  OK: {result.output_path} ({result.safe_message})")
+    else:
+        print(f"  ERR: {result.safe_message}")
+    return result.ok
 
 
 def _parser() -> argparse.ArgumentParser:
