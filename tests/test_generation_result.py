@@ -95,6 +95,17 @@ class GenerationResultTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     GenerationResult(status, provider, channel, output_path)
 
+    def test_result_rejects_non_enum_status_values(self):
+        for status in ("unknown", "success"):
+            with self.subTest(status=status):
+                with self.assertRaises(ValueError):
+                    GenerationResult(status, "openai", "host")
+
+    def test_safe_message_redacts_overlapping_known_secrets(self):
+        result = safe_message("token=abcdef", secrets=("abc", "abcdef"))
+        self.assertNotIn("abcdef", result)
+        self.assertNotIn("def", result)
+
 
 if __name__ == "__main__":
     unittest.main()

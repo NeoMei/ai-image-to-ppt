@@ -36,6 +36,8 @@ class GenerationResult:
     safe_message: str = ""
 
     def __post_init__(self) -> None:
+        if not isinstance(self.status, GenerationStatus):
+            raise ValueError("status must be a GenerationStatus")
         if self.provider not in {"openai", "gemini", "doubao"}:
             raise ValueError("provider must be openai, gemini, or doubao")
         if self.channel not in {"host", "api"}:
@@ -80,9 +82,8 @@ def classify_http_failure(
 
 def safe_message(message: object, secrets: Iterable[str] = ()) -> str:
     text = str(message)
-    for secret in secrets:
-        if secret:
-            text = text.replace(secret, "[REDACTED]")
+    for secret in sorted((secret for secret in secrets if secret), key=len, reverse=True):
+        text = text.replace(secret, "[REDACTED]")
     text = re.sub(r"(?<![A-Za-z0-9_-])sk-[A-Za-z0-9_-]+", "[REDACTED]", text)
     text = re.sub(r"(?i)Bearer[ ]+[A-Za-z0-9._~+/-]+", "Bearer [REDACTED]", text)
     return text[:300]
