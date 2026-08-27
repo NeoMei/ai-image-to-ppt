@@ -102,12 +102,15 @@ class OpenAIGenerationTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp_dir:
             out_path = Path(temp_dir) / "slide.jpg"
+            output = io.StringIO()
             with mock.patch.dict(os.environ, {"OPENAI_API_KEY": "test-key"}, clear=True), \
-                 mock.patch.object(gen_slide_openai.urllib.request, "urlopen", return_value=response) as urlopen:
+                 mock.patch.object(gen_slide_openai.urllib.request, "urlopen", return_value=response) as urlopen, \
+                 redirect_stdout(output):
                 ok = gen_slide_openai.gen("draw a slide", str(out_path), retries=0)
 
             self.assertTrue(ok)
             self.assertEqual(out_path.read_bytes(), generated_image)
+            self.assertIn("(0KB, OpenAI gpt-image-2)", output.getvalue())
             request = urlopen.call_args.args[0]
             payload = json.loads(request.data)
             self.assertEqual(request.full_url, gen_slide_openai.API_URL)
@@ -119,6 +122,68 @@ class OpenAIGenerationTests(unittest.TestCase):
                 "quality": "medium",
                 "output_format": "jpeg",
             })
+
+    def test_gen_redacts_environment_key_from_success_and_final_failure_paths(self):
+        key = "known-test-key"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = Path(temp_dir) / key / "slide.jpg"
+            response = FakeResponse({
+                "data": [{"b64_json": base64.b64encode(image_bytes()).decode()}]
+            })
+            success_output = io.StringIO()
+            with mock.patch.dict(os.environ, {"OPENAI_API_KEY": key}, clear=True), \
+                 mock.patch.object(
+                     gen_slide_openai.urllib.request,
+                     "urlopen",
+                     return_value=response,
+                 ), \
+                 redirect_stdout(success_output):
+                self.assertTrue(gen_slide_openai.gen("prompt", str(target), retries=0))
+            self.assertNotIn(key, success_output.getvalue())
+            self.assertIn("(0KB, OpenAI gpt-image-2)", success_output.getvalue())
+
+            failure_output = io.StringIO()
+            with mock.patch.dict(os.environ, {"OPENAI_API_KEY": key}, clear=True), \
+                 mock.patch.object(
+                     gen_slide_openai,
+                     "output_lock",
+                     side_effect=gen_slide_openai.OutputLockError(f"locked {target}"),
+                 ), \
+                 mock.patch.object(gen_slide_openai.urllib.request, "urlopen") as urlopen, \
+                 redirect_stdout(failure_output):
+                self.assertFalse(gen_slide_openai.gen("prompt", str(target), retries=0))
+            self.assertNotIn(key, failure_output.getvalue())
+            self.assertEqual(failure_output.getvalue().count("  ERR:"), 1)
+            urlopen.assert_not_called()
+
+    def test_terminal_http_and_transport_errors_print_only_the_final_error(self):
+        failures = (
+            urllib.error.HTTPError(
+                gen_slide_openai.API_URL,
+                400,
+                "bad request",
+                {},
+                io.BytesIO(b'{"error":{"message":"bad input"}}'),
+            ),
+            urllib.error.URLError("temporary outage"),
+        )
+        for failure in failures:
+            with self.subTest(failure=type(failure).__name__), tempfile.TemporaryDirectory() as temp_dir, \
+                 mock.patch.dict(os.environ, {"OPENAI_API_KEY": "test-key"}, clear=True), \
+                 mock.patch.object(
+                     gen_slide_openai.urllib.request,
+                     "urlopen",
+                     side_effect=failure,
+                 ):
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    self.assertFalse(
+                        gen_slide_openai.gen(
+                            "prompt", str(Path(temp_dir) / "slide.jpg"), retries=0
+                        )
+                    )
+                self.assertEqual(output.getvalue().count("  ERR:"), 1)
+                self.assertNotIn("  HTTP", output.getvalue())
 
     def test_environment_overrides_model_size_and_quality(self):
         response = FakeResponse({

@@ -18,6 +18,7 @@ import gen_slide_doubao
 import gen_slide_gemini
 import gen_slide_openai
 import vision_check_gemini
+from generation_result import GenerationResult, GenerationStatus
 
 
 def image_bytes(image_format):
@@ -173,10 +174,19 @@ class ProviderAbsoluteOutputTests(unittest.TestCase):
 
                 os.chdir(temp)
                 try:
+                    owned_result = True
+                    if provider is gen_slide_openai:
+                        owned_result = GenerationResult(
+                            GenerationStatus.SUCCESS,
+                            "openai",
+                            "api",
+                            str(expected),
+                            "generated",
+                        )
                     with mock.patch.object(
                         provider, "output_lock", side_effect=changing_cwd_lock
                     ), mock.patch.object(
-                        provider, "_gen_owned", return_value=True
+                        provider, "_gen_owned", return_value=owned_result
                     ) as owned:
                         self.assertTrue(provider.gen("prompt", str(relative)))
                 finally:

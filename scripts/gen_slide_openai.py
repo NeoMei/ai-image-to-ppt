@@ -64,6 +64,12 @@ def _redact(message: object, key: str) -> str:
     return safe_message(message, (key,))
 
 
+def _environment_redaction_secrets() -> Sequence[str]:
+    """Collect the configured environment key only for early safe diagnostics."""
+    key = os.environ.get("OPENAI_API_KEY")
+    return (key,) if isinstance(key, str) and key else ()
+
+
 def _error_details(error: urllib.error.HTTPError, key: str):
     code = None
     message = None
@@ -113,13 +119,14 @@ def _result(
     status: GenerationStatus,
     message: object,
     output_path: Optional[str] = None,
+    secrets: Sequence[str] = (),
 ) -> GenerationResult:
     return GenerationResult(
         status,
         "openai",
         "api",
         output_path=output_path,
-        safe_message=safe_message(message),
+        safe_message=safe_message(message, secrets),
     )
 
 
@@ -129,20 +136,23 @@ def _gen_owned(
     retries: int = 2,
     overwrite: bool = False,
     progress: Optional[Callable[[str], None]] = None,
+    redaction_secrets: Sequence[str] = (),
 ) -> GenerationResult:
     """Generate while the caller owns a prepared output lock."""
     try:
         output_format_value = _output_format(str(target))
         preflight_output(target, overwrite=overwrite)
     except ImageOutputError as error:
-        return _result(GenerationStatus.LOCAL_FAILURE, error)
+        return _result(GenerationStatus.LOCAL_FAILURE, error, secrets=redaction_secrets)
 
     key = _load_api_key()
+    secrets = tuple(redaction_secrets) + ((key,) if isinstance(key, str) and key else ())
     if not key:
         return _result(
             GenerationStatus.AUTH_UNAVAILABLE,
             "OpenAI API key not found. Set OPENAI_API_KEY or create "
             "~/.secrets/openai_api_key",
+            secrets=secrets,
         )
     try:
         key = validate_api_key(key)
@@ -150,6 +160,7 @@ def _gen_owned(
         return _result(
             GenerationStatus.AUTH_UNAVAILABLE,
             f"OpenAI API key is invalid: {error}",
+            secrets=secrets,
         )
 
     payload = {
@@ -188,16 +199,17 @@ def _gen_owned(
                 )
             else:
                 message = remote_message
-            if progress is not None:
-                progress(f"  HTTP {error.code}: {message} (attempt {attempt + 1})")
-            if (
+            should_retry = (
                 status is GenerationStatus.RETRYABLE_EXHAUSTED
                 and (error.code == 429 or error.code >= 500)
                 and attempt < retries
-            ):
+            )
+            if should_retry:
+                if progress is not None:
+                    progress(f"  HTTP {error.code}: {message} (attempt {attempt + 1})")
                 time.sleep(retry_delay(attempt, error.headers))
                 continue
-            return _result(status, message)
+            return _result(status, message, secrets=secrets)
         except (
             ImageStreamError,
             urllib.error.URLError,
@@ -206,16 +218,21 @@ def _gen_owned(
             http.client.HTTPException,
         ) as error:
             message = _redact(error, key)
-            if progress is not None:
-                progress(f"  ERR: {message} (attempt {attempt + 1})")
             if attempt < retries:
+                if progress is not None:
+                    progress(f"  ERR: {message} (attempt {attempt + 1})")
                 time.sleep(retry_delay(attempt))
                 continue
-            return _result(GenerationStatus.RETRYABLE_EXHAUSTED, message)
+            return _result(
+                GenerationStatus.RETRYABLE_EXHAUSTED,
+                message,
+                secrets=secrets,
+            )
         except ImageOutputError as error:
             return _result(
                 GenerationStatus.INVALID_OUTPUT,
                 f"invalid provider response: {_redact(error, key)}",
+                secrets=secrets,
             )
 
         try:
@@ -224,6 +241,7 @@ def _gen_owned(
             return _result(
                 GenerationStatus.INVALID_OUTPUT,
                 "invalid JSON response from OpenAI",
+                secrets=secrets,
             )
 
         try:
@@ -233,6 +251,7 @@ def _gen_owned(
             return _result(
                 GenerationStatus.INVALID_OUTPUT,
                 f"invalid image response: {_redact(error, key)}",
+                secrets=secrets,
             )
         try:
             byte_count = publish_bytes(image, target, overwrite=overwrite)
@@ -240,15 +259,21 @@ def _gen_owned(
             return _result(
                 GenerationStatus.LOCAL_FAILURE,
                 f"output failure: {_redact(error, key)}",
+                secrets=secrets,
             )
 
         return _result(
             GenerationStatus.SUCCESS,
-            f"generated {byte_count // 1024}KB with OpenAI {_redact(payload['model'], key)}",
+            f"{byte_count // 1024}KB, OpenAI {_redact(payload['model'], key)}",
             str(target.path),
+            secrets=secrets,
         )
 
-    return _result(GenerationStatus.RETRYABLE_EXHAUSTED, "request retries exhausted")
+    return _result(
+        GenerationStatus.RETRYABLE_EXHAUSTED,
+        "request retries exhausted",
+        secrets=secrets,
+    )
 
 
 def _generate_result_with_lock(
@@ -258,6 +283,7 @@ def _generate_result_with_lock(
     overwrite: bool,
     progress: Optional[Callable[[str], None]],
 ) -> GenerationResult:
+    redaction_secrets = _environment_redaction_secrets()
     try:
         retries = validate_retries(retries)
         if not isinstance(prompt, str) or not prompt.strip():
@@ -266,20 +292,27 @@ def _generate_result_with_lock(
             raise ImageOutputError("overwrite must be a boolean")
         _output_format(out_path)
     except (ImageOutputError, TypeError, ValueError) as error:
-        return _result(GenerationStatus.INVALID_INPUT, error)
+        return _result(GenerationStatus.INVALID_INPUT, error, secrets=redaction_secrets)
 
     try:
         target = prepare_target(resolve_output_path(out_path))
         with output_lock(prepared_lock_target(target)):
-            result = _gen_owned(prompt, target, retries, overwrite, progress)
+            result = _gen_owned(
+                prompt,
+                target,
+                retries,
+                overwrite,
+                progress,
+                redaction_secrets,
+            )
     except (ImageOutputError, OutputLockError, OSError, TypeError, ValueError) as error:
-        return _result(GenerationStatus.LOCAL_FAILURE, error)
+        return _result(GenerationStatus.LOCAL_FAILURE, error, secrets=redaction_secrets)
 
     if not isinstance(result, GenerationResult):
         return _result(
-            GenerationStatus.SUCCESS if result else GenerationStatus.LOCAL_FAILURE,
-            "generated" if result else "generation failed",
-            str(target.path) if result else None,
+            GenerationStatus.LOCAL_FAILURE,
+            "internal generator returned an invalid result",
+            secrets=redaction_secrets,
         )
     return result
 
@@ -300,6 +333,7 @@ def gen(
     retries: int = 2,
     overwrite: bool = False,
 ) -> bool:
+    redaction_secrets = _environment_redaction_secrets()
     result = generate_result(
         prompt,
         out_path,
@@ -308,7 +342,10 @@ def gen(
         progress=print,
     )
     if result.ok:
-        print(f"  OK: {result.output_path} ({result.safe_message})")
+        print(
+            f"  OK: {safe_message(result.output_path, redaction_secrets)} "
+            f"({result.safe_message})"
+        )
     else:
         print(f"  ERR: {result.safe_message}")
     return result.ok

@@ -96,6 +96,47 @@ class OpenAIResultTests(unittest.TestCase):
         self.assertEqual(urlopen.call_count, 1)
         sleep.assert_not_called()
 
+    def test_non_result_owned_return_fails_closed_without_publishing(self):
+        with tempfile.TemporaryDirectory() as temp_dir, \
+             mock.patch.object(gen_slide_openai, "_gen_owned", return_value=True):
+            target = Path(temp_dir) / "slide.jpg"
+            result = gen_slide_openai.generate_result("prompt", str(target), retries=0)
+        self.assertEqual(result.status, GenerationStatus.LOCAL_FAILURE)
+        self.assertIsNone(result.output_path)
+        self.assertFalse(target.exists())
+
+    def test_early_local_failures_redact_environment_key_before_networking(self):
+        key = "known-test-key"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = Path(temp_dir) / key / "slide.jpg"
+            with mock.patch.dict(os.environ, {"OPENAI_API_KEY": key}, clear=True), \
+                 mock.patch.object(
+                     gen_slide_openai,
+                     "prepare_target",
+                     side_effect=ImageOutputError(f"cannot prepare {target}"),
+                 ), \
+                 mock.patch.object(gen_slide_openai.urllib.request, "urlopen") as urlopen:
+                prepared_failure = gen_slide_openai.generate_result(
+                    "prompt", str(target), retries=0
+                )
+            self.assertEqual(prepared_failure.status, GenerationStatus.LOCAL_FAILURE)
+            self.assertNotIn(key, prepared_failure.safe_message)
+            urlopen.assert_not_called()
+
+            with mock.patch.dict(os.environ, {"OPENAI_API_KEY": key}, clear=True), \
+                 mock.patch.object(
+                     gen_slide_openai,
+                     "output_lock",
+                     side_effect=gen_slide_openai.OutputLockError(f"locked {target}"),
+                 ), \
+                 mock.patch.object(gen_slide_openai.urllib.request, "urlopen") as urlopen:
+                lock_failure = gen_slide_openai.generate_result(
+                    "prompt", str(target), retries=0
+                )
+            self.assertEqual(lock_failure.status, GenerationStatus.LOCAL_FAILURE)
+            self.assertNotIn(key, lock_failure.safe_message)
+            urlopen.assert_not_called()
+
     def test_missing_or_invalid_key_stops_before_network(self):
         for key in ("", "bad key"):
             with self.subTest(key=repr(key)), tempfile.TemporaryDirectory() as temp_dir, \
