@@ -77,6 +77,10 @@ deliberately discovers and mutates the private recovery namespace (random and
 mode 0700) between syscalls is outside the portable ownership guarantee because
 POSIX has no unlink-if-inode primitive. Treat a reported retained path as
 sensitive and recover it manually.
+Recovery warnings begin with a complete ASCII locator such as
+`recovery=.image-output-recovery-<random>/entry relative-to-target-parent`.
+Resolve it against the known raw or master target parent. It is never truncated;
+only the following absolute-path diagnostic may be shortened.
 
 A materialization authorization failure is `auth_unavailable`; an exhausted
 timeout, 429, network error, or 5xx is `retryable_exhausted`; an explicit

@@ -89,6 +89,10 @@ deliberately discovers and mutates the private recovery namespace (random and
 mode 0700) between syscalls is outside the portable ownership guarantee; POSIX
 has no unlink-if-inode primitive. Treat every reported retained recovery path
 as sensitive and recover it manually before removing that directory.
+Recovery warnings begin with a complete ASCII locator such as
+`recovery=.image-output-recovery-<random>/entry relative-to-target-parent`.
+Resolve it against the known target parent; this locator is never truncated,
+even when the following absolute-path diagnostic is shortened.
 
 ## Editable-converter handoff
 

@@ -897,6 +897,73 @@ class DestructiveBoundaryTests(unittest.TestCase):
             self.assertEqual(len(lines), 1)
             self.assertIn(str(retained[0]), lines[0])
 
+    def test_deep_host_failure_reports_complete_relative_recovery_locator(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            components = [f"segment-{index}-" + ("x" * 54) for index in range(6)]
+            output = Path(*components) / "slide.png"
+            master = root / output
+            raw = master.parent / "raw" / master.name
+            raw.parent.mkdir(parents=True)
+            self.assertGreaterEqual(len(str(raw.parent)), 380)
+            original_master = image_bytes("PNG")
+            original_raw = image_bytes("PNG")
+            master.write_bytes(original_master)
+            raw.write_bytes(original_raw)
+            real_stat = image_output.os.stat
+            failed = False
+
+            def fail_first_entry_stat(path, *args, **kwargs):
+                nonlocal failed
+                if (
+                    not failed
+                    and path == "entry"
+                    and kwargs.get("dir_fd") is not None
+                ):
+                    failed = True
+                    raise OSError("injected deep recovery stat failure")
+                return real_stat(path, *args, **kwargs)
+
+            stderr = io.StringIO()
+            with mock.patch.object(
+                image_output.os,
+                "stat",
+                side_effect=fail_first_entry_stat,
+            ), redirect_stderr(stderr):
+                result = import_host_image.import_host_artifact(
+                    import_host_image.HostArtifact.inline_bytes(
+                        image_bytes("PNG"), "image/png"
+                    ),
+                    str(output),
+                    root,
+                    provider="openai",
+                    overwrite=True,
+                )
+
+            retained = list(raw.parent.glob(
+                ".image-output-recovery-*/entry"
+            ))
+            self.assertTrue(failed)
+            self.assertEqual(result.status, GenerationStatus.LOCAL_FAILURE)
+            self.assertEqual(len(retained), 1)
+            self.assertEqual(retained[0].read_bytes(), original_raw)
+            locator = f"{retained[0].parent.name}/entry"
+            self.assertRegex(
+                locator,
+                r"^\.image-output-recovery-[0-9a-f]{32}/entry$",
+            )
+            self.assertEqual(raw.parent / locator, retained[0])
+            locator.encode("ascii")
+            lines = stderr.getvalue().splitlines()
+            self.assertEqual(len(lines), 1)
+            self.assertLessEqual(len(lines[0]), 512)
+            self.assertIn(f"recovery={locator}", lines[0])
+            self.assertIn("relative-to-target-parent", lines[0])
+            for character in lines[0]:
+                codepoint = ord(character)
+                self.assertFalse(codepoint < 32 or 127 <= codepoint <= 159)
+                self.assertFalse(0xD800 <= codepoint <= 0xDFFF)
+
     def test_transaction_owned_removal_preserves_replacement_at_rename_boundary(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             target = Path(temp_dir) / "slide.png"
@@ -1108,6 +1175,44 @@ class DestructiveBoundaryTests(unittest.TestCase):
                 os.close(temporary.descriptor)
                 os.close(temporary.parent_fd)
 
+    def test_successful_publish_private_unlink_failure_warns_once_with_locator(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            target = root / "slide.jpg"
+            real_unlink = image_output.os.unlink
+            failed = False
+
+            def fail_private_unlink(path, *args, **kwargs):
+                nonlocal failed
+                if (
+                    not failed
+                    and path == "entry"
+                    and kwargs.get("dir_fd") is not None
+                ):
+                    failed = True
+                    raise PermissionError("injected private cleanup failure")
+                return real_unlink(path, *args, **kwargs)
+
+            stderr = io.StringIO()
+            with mock.patch.object(
+                image_output.os,
+                "unlink",
+                side_effect=fail_private_unlink,
+            ), redirect_stderr(stderr):
+                byte_count = image_output.publish_bytes(image_bytes(), target)
+
+            retained = list(root.glob(".image-output-recovery-*/entry"))
+            self.assertTrue(failed)
+            self.assertGreater(byte_count, 0)
+            self.assertTrue(target.is_file())
+            self.assertEqual(len(retained), 1)
+            self.assertEqual(retained[0].stat().st_ino, target.stat().st_ino)
+            lines = stderr.getvalue().splitlines()
+            self.assertEqual(len(lines), 1)
+            locator = f"{retained[0].parent.name}/entry"
+            self.assertIn(f"recovery={locator}", lines[0])
+            self.assertNotIn(".tmp", lines[0])
+
 
 class SafeDiagnosticTests(unittest.TestCase):
     ADVERSARIAL = "useful\r\n\x1b[31mRED\x1b[0m\x00\x85\ud800 tail"
@@ -1237,6 +1342,19 @@ class DocumentationCorrectionTests(unittest.TestCase):
                 self.assertIn("private recovery namespace", contents)
                 self.assertIn("outside", contents)
                 self.assertIn("unlink-if-inode", contents)
+
+    def test_docs_explain_complete_relative_recovery_locator(self):
+        documents = (
+            ROOT / "README.md",
+            ROOT / "SKILL.md",
+            ROOT / "references" / "host-image-routing.md",
+        )
+        for document in documents:
+            with self.subTest(document=document.name):
+                contents = document.read_text(encoding="utf-8")
+                self.assertIn("recovery=.image-output-recovery-", contents)
+                self.assertIn("relative-to-target-parent", contents)
+                self.assertIn("never truncated", contents)
 
     def test_skill_root_python_example_executes_from_repo_root(self):
         skill = (ROOT / "SKILL.md").read_text(encoding="utf-8")

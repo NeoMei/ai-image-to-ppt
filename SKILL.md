@@ -149,6 +149,10 @@ deliberately discovers and mutates the private recovery namespace (random and
 mode 0700) between syscalls is outside the portable guarantee because POSIX has
 no unlink-if-inode primitive; treat reported retained paths as sensitive and
 recover them manually.
+Recovery warnings begin with a complete ASCII locator such as
+`recovery=.image-output-recovery-<random>/entry relative-to-target-parent`.
+Resolve it against the known target parent. The locator is never truncated;
+only the following diagnostic detail may be shortened.
 Clearly over-limit manifests are rejected during path preflight, before image
 decoding. If source files change after preflight, actual loaded bytes are
 accumulated after each image load and rejected before PDF/PPTX serialization.
