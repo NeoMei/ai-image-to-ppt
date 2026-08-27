@@ -548,20 +548,31 @@ def load_image(
     return _load_image_data(data, verify=verify, copy_image=copy_image)
 
 
-def validate_image_bytes(data: bytes, target: object) -> LoadedImage:
+def validate_decoded_image_bytes(
+    data: bytes,
+    target: object,
+    copy_image: bool = False,
+) -> LoadedImage:
+    """Validate bounded, decodable image bytes and the requested file format."""
     if not isinstance(data, bytes) or not data:
         raise ImageOutputError("image data must be non-empty bytes")
     if len(data) > MAX_IMAGE_BYTES:
         raise ImageOutputError(
             f"image data exceeds maximum size of {MAX_IMAGE_BYTES} bytes"
         )
-    loaded = _load_image_data(data, verify=True, copy_image=False)
+    loaded = _load_image_data(data, verify=True, copy_image=copy_image)
     expected = PIL_FORMATS[output_format(str(target))]
     if loaded.image_format != expected:
         raise ImageOutputError(
             f"image format {loaded.image_format or '<unknown>'} does not match "
             f"{Path(str(target)).suffix.lower()}"
         )
+    return loaded
+
+
+def validate_image_bytes(data: bytes, target: object) -> LoadedImage:
+    """Validate a provider output, including the strict 16:9 public boundary."""
+    loaded = validate_decoded_image_bytes(data, target)
     if loaded.width * 9 != loaded.height * 16:
         raise ImageOutputError(
             f"generated image must be exactly 16:9; received "
@@ -927,6 +938,7 @@ def _cleanup_failed_temp(path: Union[str, TemporaryOutput]) -> None:
 def _validate_temp(
     path: Union[str, TemporaryOutput],
     target: TargetValue,
+    validator=validate_image_bytes,
 ) -> int:
     prepared = _as_prepared_target(target)
     try:
@@ -942,7 +954,7 @@ def _validate_temp(
         else:
             with Path(path).open("rb") as stream:
                 data = read_bounded_image_stream(stream)
-        loaded = validate_image_bytes(data, prepared)
+        loaded = validator(data, prepared)
     except ImageOutputError:
         raise
     return loaded.byte_count
@@ -1029,7 +1041,12 @@ def _publish_temp(
         )
 
 
-def publish_bytes(data: bytes, target: TargetValue, overwrite: bool = False) -> int:
+def _publish_image_bytes(
+    data: bytes,
+    target: TargetValue,
+    overwrite: bool,
+    validator,
+) -> int:
     if not isinstance(data, bytes) or not data:
         raise ImageOutputError("image data must be non-empty bytes")
     if len(data) > MAX_IMAGE_BYTES:
@@ -1043,7 +1060,10 @@ def publish_bytes(data: bytes, target: TargetValue, overwrite: bool = False) -> 
             output.write(data)
             output.flush()
             os.fsync(output.fileno())
-        byte_count = _validate_temp(temporary, target)
+        if validator is validate_image_bytes:
+            byte_count = _validate_temp(temporary, target)
+        else:
+            byte_count = _validate_temp(temporary, target, validator)
         _publish_temp(temporary, target, overwrite)
         published = True
         return byte_count
@@ -1062,6 +1082,29 @@ def publish_bytes(data: bytes, target: TargetValue, overwrite: bool = False) -> 
             os.close(temporary.parent_fd)
         except OSError:
             pass
+
+
+def publish_bytes(data: bytes, target: TargetValue, overwrite: bool = False) -> int:
+    """Publish an image only when it passes the strict shared 16:9 boundary."""
+    return _publish_image_bytes(data, target, overwrite, validate_image_bytes)
+
+
+def publish_decoded_image_bytes(
+    data: bytes,
+    target: TargetValue,
+    overwrite: bool = False,
+) -> int:
+    """Publish bounded image bytes after format/decode validation only.
+
+    This is for retaining an immutable raw artifact before a caller applies a
+    stricter, source-specific transform. It must not be used for API outputs.
+    """
+    return _publish_image_bytes(
+        data,
+        target,
+        overwrite,
+        validate_decoded_image_bytes,
+    )
 
 
 def publish_stream(

@@ -26,6 +26,10 @@ deterministic batch state; the Skill retains host discovery and host-tool calls.
 - Do not use browser automation, cookies, or extracted host tokens.
 - Generate page images serially. Cached pages do not change routing; a fallback
   moves only forward, and a successful page is never regenerated.
+- The host importer preserves an absolute workspace raw copy under
+  `raw/<filename>`. Only host artifacts within the 0.5% integer-checked
+  near-16:9 tolerance may be center-cropped (never stretched) into a strict
+  16:9 master; API outputs remain strict 16:9 without this exception.
 - Keep generated masters. Create exact `1280×720 PNG` files only for the
   editable-converter handoff.
 
@@ -97,8 +101,9 @@ Run a visual self-check for quantity-sensitive pages:
 python3 scripts/vision_check_gemini.py out/slide_01.jpg "精确数一下卡片数量是否正确?"
 ```
 
-For `image-to-editable-pptx`, preserve the strict-16:9 master and create a
-separate exact `1280×720 PNG`; this command does not create an editable PPTX:
+For `image-to-editable-pptx`, preserve the strict-16:9 master and its unchanged
+raw host copy, then create a separate exact `1280×720 PNG`; this command does
+not create an editable PPTX:
 
 ```bash
 python3 scripts/prepare_editable_input.py \

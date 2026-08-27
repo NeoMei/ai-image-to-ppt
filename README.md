@@ -60,19 +60,24 @@ vision check uses `gemini-3.6-flash`. Doubao uses the current
 `doubao-seedream-5-0-260128` default model. OpenAI and Doubao accept `.jpg`, `.jpeg`,
 `.png`, and `.webp`; Gemini accepts `.png`, `.jpg`, and `.jpeg`.
 
-All sources are decoded and checked for actual format and strict 16:9 before
-publication. Existing outputs are protected unless `--force` is explicit; use
-`--force` only for intentional replacement with rollback and crash-recovery
-protection. Image inputs and generation outputs are capped at 50 MiB and 64 MP.
-Vision-check inputs have a separate 14 MiB limit. Transient provider retries
-honor bounded `Retry-After` guidance. Parent-directory replacement is detected
-before publication and fails closed.
+All API sources are decoded and checked for actual format and strict 16:9 before
+publication. A host artifact is first retained unchanged at the absolute
+workspace sibling path `raw/<filename>`. The host importer alone may accept a
+near-16:9 image within a 0.5% integer cross-product tolerance, center-crop it
+(never stretch it) to the largest strict 16:9 master, and strictly revalidate
+the encoded master. API adapters never receive that tolerance or crop. Existing
+outputs are protected unless `--force` is explicit; use `--force` only for
+intentional replacement with rollback and crash-recovery protection. Image
+inputs and generation outputs are capped at 50 MiB and 64 MP. Vision-check
+inputs have a separate 14 MiB limit. Transient provider retries honor bounded
+`Retry-After` guidance. Parent-directory replacement is detected before
+publication and fails closed.
 
 ## Editable-converter handoff
 
-Keep the high-resolution 16:9 master. For `image-to-editable-pptx`, make a
-separate real exact `1280×720 PNG`; this is converter input, not an editable
-PPTX:
+Keep the high-resolution strict 16:9 master and unchanged raw host copy. For
+`image-to-editable-pptx`, make a separate real exact `1280×720 PNG`; this is
+converter input, not an editable PPTX:
 
 ```bash
 python3 scripts/prepare_editable_input.py \

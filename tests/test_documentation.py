@@ -53,6 +53,19 @@ class DocumentationTests(unittest.TestCase):
             self.assertIn("1280×720 PNG", document)
             self.assertIn("prepare_editable_input.py", document)
 
+    def test_host_near_ratio_normalization_contract_is_discoverable(self):
+        reference = (ROOT / "references/host-image-routing.md").read_text(
+            encoding="utf-8"
+        )
+        for document in (reference, self.readme, self.skill):
+            normalized = " ".join(document.split()).lower()
+            self.assertIn("0.5%", normalized)
+            self.assertIn("raw", normalized)
+            self.assertIn("center-crop", normalized)
+            self.assertIn("strict 16:9", normalized)
+        self.assertIn("raw/<filename>", reference)
+        self.assertIn("do not stretch", " ".join(reference.split()).lower())
+
     def test_readme_keeps_provider_and_safety_recovery_boundaries(self):
         normalized = " ".join(self.readme.split())
         for expected in (

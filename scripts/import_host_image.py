@@ -2,9 +2,11 @@
 """Safely import a host-generated slide image into one workspace."""
 
 import argparse
+import io
 import os
 import re
 import stat
+from contextlib import ExitStack
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -19,6 +21,7 @@ from image_output import (
     prepare_workspace_target,
     prepared_lock_target,
     preflight_output,
+    publish_decoded_image_bytes,
     publish_bytes,
     read_bounded_image_stream,
     resolve_input_path,
@@ -32,6 +35,9 @@ class HostArtifactKind(str, Enum):
     INLINE_BYTES = "inline_bytes"
     BASE64 = "base64"
     DATA_URL = "data_url"
+
+
+HOST_ASPECT_ERROR_DENOMINATOR = 200
 
 
 @dataclass(frozen=True)
@@ -155,6 +161,48 @@ def _validate_mime(mime_type: Optional[str], target: PreparedTarget) -> None:
         )
 
 
+def _raw_workspace_target(
+    target: PreparedTarget, workspace_root: object
+) -> PreparedTarget:
+    """Reserve the recoverable raw sibling before publishing a master."""
+    return prepare_workspace_target(
+        target.path.parent / "raw" / target.name,
+        workspace_root,
+    )
+
+
+def _normalize_host_image(data: bytes, target: PreparedTarget) -> bytes:
+    """Return strict host master bytes without relaxing API validation."""
+    loaded = image_output.validate_decoded_image_bytes(data, target, copy_image=True)
+    width, height = loaded.width, loaded.height
+    k = min(width // 16, height // 9)
+    if k < 1:
+        raise ImageOutputError("host image is too small for a 16:9 crop")
+    cross_product_error = abs(width * 9 - height * 16)
+    if cross_product_error * HOST_ASPECT_ERROR_DENOMINATOR > height * 16:
+        raise ImageOutputError("host image is outside the 0.5% 16:9 tolerance")
+
+    target_size = (16 * k, 9 * k)
+    if (width, height) == target_size:
+        return data
+
+    image = loaded.image
+    if image is None:
+        raise ImageOutputError("host image could not be decoded for normalization")
+    left = (width - target_size[0]) // 2
+    top = (height - target_size[1]) // 2
+    cropped = image.crop((left, top, left + target_size[0], top + target_size[1]))
+    try:
+        buffer = io.BytesIO()
+        cropped.save(
+            buffer,
+            format=image_output.PIL_FORMATS[image_output.output_format(str(target))],
+        )
+        return buffer.getvalue()
+    except (OSError, ValueError) as error:
+        raise ImageOutputError("host image could not be encoded after normalization") from error
+
+
 def import_host_artifact(
     artifact: HostArtifact,
     out_path: object,
@@ -173,8 +221,16 @@ def import_host_artifact(
     try:
         target = prepare_workspace_target(out_path, workspace_root)
         image_output.output_format(str(target))
-        with output_lock(prepared_lock_target(target)):
+        raw_target = _raw_workspace_target(target, workspace_root)
+        image_output.output_format(str(raw_target))
+        lock_targets = sorted(
+            (target, raw_target), key=lambda item: str(prepared_lock_target(item))
+        )
+        with ExitStack() as locks:
+            for lock_target in lock_targets:
+                locks.enter_context(output_lock(prepared_lock_target(lock_target)))
             target = preflight_output(target, overwrite=overwrite)
+            raw_target = preflight_output(raw_target, overwrite=overwrite)
             try:
                 data, mime_type = _artifact_bytes(artifact)
             except OSError:
@@ -191,8 +247,9 @@ def import_host_artifact(
                 )
 
             try:
-                validate_image_bytes(data, target)
                 _validate_mime(mime_type, target)
+                normalized = _normalize_host_image(data, target)
+                validate_image_bytes(normalized, target)
             except ImageOutputError:
                 return _failure(
                     GenerationStatus.INVALID_OUTPUT,
@@ -201,7 +258,8 @@ def import_host_artifact(
                 )
 
             try:
-                publish_bytes(data, target, overwrite=overwrite)
+                publish_decoded_image_bytes(data, raw_target, overwrite=overwrite)
+                publish_bytes(normalized, target, overwrite=overwrite)
             except ImageOutputError:
                 return _failure(
                     GenerationStatus.LOCAL_FAILURE,

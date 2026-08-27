@@ -17,6 +17,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 import image_output
 import import_host_image
+import prepare_editable_input
 from generation_result import GenerationStatus
 from output_lock import OutputLockBusy
 
@@ -27,11 +28,181 @@ def image_bytes(image_format="JPEG", size=(160, 90)):
     return buffer.getvalue()
 
 
+def patterned_image_bytes(image_format="PNG", size=(1672, 941), mode="RGB"):
+    """Create a near-16:9 image whose cropped center is observable."""
+    image = Image.new(mode, size, (20, 30, 40, 128) if mode == "RGBA" else (20, 30, 40))
+    for y, color in (
+        (0, (255, 0, 0, 64) if mode == "RGBA" else (255, 0, 0)),
+        (2, (0, 255, 0, 128) if mode == "RGBA" else (0, 255, 0)),
+        (937, (0, 0, 255, 192) if mode == "RGBA" else (0, 0, 255)),
+        (940, (255, 255, 0, 255) if mode == "RGBA" else (255, 255, 0)),
+    ):
+        if y < size[1]:
+            for x in range(size[0]):
+                image.putpixel((x, y), color)
+    buffer = io.BytesIO()
+    image.save(buffer, format=image_format)
+    return buffer.getvalue()
+
+
 def assert_no_temp_files(test_case, root, target_name="slide.jpg"):
     test_case.assertEqual(list(root.glob(f".{target_name}.*.tmp")), [])
 
 
 class HostImageImportTests(unittest.TestCase):
+    def test_near_ratio_png_is_central_cropped_after_raw_workspace_copy(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "host-source.png"
+            source_bytes = patterned_image_bytes(mode="RGBA")
+            source.write_bytes(source_bytes)
+
+            result = import_host_image.import_host_artifact(
+                import_host_image.HostArtifact.local_path(str(source)),
+                "out/slide.png",
+                root,
+                provider="openai",
+            )
+
+            master = root / "out" / "slide.png"
+            raw = root / "out" / "raw" / "slide.png"
+            self.assertEqual(result.status, GenerationStatus.SUCCESS)
+            self.assertEqual(Path(result.output_path), master.resolve())
+            self.assertEqual(source.read_bytes(), source_bytes)
+            self.assertEqual(raw.read_bytes(), source_bytes)
+            self.assertNotEqual(master.read_bytes(), source_bytes)
+            self.assertTrue(master.is_absolute())
+            with Image.open(master) as image:
+                self.assertEqual(image.format, "PNG")
+                self.assertEqual(image.size, (1664, 936))
+                self.assertEqual(image.mode, "RGBA")
+                self.assertEqual(image.getpixel((800, 0)), (0, 255, 0, 128))
+                self.assertEqual(image.getpixel((800, 935)), (0, 0, 255, 192))
+            image_output.validate_image_bytes(master.read_bytes(), master)
+
+    def test_near_ratio_is_normalized_before_strict_validation(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source_bytes = patterned_image_bytes()
+            calls = []
+            original_validate = import_host_image.validate_image_bytes
+
+            def capture_strict_validation(data, target):
+                calls.append(data)
+                return original_validate(data, target)
+
+            with mock.patch.object(
+                import_host_image,
+                "validate_image_bytes",
+                side_effect=capture_strict_validation,
+            ):
+                result = import_host_image.import_host_artifact(
+                    import_host_image.HostArtifact.inline_bytes(
+                        source_bytes, "image/png"
+                    ),
+                    "slide.png",
+                    root,
+                    provider="openai",
+                )
+
+            self.assertEqual(result.status, GenerationStatus.SUCCESS)
+            self.assertEqual(len(calls), 1)
+            self.assertNotEqual(calls[0], source_bytes)
+
+    def test_exact_ratio_host_image_retains_existing_master_bytes_and_raw_copy(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source_bytes = image_bytes("JPEG", (160, 90))
+            result = import_host_image.import_host_artifact(
+                import_host_image.HostArtifact.inline_bytes(source_bytes, "image/jpeg"),
+                "out/slide.jpg",
+                root,
+                provider="openai",
+            )
+
+            self.assertEqual(result.status, GenerationStatus.SUCCESS)
+            self.assertEqual((root / "out" / "slide.jpg").read_bytes(), source_bytes)
+            self.assertEqual((root / "out" / "raw" / "slide.jpg").read_bytes(), source_bytes)
+
+    def test_host_ratio_threshold_is_inclusive_by_integer_cross_product(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            # abs(3216 * 9 - 1800 * 16) / (1800 * 16) == 0.005 exactly.
+            result = import_host_image.import_host_artifact(
+                import_host_image.HostArtifact.inline_bytes(
+                    image_bytes("JPEG", (3216, 1800)), "image/jpeg"
+                ),
+                "slide.jpg",
+                root,
+                provider="openai",
+            )
+
+            self.assertEqual(result.status, GenerationStatus.SUCCESS)
+            with Image.open(root / "slide.jpg") as image:
+                self.assertEqual(image.format, "JPEG")
+                self.assertEqual(image.size, (3200, 1800))
+
+    def test_host_ratio_just_over_threshold_is_invalid_and_force_preserves_target(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            target = root / "slide.jpg"
+            target.write_bytes(image_bytes("JPEG", (160, 90)))
+            before = target.read_bytes()
+
+            result = import_host_image.import_host_artifact(
+                import_host_image.HostArtifact.inline_bytes(
+                    image_bytes("JPEG", (3217, 1800)), "image/jpeg"
+                ),
+                "slide.jpg",
+                root,
+                provider="openai",
+                overwrite=True,
+            )
+
+            self.assertEqual(result.status, GenerationStatus.INVALID_OUTPUT)
+            self.assertEqual(target.read_bytes(), before)
+            self.assertFalse((root / "raw" / "slide.jpg").exists())
+
+    def test_host_image_too_small_to_contain_a_16_by_9_rectangle_is_invalid(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            target = image_output.prepare_workspace_target("slide.png", root)
+            with self.assertRaisesRegex(image_output.ImageOutputError, "too small"):
+                import_host_image._normalize_host_image(
+                    image_bytes("PNG", (15, 9)), target
+                )
+            result = import_host_image.import_host_artifact(
+                import_host_image.HostArtifact.inline_bytes(
+                    image_bytes("PNG", (15, 9)), "image/png"
+                ),
+                "slide.png",
+                root,
+                provider="openai",
+            )
+            self.assertEqual(result.status, GenerationStatus.INVALID_OUTPUT)
+            self.assertFalse((root / "slide.png").exists())
+            self.assertFalse((root / "raw" / "slide.png").exists())
+
+    def test_normalized_master_can_be_prepared_as_a_distinct_editable_png(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            result = import_host_image.import_host_artifact(
+                import_host_image.HostArtifact.inline_bytes(
+                    patterned_image_bytes(), "image/png"
+                ),
+                "out/master.png",
+                root,
+                provider="openai",
+            )
+            master = Path(result.output_path)
+            editable = root / "out" / "editable" / "slide.png"
+
+            self.assertEqual(result.status, GenerationStatus.SUCCESS)
+            self.assertTrue(prepare_editable_input.prepare(str(master), str(editable)))
+            self.assertNotEqual(editable, master)
+            with Image.open(editable) as image:
+                self.assertEqual(image.format, "PNG")
+                self.assertEqual(image.size, (1280, 720))
     def test_local_file_is_validated_and_published_inside_workspace(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

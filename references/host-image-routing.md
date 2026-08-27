@@ -46,11 +46,25 @@ python3 scripts/import_host_image.py \
   --json
 ```
 
-The importer validates, copies, and atomically publishes the master under the
-workspace. A materialization authorization failure is `auth_unavailable`; an
-exhausted timeout, 429, network error, or 5xx is `retryable_exhausted`; an
-explicit safety refusal is `policy_refused`; missing or undecodable content is
-`invalid_output`; and workspace write or publication failure is `local_failure`.
+The importer first copies the accepted host bytes unchanged to the absolute
+workspace path `out/raw/<filename>` (for this example,
+`/absolute/workspace/out/raw/slide_01.png`). That raw artifact is recoverable;
+it is never resized or overwritten by the master-normalization step.
+
+Host artifacts alone may be within a 0.5% relative 16:9 error, evaluated with
+integer cross-products. Exact 16:9 host bytes retain the existing master
+publication behavior. A qualifying near-ratio artifact is center-cropped; do
+not stretch it. Crop to the largest contained `16*k × 9*k` master, then strict 16:9
+validation is applied to the newly encoded PNG/JPEG before atomic publication.
+For example, a 1672×941 PNG becomes a 1664×936 PNG master. MIME and actual
+format must still match the requested suffix. The OpenAI, Gemini, and Doubao
+API adapters remain strict 16:9: they do not receive this tolerance or crop.
+
+A materialization authorization failure is `auth_unavailable`; an exhausted
+timeout, 429, network error, or 5xx is `retryable_exhausted`; an explicit
+safety refusal is `policy_refused`; missing, undecodable, too-small,
+MIME/format-mismatched, or over-tolerance content is `invalid_output`; and
+workspace write or publication failure is `local_failure`.
 
 ## API/CLI-only adapter
 
@@ -92,4 +106,6 @@ python3 scripts/prepare_editable_input.py \
   out/editable/slide_01.png
 ```
 
-Do not overwrite the master or silently crop a non-16:9 artifact.
+Do not overwrite the master or raw artifact. The host importer is the only
+place that can center-crop a qualifying near-16:9 host artifact; this handoff
+accepts the resulting strict 16:9 master and never stretches it.
