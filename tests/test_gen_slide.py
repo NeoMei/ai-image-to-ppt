@@ -110,6 +110,52 @@ class RouterTests(unittest.TestCase):
         self.assertEqual(json.loads(stdout.getvalue())["status"], "auth_unavailable")
         self.assertEqual(len(stdout.getvalue().splitlines()), 1)
 
+    def test_json_cli_discards_lazy_import_stdout_before_emitting_result(self):
+        expected = GenerationResult(
+            GenerationStatus.AUTH_UNAVAILABLE,
+            "openai",
+            "api",
+            safe_message="missing key",
+        )
+        provider = SimpleNamespace(generate_result=mock.Mock(return_value=expected))
+
+        def noisy_import(module_name):
+            print(f"unexpected import output from {module_name}")
+            return provider
+
+        stdout = io.StringIO()
+        with mock.patch.object(gen_slide.importlib, "import_module", side_effect=noisy_import), \
+             redirect_stdout(stdout):
+            exit_code = gen_slide.main(["slide.jpg", "prompt", "--json"])
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(json.loads(stdout.getvalue())["status"], "auth_unavailable")
+        self.assertEqual(len(stdout.getvalue().splitlines()), 1)
+        self.assertNotIn("unexpected import output", stdout.getvalue())
+
+    def test_json_cli_discards_provider_stdout_before_emitting_result(self):
+        expected = GenerationResult(
+            GenerationStatus.AUTH_UNAVAILABLE,
+            "openai",
+            "api",
+            safe_message="missing key",
+        )
+
+        def noisy_generate(*args, **kwargs):
+            print("unexpected provider output with sk-not-a-real-secret")
+            return expected
+
+        provider = SimpleNamespace(generate_result=noisy_generate)
+        stdout = io.StringIO()
+        with mock.patch.object(gen_slide.importlib, "import_module", return_value=provider), \
+             redirect_stdout(stdout):
+            exit_code = gen_slide.main(["slide.jpg", "prompt", "--json"])
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(json.loads(stdout.getvalue())["status"], "auth_unavailable")
+        self.assertEqual(len(stdout.getvalue().splitlines()), 1)
+        self.assertNotIn("sk-not-a-real-secret", stdout.getvalue())
+
     def test_cli_passes_explicit_engine_and_retry_count(self):
         result = GenerationResult(
             GenerationStatus.POLICY_REFUSED,
@@ -211,6 +257,39 @@ class RouterTests(unittest.TestCase):
             result = gen_slide.generate_result("prompt", "slide.jpg")
         self.assertEqual(result.status, GenerationStatus.LOCAL_FAILURE)
 
+    def test_structured_router_rejects_misaligned_provider_results(self):
+        invalid_results = (
+            GenerationResult(
+                GenerationStatus.SUCCESS,
+                "gemini",
+                "api",
+                output_path="/workspace/slide.jpg",
+            ),
+            GenerationResult(
+                GenerationStatus.AUTH_UNAVAILABLE,
+                "openai",
+                "host",
+                safe_message="wrong channel",
+            ),
+        )
+        for provider_result in invalid_results:
+            with self.subTest(provider_result=provider_result), mock.patch.object(
+                gen_slide.importlib,
+                "import_module",
+                return_value=SimpleNamespace(
+                    generate_result=mock.Mock(return_value=provider_result)
+                ),
+            ):
+                result = gen_slide.generate_result("prompt", "slide.jpg")
+            self.assertEqual(result.status, GenerationStatus.LOCAL_FAILURE)
+            self.assertEqual(result.provider, "openai")
+            self.assertEqual(result.channel, "api")
+            self.assertIsNone(result.output_path)
+            self.assertEqual(
+                result.safe_message,
+                "requested API provider returned an invalid result",
+            )
+
     def test_json_cli_success_includes_absolute_output_path(self):
         result = GenerationResult(
             GenerationStatus.SUCCESS,
@@ -226,6 +305,34 @@ class RouterTests(unittest.TestCase):
         payload = json.loads(stdout.getvalue())
         self.assertEqual(exit_code, 0)
         self.assertEqual(payload["output_path"], "/workspace/slide.jpg")
+
+    def test_cli_human_summaries_normalize_untrusted_control_characters(self):
+        unsafe_message = "first\nsecond\r\x1b[31mred\x1b[0m\tthird\x85"
+        cases = (
+            GenerationResult(
+                GenerationStatus.SUCCESS,
+                "openai",
+                "api",
+                output_path="/workspace/slide.jpg",
+                safe_message=unsafe_message,
+            ),
+            GenerationResult(
+                GenerationStatus.LOCAL_FAILURE,
+                "openai",
+                "api",
+                safe_message=unsafe_message,
+            ),
+        )
+        for result in cases:
+            with self.subTest(status=result.status), mock.patch.object(
+                gen_slide, "generate_result", return_value=result
+            ), redirect_stdout(io.StringIO()) as stdout:
+                exit_code = gen_slide.main(["slide.jpg", "prompt"])
+            summary = stdout.getvalue()
+            self.assertEqual(exit_code, 0 if result.ok else 1)
+            self.assertEqual(summary.count("\n"), 1)
+            self.assertNotRegex(summary.rstrip("\n"), r"[\x00-\x1f\x7f-\x9f]")
+            self.assertIn("first second red third", summary)
 
     def test_cli_rejects_negative_retries_with_usage_error(self):
         stderr = io.StringIO()

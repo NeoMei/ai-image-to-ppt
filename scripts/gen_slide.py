@@ -3,6 +3,9 @@
 
 import argparse
 import importlib
+import io
+import re
+from contextlib import redirect_stdout
 from typing import Callable, Optional, Sequence
 
 from generation_result import GenerationResult, GenerationStatus, safe_message
@@ -14,6 +17,10 @@ ENGINE_MODULES = {
     "doubao": "gen_slide_doubao",
 }
 DEFAULT_ENGINE = "openai"
+_ANSI_ESCAPE = re.compile(
+    r"\x1b(?:\][^\x1b\x07]*(?:\x07|\x1b\\)|[@-_][0-?]*[ -/]*[@-~]|[0-?]*[ -/]*[@-~])"
+)
+_CONTROL_CHARACTERS = re.compile(r"[\x00-\x1f\x7f-\x9f]+")
 
 
 def _non_negative_int(value: str) -> int:
@@ -92,13 +99,32 @@ def generate_result(
             engine,
             "requested API provider failed locally",
         )
-    if not isinstance(result, GenerationResult):
+    if (
+        not isinstance(result, GenerationResult)
+        or result.provider != engine
+        or result.channel != "api"
+    ):
         return _result(
             GenerationStatus.LOCAL_FAILURE,
             engine,
             "requested API provider returned an invalid result",
         )
     return result
+
+
+def _single_line_safe_text(value: object) -> str:
+    text = _ANSI_ESCAPE.sub("", str(value))
+    text = _CONTROL_CHARACTERS.sub(" ", text)
+    return " ".join(safe_message(text).split())
+
+
+def _human_summary(result: GenerationResult) -> str:
+    message = _single_line_safe_text(result.safe_message)
+    if result.ok:
+        output_path = _single_line_safe_text(result.output_path)
+        detail = f" ({message})" if message else ""
+        return f"  OK: {output_path}{detail}"
+    return f"  ERR: {message}"
 
 
 def gen(
@@ -165,20 +191,27 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = _parser().parse_args(argv)
-    result = generate_result(
-        args.prompt,
-        args.out_path,
-        engine=args.engine,
-        retries=args.retries,
-        overwrite=args.force,
-        progress=None,
-    )
     if args.json:
+        with redirect_stdout(io.StringIO()):
+            result = generate_result(
+                args.prompt,
+                args.out_path,
+                engine=args.engine,
+                retries=args.retries,
+                overwrite=args.force,
+                progress=None,
+            )
         print(result.to_json())
-    elif result.ok:
-        print(f"  OK: {safe_message(result.output_path)} ({safe_message(result.safe_message)})")
     else:
-        print(f"  ERR: {safe_message(result.safe_message)}")
+        result = generate_result(
+            args.prompt,
+            args.out_path,
+            engine=args.engine,
+            retries=args.retries,
+            overwrite=args.force,
+            progress=None,
+        )
+        print(_human_summary(result))
     return 0 if result.ok else 1
 
 
