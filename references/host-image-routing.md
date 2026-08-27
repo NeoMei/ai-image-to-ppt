@@ -72,6 +72,11 @@ single-syscall atomic replacement: it atomically isolates the current pathname,
 verifies the inode actually moved, and then installs without clobbering. An
 unexpected file or failed cleanup is retained under
 `.image-output-recovery-*/entry` and reported instead of being deleted.
+Cooperating processes may race public target names. A same-UID actor that
+deliberately discovers and mutates the private recovery namespace (random and
+mode 0700) between syscalls is outside the portable ownership guarantee because
+POSIX has no unlink-if-inode primitive. Treat a reported retained path as
+sensitive and recover it manually.
 
 A materialization authorization failure is `auth_unavailable`; an exhausted
 timeout, 429, network error, or 5xx is `retryable_exhausted`; an explicit

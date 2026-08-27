@@ -412,7 +412,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("output_path", help="Output .png (default), .jpg, or .jpeg")
     parser.add_argument("prompt", help="Slide image prompt")
     parser.add_argument(
-        "--force", action="store_true", help="Atomically replace an existing output"
+        "--force",
+        action="store_true",
+        help=(
+            "Conditionally perform ownership-preserving replacement; "
+            "target may be briefly absent"
+        ),
     )
     return parser
 

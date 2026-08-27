@@ -429,6 +429,474 @@ class UnsupportedPublicationPlatformTests(unittest.TestCase):
 
 
 class DestructiveBoundaryTests(unittest.TestCase):
+    def test_recovery_directory_must_remain_empty_before_use(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            target = root / "slide.jpg"
+            original = image_bytes()
+            target.write_bytes(original)
+            prepared = image_output.preflight_output(target, overwrite=True)
+            external = b"same-directory-injected-entry"
+            recovery_path = None
+            injected = False
+            real_open = image_output.os.open
+
+            def populate_recovery_before_open(path, flags, *args, **kwargs):
+                nonlocal injected, recovery_path
+                parent_fd = kwargs.get("dir_fd")
+                if (
+                    not injected
+                    and parent_fd is not None
+                    and isinstance(path, str)
+                    and path.startswith(".image-output-recovery-")
+                ):
+                    injected = True
+                    recovery_fd = real_open(
+                        path,
+                        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+                        dir_fd=parent_fd,
+                    )
+                    try:
+                        entry_fd = real_open(
+                            "entry",
+                            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                            0o600,
+                            dir_fd=recovery_fd,
+                        )
+                        with os.fdopen(entry_fd, "wb") as stream:
+                            stream.write(external)
+                    finally:
+                        os.close(recovery_fd)
+                    recovery_path = root / path / "entry"
+                return real_open(path, flags, *args, **kwargs)
+
+            stderr = io.StringIO()
+            with mock.patch.object(
+                image_output.os,
+                "open",
+                side_effect=populate_recovery_before_open,
+            ), redirect_stderr(stderr), self.assertRaises(
+                image_output.ImageOutputError
+            ):
+                image_output.publish_bytes(
+                    image_bytes(), prepared, overwrite=True
+                )
+
+            self.assertTrue(injected)
+            self.assertEqual(target.read_bytes(), original)
+            self.assertIsNotNone(recovery_path)
+            self.assertEqual(recovery_path.read_bytes(), external)
+            self.assertEqual(len(stderr.getvalue().splitlines()), 1)
+
+    def test_recovery_directory_metadata_requires_current_owner_and_mode_0700(self):
+        geteuid = getattr(image_output.os, "geteuid", None)
+        if not callable(geteuid):
+            self.skipTest("current-user ownership checks require geteuid")
+        current_uid = geteuid()
+        wrong_mode = mock.Mock(
+            st_mode=image_output.stat.S_IFDIR | 0o750,
+            st_dev=1,
+            st_ino=2,
+            st_uid=current_uid,
+        )
+        with self.assertRaisesRegex(
+            image_output.ImageOutputError, "permissions are not 0700"
+        ):
+            image_output._validate_recovery_directory_metadata(wrong_mode)
+
+        wrong_owner = mock.Mock(
+            st_mode=image_output.stat.S_IFDIR | 0o700,
+            st_dev=1,
+            st_ino=2,
+            st_uid=current_uid + 1,
+        )
+        with self.assertRaisesRegex(
+            image_output.ImageOutputError, "owner is not current user"
+        ):
+            image_output._validate_recovery_directory_metadata(wrong_owner)
+
+    def test_recovery_directory_swap_before_open_preserves_external_namespace(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            target = root / "slide.jpg"
+            original = image_bytes()
+            target.write_bytes(original)
+            prepared = image_output.preflight_output(target, overwrite=True)
+            external = b"external-private-recovery-entry"
+            external_identity = None
+            recovery_path = None
+            swapped = False
+            real_open = image_output.os.open
+            real_mkdir = image_output.os.mkdir
+            real_rmdir = image_output.os.rmdir
+
+            def swap_recovery_before_open(path, flags, *args, **kwargs):
+                nonlocal external_identity, recovery_path, swapped
+                parent_fd = kwargs.get("dir_fd")
+                if (
+                    not swapped
+                    and parent_fd is not None
+                    and isinstance(path, str)
+                    and path.startswith(".image-output-recovery-")
+                ):
+                    swapped = True
+                    real_rmdir(path, dir_fd=parent_fd)
+                    real_mkdir(path, 0o700, dir_fd=parent_fd)
+                    replacement_fd = real_open(
+                        path,
+                        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+                        dir_fd=parent_fd,
+                    )
+                    try:
+                        entry_fd = real_open(
+                            "entry",
+                            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                            0o600,
+                            dir_fd=replacement_fd,
+                        )
+                        with os.fdopen(entry_fd, "wb") as stream:
+                            stream.write(external)
+                    finally:
+                        os.close(replacement_fd)
+                    recovery_path = root / path / "entry"
+                    current = recovery_path.stat()
+                    external_identity = (current.st_dev, current.st_ino)
+                return real_open(path, flags, *args, **kwargs)
+
+            stderr = io.StringIO()
+            with mock.patch.object(
+                image_output.os,
+                "open",
+                side_effect=swap_recovery_before_open,
+            ), redirect_stderr(stderr), self.assertRaises(
+                image_output.ImageOutputError
+            ):
+                image_output.publish_bytes(
+                    image_bytes(), prepared, overwrite=True
+                )
+
+            self.assertTrue(swapped)
+            self.assertEqual(target.read_bytes(), original)
+            self.assertIsNotNone(recovery_path)
+            self.assertEqual(recovery_path.read_bytes(), external)
+            self.assertEqual(
+                (recovery_path.stat().st_dev, recovery_path.stat().st_ino),
+                external_identity,
+            )
+            self.assertEqual(len(stderr.getvalue().splitlines()), 1)
+
+    def test_cleanup_does_not_remove_replacement_recovery_directory(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            prepared = image_output.preflight_output(root / "slide.jpg")
+            parent_fd = image_output._open_verified_parent(prepared)
+            quarantine = image_output._new_quarantine(
+                parent_fd, prepared.parent
+            )
+            held_name = f"{quarantine.directory_name}.held"
+            os.rename(
+                quarantine.directory_name,
+                held_name,
+                src_dir_fd=parent_fd,
+                dst_dir_fd=parent_fd,
+            )
+            os.mkdir(quarantine.directory_name, 0o700, dir_fd=parent_fd)
+            replacement_path = root / quarantine.directory_name
+            replacement_identity = (
+                replacement_path.stat().st_dev,
+                replacement_path.stat().st_ino,
+            )
+            stderr = io.StringIO()
+            try:
+                with redirect_stderr(stderr):
+                    removed = image_output._cleanup_recovery_directory(
+                        quarantine,
+                        "recovery directory cleanup was incomplete",
+                    )
+                self.assertFalse(removed)
+                self.assertTrue(replacement_path.is_dir())
+                self.assertEqual(
+                    (
+                        replacement_path.stat().st_dev,
+                        replacement_path.stat().st_ino,
+                    ),
+                    replacement_identity,
+                )
+                self.assertEqual(len(stderr.getvalue().splitlines()), 1)
+            finally:
+                if replacement_path.exists():
+                    os.rmdir(quarantine.directory_name, dir_fd=parent_fd)
+                held_path = root / held_name
+                if held_path.exists():
+                    os.rmdir(held_name, dir_fd=parent_fd)
+                os.close(parent_fd)
+
+    def test_cleanup_rmdir_failure_is_reported_and_preserved(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            prepared = image_output.preflight_output(root / "slide.jpg")
+            parent_fd = image_output._open_verified_parent(prepared)
+            quarantine = image_output._new_quarantine(
+                parent_fd, prepared.parent
+            )
+            real_rmdir = image_output.os.rmdir
+
+            def fail_recovery_rmdir(path, *args, **kwargs):
+                if path == quarantine.directory_name:
+                    raise PermissionError("injected recovery rmdir failure")
+                return real_rmdir(path, *args, **kwargs)
+
+            stderr = io.StringIO()
+            try:
+                with mock.patch.object(
+                    image_output.os,
+                    "rmdir",
+                    side_effect=fail_recovery_rmdir,
+                ), redirect_stderr(stderr):
+                    removed = image_output._cleanup_recovery_directory(
+                        quarantine,
+                        "recovery directory cleanup was incomplete",
+                    )
+                self.assertFalse(removed)
+                self.assertTrue((root / quarantine.directory_name).is_dir())
+                self.assertEqual(len(stderr.getvalue().splitlines()), 1)
+                self.assertIn(
+                    str(root / quarantine.directory_name), stderr.getvalue()
+                )
+            finally:
+                recovery_path = root / quarantine.directory_name
+                if recovery_path.exists():
+                    real_rmdir(quarantine.directory_name, dir_fd=parent_fd)
+                os.close(parent_fd)
+
+    def test_recovery_directory_replacement_at_failing_rmdir_is_preserved(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            prepared = image_output.preflight_output(root / "slide.jpg")
+            parent_fd = image_output._open_verified_parent(prepared)
+            quarantine = image_output._new_quarantine(
+                parent_fd, prepared.parent
+            )
+            held_name = f"{quarantine.directory_name}.held"
+            replacement_identity = None
+            real_rmdir = image_output.os.rmdir
+
+            def replace_then_fail_rmdir(path, *args, **kwargs):
+                nonlocal replacement_identity
+                if path == quarantine.directory_name:
+                    os.rename(
+                        path,
+                        held_name,
+                        src_dir_fd=parent_fd,
+                        dst_dir_fd=parent_fd,
+                    )
+                    os.mkdir(path, 0o700, dir_fd=parent_fd)
+                    replacement = root / path
+                    current = replacement.stat()
+                    replacement_identity = (current.st_dev, current.st_ino)
+                    raise PermissionError("injected rmdir-boundary replacement")
+                return real_rmdir(path, *args, **kwargs)
+
+            stderr = io.StringIO()
+            try:
+                with mock.patch.object(
+                    image_output.os,
+                    "rmdir",
+                    side_effect=replace_then_fail_rmdir,
+                ), redirect_stderr(stderr):
+                    removed = image_output._cleanup_recovery_directory(
+                        quarantine,
+                        "recovery directory cleanup was incomplete",
+                    )
+                replacement = root / quarantine.directory_name
+                self.assertFalse(removed)
+                self.assertEqual(
+                    (replacement.stat().st_dev, replacement.stat().st_ino),
+                    replacement_identity,
+                )
+                self.assertEqual(len(stderr.getvalue().splitlines()), 1)
+            finally:
+                replacement = root / quarantine.directory_name
+                if replacement.exists():
+                    real_rmdir(quarantine.directory_name, dir_fd=parent_fd)
+                held = root / held_name
+                if held.exists():
+                    real_rmdir(held_name, dir_fd=parent_fd)
+                os.close(parent_fd)
+
+    def test_private_entry_replacement_before_unlink_check_is_retained(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            target = root / "slide.jpg"
+            target.write_bytes(image_bytes())
+            prepared = image_output.preflight_output(target, overwrite=True)
+            parent_fd = image_output._open_verified_parent(prepared)
+            quarantine = image_output._displace_to_quarantine(
+                parent_fd,
+                prepared.parent,
+                prepared.name,
+            )
+            self.assertIsNotNone(quarantine)
+            os.unlink("entry", dir_fd=quarantine.directory_fd)
+            external = b"external-private-entry-before-unlink-check"
+            entry_fd = os.open(
+                "entry",
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+                dir_fd=quarantine.directory_fd,
+            )
+            with os.fdopen(entry_fd, "wb") as stream:
+                stream.write(external)
+            retained_path = quarantine.retained_path
+            external_identity = (
+                retained_path.stat().st_dev,
+                retained_path.stat().st_ino,
+            )
+            stderr = io.StringIO()
+            try:
+                with redirect_stderr(stderr):
+                    removed = image_output._discard_quarantine(
+                        quarantine,
+                        "private entry cleanup was incomplete",
+                    )
+                self.assertFalse(removed)
+                self.assertEqual(retained_path.read_bytes(), external)
+                self.assertEqual(
+                    (
+                        retained_path.stat().st_dev,
+                        retained_path.stat().st_ino,
+                    ),
+                    external_identity,
+                )
+                self.assertEqual(len(stderr.getvalue().splitlines()), 1)
+            finally:
+                if retained_path.exists():
+                    retained_path.unlink()
+                recovery_directory = retained_path.parent
+                if recovery_directory.exists():
+                    recovery_directory.rmdir()
+                os.close(parent_fd)
+
+    def test_private_entry_replacement_at_failing_unlink_is_retained(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            target = root / "slide.jpg"
+            target.write_bytes(image_bytes())
+            prepared = image_output.preflight_output(target, overwrite=True)
+            parent_fd = image_output._open_verified_parent(prepared)
+            quarantine = image_output._displace_to_quarantine(
+                parent_fd,
+                prepared.parent,
+                prepared.name,
+            )
+            self.assertIsNotNone(quarantine)
+            external = b"external-private-entry-at-unlink-boundary"
+            external_identity = None
+            real_unlink = image_output.os.unlink
+
+            def replace_then_fail_unlink(path, *args, **kwargs):
+                nonlocal external_identity
+                if path == "entry" and kwargs.get("dir_fd") == quarantine.directory_fd:
+                    real_unlink(path, *args, **kwargs)
+                    entry_fd = os.open(
+                        "entry",
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                        0o600,
+                        dir_fd=quarantine.directory_fd,
+                    )
+                    with os.fdopen(entry_fd, "wb") as stream:
+                        stream.write(external)
+                    current = os.stat(
+                        "entry",
+                        dir_fd=quarantine.directory_fd,
+                        follow_symlinks=False,
+                    )
+                    external_identity = (current.st_dev, current.st_ino)
+                    raise PermissionError("injected unlink-boundary replacement")
+                return real_unlink(path, *args, **kwargs)
+
+            retained_path = quarantine.retained_path
+            stderr = io.StringIO()
+            try:
+                with mock.patch.object(
+                    image_output.os,
+                    "unlink",
+                    side_effect=replace_then_fail_unlink,
+                ), redirect_stderr(stderr):
+                    removed = image_output._discard_quarantine(
+                        quarantine,
+                        "private entry cleanup was incomplete",
+                    )
+                self.assertFalse(removed)
+                self.assertEqual(retained_path.read_bytes(), external)
+                self.assertEqual(
+                    (
+                        retained_path.stat().st_dev,
+                        retained_path.stat().st_ino,
+                    ),
+                    external_identity,
+                )
+                self.assertEqual(len(stderr.getvalue().splitlines()), 1)
+            finally:
+                if retained_path.exists():
+                    retained_path.unlink()
+                recovery_directory = retained_path.parent
+                if recovery_directory.exists():
+                    recovery_directory.rmdir()
+                os.close(parent_fd)
+
+    def test_host_reports_exact_recovery_path_when_first_entry_stat_fails(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            master = root / "out" / "slide.png"
+            raw = root / "out" / "raw" / "slide.png"
+            raw.parent.mkdir(parents=True)
+            original_master = image_bytes("PNG")
+            original_raw = image_bytes("PNG")
+            master.write_bytes(original_master)
+            raw.write_bytes(original_raw)
+            real_stat = image_output.os.stat
+            failed = False
+
+            def fail_first_entry_stat(path, *args, **kwargs):
+                nonlocal failed
+                if (
+                    not failed
+                    and path == "entry"
+                    and kwargs.get("dir_fd") is not None
+                ):
+                    failed = True
+                    raise OSError("injected first recovery stat failure")
+                return real_stat(path, *args, **kwargs)
+
+            stderr = io.StringIO()
+            with mock.patch.object(
+                image_output.os,
+                "stat",
+                side_effect=fail_first_entry_stat,
+            ), redirect_stderr(stderr):
+                result = import_host_image.import_host_artifact(
+                    import_host_image.HostArtifact.inline_bytes(
+                        image_bytes("PNG"), "image/png"
+                    ),
+                    "out/slide.png",
+                    root,
+                    provider="openai",
+                    overwrite=True,
+                )
+
+            retained = list(raw.parent.glob(
+                ".image-output-recovery-*/entry"
+            ))
+            self.assertTrue(failed)
+            self.assertEqual(result.status, GenerationStatus.LOCAL_FAILURE)
+            self.assertEqual(len(retained), 1)
+            self.assertEqual(retained[0].read_bytes(), original_raw)
+            self.assertEqual(master.read_bytes(), original_master)
+            lines = stderr.getvalue().splitlines()
+            self.assertEqual(len(lines), 1)
+            self.assertIn(str(retained[0]), lines[0])
+
     def test_transaction_owned_removal_preserves_replacement_at_rename_boundary(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             target = Path(temp_dir) / "slide.png"
@@ -733,6 +1201,18 @@ class SafeDiagnosticTests(unittest.TestCase):
             self.assertEqual(len(output.splitlines()), 1)
             self.assertNotIn("\x1b", output)
 
+    def test_direct_force_help_describes_conditional_non_atomic_replacement(self):
+        for provider in (gen_slide_openai, gen_slide_gemini, gen_slide_doubao):
+            with self.subTest(provider=provider.__name__):
+                stdout = io.StringIO()
+                with redirect_stdout(stdout), self.assertRaises(SystemExit) as raised:
+                    provider._parser().parse_args(["--help"])
+                self.assertEqual(raised.exception.code, 0)
+                help_text = stdout.getvalue()
+                self.assertNotIn("Atomically replace", help_text)
+                self.assertIn("ownership-preserving", help_text)
+                self.assertIn("briefly absent", help_text)
+
 
 class DocumentationCorrectionTests(unittest.TestCase):
     def test_readme_scopes_publication_guarantees(self):
@@ -743,6 +1223,20 @@ class DocumentationCorrectionTests(unittest.TestCase):
         self.assertIn("not a crash-atomic", readme)
         self.assertIn("export journal", readme)
         self.assertIn("secure publication primitives", readme)
+
+    def test_docs_scope_deliberate_same_uid_private_namespace_mutation(self):
+        documents = (
+            ROOT / "README.md",
+            ROOT / "SKILL.md",
+            ROOT / "references" / "host-image-routing.md",
+        )
+        for document in documents:
+            with self.subTest(document=document.name):
+                contents = document.read_text(encoding="utf-8")
+                self.assertIn("same-UID", contents)
+                self.assertIn("private recovery namespace", contents)
+                self.assertIn("outside", contents)
+                self.assertIn("unlink-if-inode", contents)
 
     def test_skill_root_python_example_executes_from_repo_root(self):
         skill = (ROOT / "SKILL.md").read_text(encoding="utf-8")

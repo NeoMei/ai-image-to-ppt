@@ -84,6 +84,11 @@ no weaker pathname-only publication is attempted. Image inputs and generation
 outputs are capped at 50 MiB and 64 MP. Vision-check inputs have a separate
 14 MiB limit. Transient provider retries honor bounded `Retry-After` guidance.
 Parent-directory replacement is detected before publication and fails closed.
+Cooperating processes may race public target names, but a same-UID actor that
+deliberately discovers and mutates the private recovery namespace (random and
+mode 0700) between syscalls is outside the portable ownership guarantee; POSIX
+has no unlink-if-inode primitive. Treat every reported retained recovery path
+as sensitive and recover it manually before removing that directory.
 
 ## Editable-converter handoff
 

@@ -144,6 +144,11 @@ into a private same-directory recovery area and verifies the inode actually
 moved before installing without clobbering; this is not a single-syscall atomic
 replacement. Concurrent unknown files and failed recovery cleanup are retained
 under `.image-output-recovery-*/entry` and reported with a bounded warning.
+Cooperating processes may race public output names. A same-UID actor that
+deliberately discovers and mutates the private recovery namespace (random and
+mode 0700) between syscalls is outside the portable guarantee because POSIX has
+no unlink-if-inode primitive; treat reported retained paths as sensitive and
+recover them manually.
 Clearly over-limit manifests are rejected during path preflight, before image
 decoding. If source files change after preflight, actual loaded bytes are
 accumulated after each image load and rejected before PDF/PPTX serialization.

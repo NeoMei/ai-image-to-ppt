@@ -50,6 +50,8 @@ MAX_JSON_CONTAINER_ITEMS = 10_000
 
 _SECURE_PUBLICATION_SUPPORTED = (
     os.name == "posix"
+    and bool(getattr(os, "O_DIRECTORY", 0))
+    and bool(getattr(os, "O_NOFOLLOW", 0))
     and all(
         function in getattr(os, "supports_dir_fd", set())
         for function in (
@@ -62,6 +64,7 @@ _SECURE_PUBLICATION_SUPPORTED = (
             os.rmdir,
         )
     )
+    and os.listdir in getattr(os, "supports_fd", set())
     and os.stat in getattr(os, "supports_follow_symlinks", set())
     and os.link in getattr(os, "supports_follow_symlinks", set())
 )
@@ -155,6 +158,7 @@ class _QuarantinedOutput:
     parent_fd: int
     directory_fd: int
     directory_name: str
+    directory_identity: Tuple[int, int]
     original_name: str
     identity: Optional[Tuple[int, int]]
     is_regular: bool
@@ -994,12 +998,116 @@ def _close_quarantine(quarantine: _QuarantinedOutput) -> None:
         pass
 
 
-def _remove_empty_quarantine(quarantine: _QuarantinedOutput) -> None:
-    _close_quarantine(quarantine)
+def _validate_recovery_directory_metadata(
+    current: os.stat_result,
+    expected_identity: Optional[Tuple[int, int]] = None,
+) -> Tuple[int, int]:
+    """Validate the ownership boundary for a private recovery namespace."""
+    if not stat.S_ISDIR(current.st_mode):
+        raise ImageOutputError("output recovery path is not a directory")
+    identity = current.st_dev, current.st_ino
+    if expected_identity is not None and identity != expected_identity:
+        raise ImageOutputError("output recovery directory identity changed")
+    geteuid = getattr(os, "geteuid", None)
+    if callable(geteuid) and current.st_uid != geteuid():
+        raise ImageOutputError("output recovery directory owner is not current user")
+    if stat.S_IMODE(current.st_mode) != 0o700:
+        raise ImageOutputError("output recovery directory permissions are not 0700")
+    return identity
+
+
+def _verify_bound_recovery_directory(
+    quarantine: _QuarantinedOutput,
+    *,
+    require_public_name: bool = False,
+    require_empty: bool = False,
+) -> None:
+    """Verify the open recovery directory and, optionally, its public name."""
     try:
+        parent = os.fstat(quarantine.parent_fd)
+        if (
+            not stat.S_ISDIR(parent.st_mode)
+            or parent.st_dev != quarantine.parent.device
+            or parent.st_ino != quarantine.parent.inode
+        ):
+            raise ImageOutputError("output parent directory identity changed")
+        current = os.fstat(quarantine.directory_fd)
+        _validate_recovery_directory_metadata(
+            current, quarantine.directory_identity
+        )
+        if require_public_name:
+            public = os.stat(
+                quarantine.directory_name,
+                dir_fd=quarantine.parent_fd,
+                follow_symlinks=False,
+            )
+            _validate_recovery_directory_metadata(
+                public, quarantine.directory_identity
+            )
+        if require_empty and os.listdir(quarantine.directory_fd):
+            raise ImageOutputError("output recovery directory is not empty")
+    except ImageOutputError:
+        raise
+    except (OSError, TypeError, NotImplementedError) as error:
+        raise ImageOutputError(
+            f"cannot verify output recovery directory: {error}"
+        ) from error
+
+
+def _verify_bound_recovery_entry(
+    quarantine: _QuarantinedOutput,
+) -> None:
+    """Verify the exact displaced entry through its bound private directory."""
+    try:
+        _verify_bound_recovery_directory(quarantine)
+        current = os.stat(
+            "entry",
+            dir_fd=quarantine.directory_fd,
+            follow_symlinks=False,
+        )
+        if (
+            quarantine.identity is None
+            or (current.st_dev, current.st_ino) != quarantine.identity
+            or stat.S_ISREG(current.st_mode) != quarantine.is_regular
+        ):
+            raise ImageOutputError("output recovery entry identity changed")
+    except ImageOutputError:
+        raise
+    except (OSError, TypeError, NotImplementedError) as error:
+        raise ImageOutputError(
+            f"cannot verify output recovery entry: {error}"
+        ) from error
+
+
+def _cleanup_recovery_directory(
+    quarantine: _QuarantinedOutput,
+    context: str,
+) -> bool:
+    """Remove one proven empty bound directory, or retain and report it.
+
+    The public name is checked against the still-open directory immediately
+    before removal.  A deliberate same-UID mutation at the final rmdir syscall
+    boundary is outside the portable guarantee documented for this module.
+    """
+    directory_path = str(
+        quarantine.parent.path / quarantine.directory_name
+    )
+    cleanup_error = None
+    try:
+        _verify_bound_recovery_directory(
+            quarantine,
+            require_public_name=True,
+            require_empty=True,
+        )
         os.rmdir(quarantine.directory_name, dir_fd=quarantine.parent_fd)
-    except (FileNotFoundError, OSError, TypeError, NotImplementedError):
-        pass
+        return True
+    except (ImageOutputError, OSError, TypeError, NotImplementedError) as error:
+        cleanup_error = error
+        return False
+    finally:
+        _close_quarantine(quarantine)
+        if cleanup_error is not None:
+            _warn_retained_temp(context, directory_path, cleanup_error)
 
 
 def _new_quarantine(
@@ -1010,6 +1118,13 @@ def _new_quarantine(
     directory_name = None
     directory_fd = None
     try:
+        parent_current = os.fstat(parent_fd)
+        if (
+            not stat.S_ISDIR(parent_current.st_mode)
+            or parent_current.st_dev != parent.device
+            or parent_current.st_ino != parent.inode
+        ):
+            raise ImageOutputError("output parent directory identity changed")
         for _attempt in range(100):
             candidate = f".image-output-recovery-{secrets.token_hex(16)}"
             try:
@@ -1020,21 +1135,33 @@ def _new_quarantine(
                 continue
         if directory_name is None:
             raise ImageOutputError("failed to allocate output recovery directory")
+        created = os.stat(
+            directory_name,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        created_identity = _validate_recovery_directory_metadata(created)
         flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
         flags |= getattr(os, "O_NOFOLLOW", 0)
         directory_fd = os.open(directory_name, flags, dir_fd=parent_fd)
         current = os.fstat(directory_fd)
-        if not stat.S_ISDIR(current.st_mode):
-            raise ImageOutputError("output recovery path is not a directory")
-        return _QuarantinedOutput(
+        _validate_recovery_directory_metadata(current, created_identity)
+        quarantine = _QuarantinedOutput(
             parent_fd,
             directory_fd,
             directory_name,
+            created_identity,
             "",
             None,
             False,
             parent,
         )
+        _verify_bound_recovery_directory(
+            quarantine,
+            require_public_name=True,
+            require_empty=True,
+        )
+        return quarantine
     except (ImageOutputError, OSError, TypeError, NotImplementedError) as error:
         if directory_fd is not None:
             try:
@@ -1042,10 +1169,11 @@ def _new_quarantine(
             except OSError:
                 pass
         if directory_name is not None:
-            try:
-                os.rmdir(directory_name, dir_fd=parent_fd)
-            except (OSError, TypeError, NotImplementedError):
-                pass
+            _warn_retained_temp(
+                "recovery directory ownership could not be established; cleanup skipped",
+                str(parent.path / directory_name),
+                error,
+            )
         if isinstance(error, ImageOutputError):
             raise
         raise ImageOutputError(
@@ -1060,24 +1188,43 @@ def _displace_to_quarantine(
 ) -> Optional[_QuarantinedOutput]:
     """Move the current name first, then identify the inode actually moved.
 
-    The rename destination is an entry in a freshly created private directory,
-    so the syscall cannot overwrite an existing recovery entry.  A concurrent
-    replacement of ``name`` is therefore moved intact and can be restored or
-    retained instead of being destroyed.
+    The rename destination is inside a freshly created, identity-bound private
+    directory.  The namespace is verified empty immediately before use.  A
+    deliberate same-UID mutation inside that random private namespace remains
+    outside the portable guarantee; public target races are preserved.
     """
     quarantine = _new_quarantine(parent_fd, parent)
     try:
+        _verify_bound_recovery_directory(
+            quarantine,
+            require_public_name=True,
+            require_empty=True,
+        )
         os.rename(
             name,
             "entry",
             src_dir_fd=parent_fd,
             dst_dir_fd=quarantine.directory_fd,
         )
+    except ImageOutputError as error:
+        _cleanup_recovery_directory(
+            quarantine,
+            "untrusted recovery directory was retained",
+        )
+        raise ImageOutputError(
+            f"failed to verify recovery directory before isolation: {error}"
+        ) from error
     except FileNotFoundError:
-        _remove_empty_quarantine(quarantine)
+        _cleanup_recovery_directory(
+            quarantine,
+            "unused recovery directory cleanup was incomplete",
+        )
         return None
     except (OSError, TypeError, NotImplementedError) as error:
-        _remove_empty_quarantine(quarantine)
+        _cleanup_recovery_directory(
+            quarantine,
+            "failed-isolation recovery directory cleanup was incomplete",
+        )
         raise ImageOutputError(
             f"failed to isolate output before changing it: {error}"
         ) from error
@@ -1089,8 +1236,11 @@ def _displace_to_quarantine(
             follow_symlinks=False,
         )
     except (OSError, TypeError, NotImplementedError) as error:
-        retained_path = quarantine.retained_path
-        _close_quarantine(quarantine)
+        retained_path = _retain_quarantine(
+            quarantine,
+            "isolated output identity is unknown; manual recovery is required",
+            error,
+        )
         raise ImageOutputError(
             "isolated output could not be identified; file retained at "
             f"{retained_path}"
@@ -1125,6 +1275,7 @@ def _restore_or_retain_quarantine(
     """Restore a displaced entry without clobbering, retaining a recovery copy."""
     restore_error = None
     try:
+        _verify_bound_recovery_entry(quarantine)
         os.link(
             "entry",
             quarantine.original_name,
@@ -1132,7 +1283,7 @@ def _restore_or_retain_quarantine(
             dst_dir_fd=quarantine.parent_fd,
             follow_symlinks=False,
         )
-    except (OSError, TypeError, NotImplementedError) as error:
+    except (ImageOutputError, OSError, TypeError, NotImplementedError) as error:
         restore_error = error
     return _retain_quarantine(quarantine, context, restore_error)
 
@@ -1144,15 +1295,21 @@ def _discard_quarantine(
     """Best-effort cleanup inside the private recovery namespace.
 
     POSIX has no conditional unlink-by-inode.  The public pathname has already
-    been displaced and checked; cleanup is restricted to the random mode-0700
-    recovery directory.  Any syscall failure retains the entry and is reported.
+    been displaced and checked; cleanup rechecks the bound random mode-0700
+    recovery directory and entry identity immediately before unlink.  A
+    deliberate same-UID mutation inside that private namespace at the unlink
+    boundary is outside the portable guarantee.  Failures retain and report.
     """
     try:
+        _verify_bound_recovery_entry(quarantine)
         os.unlink("entry", dir_fd=quarantine.directory_fd)
-    except (OSError, TypeError, NotImplementedError) as error:
+    except (ImageOutputError, OSError, TypeError, NotImplementedError) as error:
         _retain_quarantine(quarantine, context, error)
         return False
-    _remove_empty_quarantine(quarantine)
+    _cleanup_recovery_directory(
+        quarantine,
+        "empty recovery directory cleanup was incomplete",
+    )
     return True
 
 
