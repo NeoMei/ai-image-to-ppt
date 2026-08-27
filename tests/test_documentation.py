@@ -66,6 +66,11 @@ class DocumentationTests(unittest.TestCase):
         self.assertIn("raw/<filename>", reference)
         self.assertIn("do not stretch", " ".join(reference.split()).lower())
 
+    def test_host_raw_master_failure_semantics_are_not_claimed_as_crash_atomic(self):
+        normalized = " ".join(self.readme.split()).lower()
+        self.assertIn("compensating rollback", normalized)
+        self.assertIn("not a crash-atomic two-file commit", normalized)
+
     def test_readme_keeps_provider_and_safety_recovery_boundaries(self):
         normalized = " ".join(self.readme.split())
         for expected in (

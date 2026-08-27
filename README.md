@@ -71,7 +71,9 @@ intentional replacement with rollback and crash-recovery protection. Image
 inputs and generation outputs are capped at 50 MiB and 64 MP. Vision-check
 inputs have a separate 14 MiB limit. Transient provider retries honor bounded
 `Retry-After` guidance. Parent-directory replacement is detected before
-publication and fails closed.
+publication and fails closed. The paired host raw/master publication uses
+compensating rollback for ordinary process-time failures while both output locks
+are held; it is not a crash-atomic two-file commit.
 
 ## Editable-converter handoff
 

@@ -31,14 +31,27 @@ def image_bytes(image_format="JPEG", size=(160, 90)):
 def patterned_image_bytes(image_format="PNG", size=(1672, 941), mode="RGB"):
     """Create a near-16:9 image whose cropped center is observable."""
     image = Image.new(mode, size, (20, 30, 40, 128) if mode == "RGBA" else (20, 30, 40))
+
+    def pixel(red, green, blue, alpha=255):
+        return (red, green, blue, alpha) if mode == "RGBA" else (red, green, blue)
+
     for y, color in (
-        (0, (255, 0, 0, 64) if mode == "RGBA" else (255, 0, 0)),
-        (2, (0, 255, 0, 128) if mode == "RGBA" else (0, 255, 0)),
-        (937, (0, 0, 255, 192) if mode == "RGBA" else (0, 0, 255)),
-        (940, (255, 255, 0, 255) if mode == "RGBA" else (255, 255, 0)),
+        (0, pixel(255, 0, 0, 64)),
+        (2, pixel(0, 255, 0, 128)),
+        (937, pixel(0, 0, 255, 192)),
+        (940, pixel(255, 255, 0)),
     ):
         if y < size[1]:
             for x in range(size[0]):
+                image.putpixel((x, y), color)
+    for x, color in (
+        (0, pixel(255, 0, 0, 64)),
+        (4, pixel(0, 255, 255, 96)),
+        (1667, pixel(255, 0, 255, 160)),
+        (1671, pixel(255, 255, 0)),
+    ):
+        if x < size[0]:
+            for y in range(size[1]):
                 image.putpixel((x, y), color)
     buffer = io.BytesIO()
     image.save(buffer, format=image_format)
@@ -78,7 +91,78 @@ class HostImageImportTests(unittest.TestCase):
                 self.assertEqual(image.mode, "RGBA")
                 self.assertEqual(image.getpixel((800, 0)), (0, 255, 0, 128))
                 self.assertEqual(image.getpixel((800, 935)), (0, 0, 255, 192))
+                self.assertEqual(image.getpixel((0, 500)), (0, 255, 255, 96))
+                self.assertEqual(image.getpixel((1663, 500)), (255, 0, 255, 160))
             image_output.validate_image_bytes(master.read_bytes(), master)
+
+    def test_master_publication_failure_removes_new_raw_and_allows_retry(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            artifact = import_host_image.HostArtifact.inline_bytes(
+                patterned_image_bytes(), "image/png"
+            )
+            with mock.patch.object(
+                import_host_image,
+                "publish_bytes",
+                side_effect=image_output.ImageOutputError("forced master failure"),
+            ):
+                failed = import_host_image.import_host_artifact(
+                    artifact, "out/slide.png", root, provider="openai"
+                )
+
+            self.assertEqual(failed.status, GenerationStatus.LOCAL_FAILURE)
+            self.assertFalse((root / "out" / "slide.png").exists())
+            self.assertFalse((root / "out" / "raw" / "slide.png").exists())
+            self.assertEqual(list(root.rglob(".*.tmp")), [])
+            self.assertEqual(list(root.rglob("*.backup")), [])
+
+            retried = import_host_image.import_host_artifact(
+                artifact, "out/slide.png", root, provider="openai"
+            )
+            self.assertEqual(retried.status, GenerationStatus.SUCCESS)
+
+    def test_force_master_failure_restores_existing_raw_and_master(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            master = root / "out" / "slide.png"
+            raw = root / "out" / "raw" / "slide.png"
+            raw.parent.mkdir(parents=True)
+            master.write_bytes(image_bytes("PNG", (160, 90)))
+            raw.write_bytes(patterned_image_bytes())
+            previous_master = master.read_bytes()
+            previous_raw = raw.read_bytes()
+            real_publish = import_host_image.publish_bytes
+            attempts = 0
+
+            def publish_then_fail_once(data, target, overwrite=False):
+                nonlocal attempts
+                attempts += 1
+                result = real_publish(data, target, overwrite=overwrite)
+                if attempts == 1:
+                    raise image_output.ImageOutputError("forced master failure")
+                return result
+
+            with mock.patch.object(
+                import_host_image,
+                "publish_bytes",
+                side_effect=publish_then_fail_once,
+            ):
+                failed = import_host_image.import_host_artifact(
+                    import_host_image.HostArtifact.inline_bytes(
+                        patterned_image_bytes(mode="RGBA"), "image/png"
+                    ),
+                    "out/slide.png",
+                    root,
+                    provider="openai",
+                    overwrite=True,
+                )
+
+            self.assertEqual(failed.status, GenerationStatus.LOCAL_FAILURE)
+            self.assertEqual(master.read_bytes(), previous_master)
+            self.assertEqual(raw.read_bytes(), previous_raw)
+            self.assertEqual(attempts, 2)
+            self.assertEqual(list(root.rglob(".*.tmp")), [])
+            self.assertEqual(list(root.rglob("*.backup")), [])
 
     def test_near_ratio_is_normalized_before_strict_validation(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -221,6 +305,24 @@ class HostImageImportTests(unittest.TestCase):
                 Path(result.output_path), (root / "out/slide.jpg").resolve()
             )
             self.assertEqual((root / "out/slide.jpg").read_bytes(), source.read_bytes())
+
+    def test_oversized_local_file_is_invalid_output_not_local_failure(self):
+        with tempfile.TemporaryDirectory() as temp_dir, mock.patch.object(
+            image_output, "MAX_IMAGE_BYTES", 3
+        ):
+            root = Path(temp_dir)
+            source = root / "host-source.jpg"
+            source.write_bytes(b"four")
+            result = import_host_image.import_host_artifact(
+                import_host_image.HostArtifact.local_path(str(source)),
+                "slide.jpg",
+                root,
+                provider="openai",
+            )
+
+            self.assertEqual(result.status, GenerationStatus.INVALID_OUTPUT)
+            self.assertFalse((root / "slide.jpg").exists())
+            self.assertFalse((root / "raw" / "slide.jpg").exists())
 
     def test_inline_bytes_is_validated_and_published(self):
         with tempfile.TemporaryDirectory() as temp_dir:

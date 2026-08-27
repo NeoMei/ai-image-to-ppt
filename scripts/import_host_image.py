@@ -26,6 +26,7 @@ from image_output import (
     read_bounded_image_stream,
     resolve_input_path,
     validate_image_bytes,
+    verify_parent_identity,
 )
 from output_lock import OutputLockError, output_lock
 
@@ -38,6 +39,14 @@ class HostArtifactKind(str, Enum):
 
 
 HOST_ASPECT_ERROR_DENOMINATOR = 200
+
+
+@dataclass
+class _OutputSnapshot:
+    target: PreparedTarget
+    original_bytes: Optional[bytes]
+    original_identity: Optional[Tuple[int, int]]
+    published_identity: Optional[Tuple[int, int]] = None
 
 
 @dataclass(frozen=True)
@@ -85,13 +94,16 @@ def _read_local_path(value: object) -> bytes:
         before = source.stat()
         if not stat.S_ISREG(before.st_mode):
             raise OSError("host local path is not a regular file")
-        if before.st_size <= 0:
-            raise OSError("host local image is empty")
-        if before.st_size > image_output.MAX_IMAGE_BYTES:
-            raise OSError("host local image exceeds maximum size")
-        descriptor = os.open(str(source), os.O_RDONLY)
     except ImageOutputError as error:
         raise OSError("could not resolve host local path") from error
+    except (OSError, ValueError) as error:
+        raise OSError("could not open host local image") from error
+    if before.st_size <= 0:
+        raise ImageOutputError("host local image is empty")
+    if before.st_size > image_output.MAX_IMAGE_BYTES:
+        raise ImageOutputError("host local image exceeds maximum size")
+    try:
+        descriptor = os.open(str(source), os.O_RDONLY)
     except (OSError, ValueError) as error:
         raise OSError("could not open host local image") from error
 
@@ -117,7 +129,9 @@ def _read_local_path(value: object) -> bytes:
         ):
             raise OSError("host local image identity changed during reading")
         return data
-    except (ImageOutputError, OSError, ValueError) as error:
+    except ImageOutputError:
+        raise
+    except (OSError, ValueError) as error:
         raise OSError("could not read host local image") from error
 
 
@@ -203,6 +217,113 @@ def _normalize_host_image(data: bytes, target: PreparedTarget) -> bytes:
         raise ImageOutputError("host image could not be encoded after normalization") from error
 
 
+def _identity(path: Path) -> Optional[Tuple[int, int]]:
+    try:
+        current = path.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise ImageOutputError("could not inspect transaction output") from error
+    if not stat.S_ISREG(current.st_mode):
+        raise ImageOutputError("transaction output identity is unsafe")
+    return current.st_dev, current.st_ino
+
+
+def _snapshot_output(target: PreparedTarget) -> _OutputSnapshot:
+    """Capture an existing bounded output before a two-file host publication."""
+    verify_parent_identity(target.parent)
+    identity = _identity(target.path)
+    if identity is None:
+        return _OutputSnapshot(target, None, None)
+    try:
+        with target.path.open("rb") as stream:
+            data = read_bounded_image_stream(stream)
+    except (ImageOutputError, OSError, ValueError) as error:
+        raise ImageOutputError("could not snapshot transaction output") from error
+    verify_parent_identity(target.parent)
+    if _identity(target.path) != identity:
+        raise ImageOutputError("transaction output identity changed before publication")
+    return _OutputSnapshot(target, data, identity)
+
+
+def _remove_owned_output(target: PreparedTarget, expected: Tuple[int, int]) -> None:
+    verify_parent_identity(target.parent)
+    if _identity(target.path) != expected:
+        raise ImageOutputError("transaction output identity changed during rollback")
+    try:
+        target.path.unlink()
+    except OSError as error:
+        raise ImageOutputError("could not remove transaction output") from error
+    verify_parent_identity(target.parent)
+
+
+def _restore_snapshot(
+    snapshot: _OutputSnapshot,
+    expected_new_bytes: bytes,
+    strict: bool,
+) -> None:
+    """Compensate a failed two-file publication while both target locks hold."""
+    current_identity = _identity(snapshot.target.path)
+    if current_identity == snapshot.original_identity:
+        return
+    if snapshot.published_identity is not None:
+        expected_identity = snapshot.published_identity
+    else:
+        if current_identity is None:
+            return
+        try:
+            with snapshot.target.path.open("rb") as stream:
+                current_bytes = read_bounded_image_stream(stream)
+        except (ImageOutputError, OSError, ValueError) as error:
+            raise ImageOutputError("could not inspect failed transaction output") from error
+        if _identity(snapshot.target.path) != current_identity:
+            raise ImageOutputError("transaction output identity changed during rollback")
+        if current_bytes != expected_new_bytes:
+            raise ImageOutputError("transaction output ownership changed during rollback")
+        expected_identity = current_identity
+
+    if snapshot.original_bytes is None:
+        _remove_owned_output(snapshot.target, expected_identity)
+        return
+
+    if _identity(snapshot.target.path) != expected_identity:
+        raise ImageOutputError("transaction output identity changed during rollback")
+    publisher = publish_bytes if strict else publish_decoded_image_bytes
+    publisher(snapshot.original_bytes, snapshot.target, overwrite=True)
+
+
+def _publish_host_pair(
+    raw_data: bytes,
+    normalized_data: bytes,
+    raw_target: PreparedTarget,
+    target: PreparedTarget,
+    overwrite: bool,
+) -> None:
+    """Publish raw and master as one compensated transaction under both locks."""
+    raw_snapshot = _snapshot_output(raw_target)
+    master_snapshot = _snapshot_output(target)
+    try:
+        publish_decoded_image_bytes(raw_data, raw_target, overwrite=overwrite)
+        raw_snapshot.published_identity = _identity(raw_target.path)
+        publish_bytes(normalized_data, target, overwrite=overwrite)
+        master_snapshot.published_identity = _identity(target.path)
+    except ImageOutputError as original_error:
+        rollback_error = None
+        for snapshot, expected_data, strict in (
+            (master_snapshot, normalized_data, True),
+            (raw_snapshot, raw_data, False),
+        ):
+            try:
+                _restore_snapshot(snapshot, expected_data, strict)
+            except ImageOutputError as error:
+                rollback_error = error
+        if rollback_error is not None:
+            raise ImageOutputError(
+                "host artifact transaction failed and rollback was incomplete"
+            ) from rollback_error
+        raise ImageOutputError("host artifact transaction could not be published") from original_error
+
+
 def import_host_artifact(
     artifact: HostArtifact,
     out_path: object,
@@ -258,8 +379,13 @@ def import_host_artifact(
                 )
 
             try:
-                publish_decoded_image_bytes(data, raw_target, overwrite=overwrite)
-                publish_bytes(normalized, target, overwrite=overwrite)
+                _publish_host_pair(
+                    data,
+                    normalized,
+                    raw_target,
+                    target,
+                    overwrite,
+                )
             except ImageOutputError:
                 return _failure(
                     GenerationStatus.LOCAL_FAILURE,
