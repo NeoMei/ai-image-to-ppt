@@ -55,6 +55,153 @@ def assert_no_transaction_files(test_case, directory):
 
 
 class SharedParentIdentityTests(unittest.TestCase):
+    def test_temp_fstat_failure_does_not_unlink_replacement_after_name_stat(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            prepared = image_output.preflight_output(root / "slide.jpg")
+            candidate = root / ".slide.jpg.fstat-race.tmp"
+            real_open = image_output.os.open
+            real_fstat = image_output.os.fstat
+            real_stat = image_output.os.stat
+            real_close = image_output.os.close
+            real_unlink = image_output.os.unlink
+            opened = []
+            closed = []
+            fstat_calls = 0
+            replaced = False
+
+            def record_open(*args, **kwargs):
+                descriptor = real_open(*args, **kwargs)
+                opened.append(descriptor)
+                return descriptor
+
+            def fail_first_temp_fstat(descriptor):
+                nonlocal fstat_calls
+                fstat_calls += 1
+                if fstat_calls == 2:
+                    raise OSError("injected temporary fstat failure")
+                return real_fstat(descriptor)
+
+            def replace_after_name_stat(path, *args, **kwargs):
+                nonlocal replaced
+                result = real_stat(path, *args, **kwargs)
+                if (
+                    not replaced
+                    and path == candidate.name
+                    and kwargs.get("dir_fd") is not None
+                ):
+                    replaced = True
+                    real_unlink(path, dir_fd=kwargs["dir_fd"])
+                    candidate.write_bytes(b"external replacement")
+                return result
+
+            def record_close(descriptor):
+                closed.append(descriptor)
+                return real_close(descriptor)
+
+            with mock.patch.object(
+                image_output.secrets,
+                "token_hex",
+                return_value="fstat-race",
+            ), mock.patch.object(
+                image_output.os,
+                "open",
+                side_effect=record_open,
+            ), mock.patch.object(
+                image_output.os,
+                "fstat",
+                side_effect=fail_first_temp_fstat,
+            ), mock.patch.object(
+                image_output.os,
+                "stat",
+                side_effect=replace_after_name_stat,
+            ), mock.patch.object(
+                image_output.os,
+                "close",
+                side_effect=record_close,
+            ), self.assertRaisesRegex(
+                image_output.ImageOutputError,
+                "failed to create output temporary file",
+            ):
+                image_output._temporary_path(prepared)
+
+            self.assertTrue(replaced)
+            self.assertGreaterEqual(len(opened), 2)
+            self.assertTrue(set(opened).issubset(set(closed)))
+            self.assertEqual(candidate.read_bytes(), b"external replacement")
+
+    def test_temp_fstat_failure_retains_replacement_when_restore_name_is_taken(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            prepared = image_output.preflight_output(root / "slide.jpg")
+            candidate = root / ".slide.jpg.fstat-restore-race.tmp"
+            real_fstat = image_output.os.fstat
+            real_stat = image_output.os.stat
+            real_unlink = image_output.os.unlink
+            real_link = image_output.os.link
+            fstat_calls = 0
+            replaced = False
+
+            def fail_first_temp_fstat(descriptor):
+                nonlocal fstat_calls
+                fstat_calls += 1
+                if fstat_calls == 2:
+                    raise OSError("injected temporary fstat failure")
+                return real_fstat(descriptor)
+
+            def replace_after_name_stat(path, *args, **kwargs):
+                nonlocal replaced
+                result = real_stat(path, *args, **kwargs)
+                if (
+                    not replaced
+                    and path == candidate.name
+                    and kwargs.get("dir_fd") is not None
+                ):
+                    replaced = True
+                    real_unlink(path, dir_fd=kwargs["dir_fd"])
+                    candidate.write_bytes(b"first external replacement")
+                return result
+
+            def occupy_name_before_restore(*args, **kwargs):
+                candidate.write_bytes(b"second external replacement")
+                return real_link(*args, **kwargs)
+
+            stderr = io.StringIO()
+            with mock.patch.object(
+                image_output.secrets,
+                "token_hex",
+                return_value="fstat-restore-race",
+            ), mock.patch.object(
+                image_output.os,
+                "fstat",
+                side_effect=fail_first_temp_fstat,
+            ), mock.patch.object(
+                image_output.os,
+                "stat",
+                side_effect=replace_after_name_stat,
+            ), mock.patch.object(
+                image_output.os,
+                "link",
+                side_effect=occupy_name_before_restore,
+            ), redirect_stderr(stderr), self.assertRaisesRegex(
+                image_output.ImageOutputError,
+                "failed to create output temporary file",
+            ):
+                image_output._temporary_path(prepared)
+
+            quarantines = list(root.glob(".image-output-cleanup-*"))
+            self.assertTrue(replaced)
+            self.assertEqual(
+                candidate.read_bytes(),
+                b"second external replacement",
+            )
+            self.assertEqual(len(quarantines), 1)
+            self.assertEqual(
+                (quarantines[0] / "entry").read_bytes(),
+                b"first external replacement",
+            )
+            self.assertIn("could not be restored safely", stderr.getvalue())
+
     def test_temp_fstat_failure_cleans_owned_name_and_closes_fd(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -106,7 +253,7 @@ class SharedParentIdentityTests(unittest.TestCase):
                 image_output._temporary_path(prepared)
 
             self.assertGreaterEqual(len(opened), 2)
-            self.assertIn(opened[-1], closed)
+            self.assertTrue(set(opened).issubset(set(closed)))
             self.assertFalse(candidate.exists())
 
     def test_temp_name_collisions_do_not_delete_external_candidate(self):
