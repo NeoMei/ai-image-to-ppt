@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Unified slide image generator; OpenAI GPT Image is the default engine."""
+"""API/CLI adapter for slide generation; does not use host capabilities."""
 
 import argparse
 import importlib
-from typing import Optional, Sequence
+from typing import Callable, Optional, Sequence
 
+from generation_result import GenerationResult, GenerationStatus, safe_message
 from image_output import MAX_RETRIES, ImageOutputError, validate_retries
 
 ENGINE_MODULES = {
@@ -24,6 +25,82 @@ def _non_negative_int(value: str) -> int:
         ) from error
 
 
+def _module_for_engine(engine: object) -> str:
+    try:
+        module_name = ENGINE_MODULES.get(engine)
+    except TypeError:
+        module_name = None
+    if module_name is None:
+        raise ValueError("engine must be openai, gemini, or doubao")
+    return module_name
+
+
+def _result(
+    status: GenerationStatus,
+    engine: str,
+    message: str,
+) -> GenerationResult:
+    return GenerationResult(status, engine, "api", safe_message=message)
+
+
+def generate_result(
+    prompt: str,
+    out_path: str,
+    engine: str = DEFAULT_ENGINE,
+    retries: int = 2,
+    overwrite: bool = False,
+    progress: Optional[Callable[[str], None]] = None,
+) -> GenerationResult:
+    """Generate through one API provider and return its structured result."""
+    try:
+        retries = validate_retries(retries)
+    except ImageOutputError:
+        _module_for_engine(engine)
+        return _result(
+            GenerationStatus.INVALID_INPUT,
+            engine,
+            "invalid generation arguments",
+        )
+    if not isinstance(overwrite, bool):
+        _module_for_engine(engine)
+        return _result(
+            GenerationStatus.INVALID_INPUT,
+            engine,
+            "invalid generation arguments",
+        )
+
+    module_name = _module_for_engine(engine)
+    try:
+        provider = importlib.import_module(module_name)
+    except Exception:
+        return _result(
+            GenerationStatus.UNAVAILABLE,
+            engine,
+            "requested API provider is unavailable",
+        )
+    try:
+        result = provider.generate_result(
+            prompt,
+            out_path,
+            retries=retries,
+            overwrite=overwrite,
+            progress=progress,
+        )
+    except Exception:
+        return _result(
+            GenerationStatus.LOCAL_FAILURE,
+            engine,
+            "requested API provider failed locally",
+        )
+    if not isinstance(result, GenerationResult):
+        return _result(
+            GenerationStatus.LOCAL_FAILURE,
+            engine,
+            "requested API provider returned an invalid result",
+        )
+    return result
+
+
 def gen(
     prompt: str,
     out_path: str,
@@ -32,40 +109,25 @@ def gen(
     overwrite: bool = False,
 ) -> bool:
     try:
-        retries = validate_retries(retries)
-    except ImageOutputError as error:
-        print(f"  ERR: {error}")
-        return False
-    if not isinstance(overwrite, bool):
-        print("  ERR: overwrite must be a boolean")
-        return False
-    module_name = ENGINE_MODULES.get(engine)
-    if module_name is None:
-        choices = ", ".join(ENGINE_MODULES)
-        print(f"  ERR: unknown engine '{engine}'. Choose: {choices}")
-        return False
-    try:
-        provider = importlib.import_module(module_name)
-    except ImportError:
-        print(f"  ERR: engine '{engine}' is unavailable ({module_name})")
-        return False
-    try:
-        return bool(
-            provider.gen(
-                prompt,
-                out_path,
-                retries=retries,
-                overwrite=overwrite,
-            )
+        result = generate_result(
+            prompt,
+            out_path,
+            engine=engine,
+            retries=retries,
+            overwrite=overwrite,
+            progress=None,
         )
-    except Exception as error:
-        print(f"  ERR: engine '{engine}' failed ({type(error).__name__})")
+    except ValueError:
         return False
+    return result.ok
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Generate a 16:9 slide image (default: OpenAI GPT Image 2)."
+        description=(
+            "Generate a 16:9 slide image through an API/CLI adapter; "
+            "does not use host capabilities (default: OpenAI GPT Image 2)."
+        )
     )
     parser.add_argument(
         "out_path",
@@ -93,19 +155,31 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="replace an existing output only after a valid image is ready",
     )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="emit one structured API-adapter result as JSON",
+    )
     return parser
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = _parser().parse_args(argv)
-    success = gen(
+    result = generate_result(
         args.prompt,
         args.out_path,
         engine=args.engine,
         retries=args.retries,
         overwrite=args.force,
+        progress=None,
     )
-    return 0 if success else 1
+    if args.json:
+        print(result.to_json())
+    elif result.ok:
+        print(f"  OK: {safe_message(result.output_path)} ({safe_message(result.safe_message)})")
+    else:
+        print(f"  ERR: {safe_message(result.safe_message)}")
+    return 0 if result.ok else 1
 
 
 if __name__ == "__main__":
