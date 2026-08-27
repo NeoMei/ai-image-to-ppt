@@ -74,8 +74,8 @@ def _validate_provider(provider: object) -> str:
 def _read_local_path(value: object) -> bytes:
     if not isinstance(value, str) or not value:
         raise OSError("host local path must be a non-empty string")
-    source = resolve_input_path(value)
     try:
+        source = resolve_input_path(value)
         before = source.stat()
         if not stat.S_ISREG(before.st_mode):
             raise OSError("host local path is not a regular file")

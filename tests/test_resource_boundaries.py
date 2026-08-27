@@ -235,7 +235,7 @@ class SharedImageLimitTests(unittest.TestCase):
             def deny_temp(path, *args, **kwargs):
                 nonlocal attempts
                 candidate = Path(path)
-                if candidate.parent == root and candidate.name.endswith(".tmp"):
+                if candidate.name.endswith(".tmp"):
                     attempts += 1
                     raise PermissionError("forced temp cleanup denial")
                 return real_unlink(path, *args, **kwargs)
@@ -269,7 +269,7 @@ class SharedImageLimitTests(unittest.TestCase):
             def deny_temp(path, *args, **kwargs):
                 nonlocal attempts
                 candidate = Path(path)
-                if candidate.parent == root and candidate.name.endswith(".tmp"):
+                if candidate.name.endswith(".tmp"):
                     attempts += 1
                     raise PermissionError("forced temp cleanup denial")
                 return real_unlink(path, *args, **kwargs)
@@ -299,7 +299,7 @@ class SharedImageLimitTests(unittest.TestCase):
             def deny_temp(path, *args, **kwargs):
                 nonlocal attempts
                 candidate = Path(path)
-                if candidate.parent == root and candidate.name.endswith(".tmp"):
+                if candidate.name.endswith(".tmp"):
                     attempts += 1
                     raise PermissionError("cleanup-denied")
                 return real_unlink(path, *args, **kwargs)
@@ -334,7 +334,7 @@ class SharedImageLimitTests(unittest.TestCase):
             def deny_temp(path, *args, **kwargs):
                 nonlocal attempts
                 candidate = Path(path)
-                if candidate.parent == root and candidate.name.endswith(".tmp"):
+                if candidate.name.endswith(".tmp"):
                     attempts += 1
                     raise PermissionError("cleanup-denied")
                 return real_unlink(path, *args, **kwargs)
@@ -365,7 +365,7 @@ class SharedImageLimitTests(unittest.TestCase):
             def deny_temp(path, *args, **kwargs):
                 nonlocal attempts
                 candidate = Path(path)
-                if candidate.parent == root and candidate.name.endswith(".tmp"):
+                if candidate.name.endswith(".tmp"):
                     attempts += 1
                     raise PermissionError("cleanup-denied")
                 return real_unlink(path, *args, **kwargs)

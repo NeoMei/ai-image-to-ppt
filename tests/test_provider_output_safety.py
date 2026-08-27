@@ -182,7 +182,7 @@ class ProviderOutputContractTests(unittest.TestCase):
                      gen_slide_openai.urllib.request,
                      "urlopen",
                      return_value=response,
-                 ), mock.patch("image_output.os.replace", side_effect=OSError("replace failed")):
+                ), mock.patch("image_output.os.rename", side_effect=OSError("replace failed")):
                 self.assertFalse(
                     gen_slide_openai.gen(
                         "prompt", str(target), retries=0, overwrite=True

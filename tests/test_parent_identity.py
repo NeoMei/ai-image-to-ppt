@@ -55,6 +55,92 @@ def assert_no_transaction_files(test_case, directory):
 
 
 class SharedParentIdentityTests(unittest.TestCase):
+    def test_temp_path_replacement_after_validation_is_not_published(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            target = root / "slide.jpg"
+            prepared = image_output.preflight_output(target)
+            real_validate = image_output._validate_temp
+            replacement = None
+
+            def validate_then_replace(temp_path, prepared_target):
+                nonlocal replacement
+                result = real_validate(temp_path, prepared_target)
+                replacement = Path(temp_path)
+                replacement.unlink()
+                replacement.write_bytes(b"not-an-image")
+                return result
+
+            with mock.patch.object(
+                image_output,
+                "_validate_temp",
+                side_effect=validate_then_replace,
+            ), self.assertRaisesRegex(image_output.ImageOutputError, "temporary"):
+                image_output.publish_bytes(image_bytes(), prepared)
+
+            self.assertFalse(target.exists())
+            self.assertIsNotNone(replacement)
+            self.assertEqual(replacement.read_bytes(), b"not-an-image")
+
+    def test_parent_replacement_after_publish_verification_fails_closed(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            parent = root / "approved"
+            parent.mkdir()
+            prepared = image_output.preflight_output(parent / "slide.jpg")
+            original = parent.with_name("approved-original")
+            rename_called = False
+            real_rename = image_output.os.rename
+
+            def swap_then_rename(*args, **kwargs):
+                nonlocal rename_called
+                rename_called = True
+                real_rename(str(parent), str(original))
+                parent.mkdir()
+                return real_rename(*args, **kwargs)
+
+            with mock.patch.object(
+                image_output.os,
+                "rename",
+                side_effect=swap_then_rename,
+            ), self.assertRaisesRegex(image_output.ImageOutputError, "parent directory"):
+                image_output.publish_bytes(image_bytes(), prepared, overwrite=True)
+
+            self.assertTrue(rename_called)
+            self.assertFalse((parent / "slide.jpg").exists())
+            self.assertFalse((original / "slide.jpg").exists())
+            assert_no_transaction_files(self, parent)
+            assert_no_transaction_files(self, original)
+
+    def test_failed_cleanup_preserves_replacement_directory_external_temp(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            parent = root / "approved"
+            parent.mkdir()
+            prepared = image_output.preflight_output(parent / "slide.jpg")
+            original = parent.with_name("approved-original")
+            external_temp = None
+
+            def replace_parent_then_fail(temp_path, _target, _overwrite):
+                nonlocal external_temp
+                temporary = Path(temp_path)
+                parent.rename(original)
+                parent.mkdir()
+                external_temp = parent / temporary.name
+                external_temp.write_bytes(b"external")
+                raise image_output.ImageOutputError("forced publication failure")
+
+            with mock.patch.object(
+                image_output,
+                "_publish_temp",
+                side_effect=replace_parent_then_fail,
+            ), self.assertRaisesRegex(image_output.ImageOutputError, "forced publication"):
+                image_output.publish_bytes(image_bytes(), prepared)
+
+            self.assertIsNotNone(external_temp)
+            self.assertEqual(external_temp.read_bytes(), b"external")
+            self.assertEqual(list(original.glob(".slide.jpg.*.tmp")), [])
+
     def test_workspace_target_rejects_escape_before_file_creation(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir) / "workspace"

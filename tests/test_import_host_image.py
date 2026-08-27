@@ -162,6 +162,32 @@ class HostImageImportTests(unittest.TestCase):
             self.assertEqual(result.status, GenerationStatus.LOCAL_FAILURE)
             self.assertFalse((root / "slide.jpg").exists())
 
+    def test_source_path_parse_errors_are_local_failures(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            with self.subTest("embedded NUL"):
+                result = import_host_image.import_host_artifact(
+                    import_host_image.HostArtifact.local_path("bad\0source.jpg"),
+                    "slide.jpg",
+                    root,
+                    provider="openai",
+                )
+                self.assertEqual(result.status, GenerationStatus.LOCAL_FAILURE)
+
+            with self.subTest("current directory capture"):
+                with mock.patch.object(
+                    import_host_image,
+                    "resolve_input_path",
+                    side_effect=image_output.ImageOutputError("cannot capture CWD"),
+                ):
+                    result = import_host_image.import_host_artifact(
+                        import_host_image.HostArtifact.local_path("source.jpg"),
+                        "other.jpg",
+                        root,
+                        provider="openai",
+                    )
+                self.assertEqual(result.status, GenerationStatus.LOCAL_FAILURE)
+
     def test_workspace_escape_is_local_failure_before_source_read(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
