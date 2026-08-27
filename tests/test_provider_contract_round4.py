@@ -221,7 +221,12 @@ class ProviderAbsoluteOutputTests(unittest.TestCase):
                         )
 
                 self.assertFalse(result)
-                self.assertIn("not a regular file", output.getvalue())
+                expected_message = (
+                    "unable to prepare output target"
+                    if provider is gen_slide_openai
+                    else "not a regular file"
+                )
+                self.assertIn(expected_message, output.getvalue())
                 load_key.assert_not_called()
                 urlopen.assert_not_called()
                 self.assertEqual(referent.read_bytes(), b"keep-me")

@@ -65,7 +65,7 @@ def _redact(message: object, key: str) -> str:
 
 
 def _environment_redaction_secrets() -> Sequence[str]:
-    """Collect the configured environment key only for early safe diagnostics."""
+    """Collect the configured environment key for credential-stage diagnostics."""
     key = os.environ.get("OPENAI_API_KEY")
     return (key,) if isinstance(key, str) and key else ()
 
@@ -136,15 +136,15 @@ def _gen_owned(
     retries: int = 2,
     overwrite: bool = False,
     progress: Optional[Callable[[str], None]] = None,
-    redaction_secrets: Sequence[str] = (),
 ) -> GenerationResult:
     """Generate while the caller owns a prepared output lock."""
     try:
         output_format_value = _output_format(str(target))
         preflight_output(target, overwrite=overwrite)
-    except ImageOutputError as error:
-        return _result(GenerationStatus.LOCAL_FAILURE, error, secrets=redaction_secrets)
+    except ImageOutputError:
+        return _result(GenerationStatus.LOCAL_FAILURE, "unable to prepare output target")
 
+    redaction_secrets = _environment_redaction_secrets()
     key = _load_api_key()
     secrets = tuple(redaction_secrets) + ((key,) if isinstance(key, str) and key else ())
     if not key:
@@ -283,7 +283,6 @@ def _generate_result_with_lock(
     overwrite: bool,
     progress: Optional[Callable[[str], None]],
 ) -> GenerationResult:
-    redaction_secrets = _environment_redaction_secrets()
     try:
         retries = validate_retries(retries)
         if not isinstance(prompt, str) or not prompt.strip():
@@ -291,8 +290,8 @@ def _generate_result_with_lock(
         if not isinstance(overwrite, bool):
             raise ImageOutputError("overwrite must be a boolean")
         _output_format(out_path)
-    except (ImageOutputError, TypeError, ValueError) as error:
-        return _result(GenerationStatus.INVALID_INPUT, error, secrets=redaction_secrets)
+    except (ImageOutputError, TypeError, ValueError):
+        return _result(GenerationStatus.INVALID_INPUT, "invalid generation arguments")
 
     try:
         target = prepare_target(resolve_output_path(out_path))
@@ -303,16 +302,14 @@ def _generate_result_with_lock(
                 retries,
                 overwrite,
                 progress,
-                redaction_secrets,
             )
-    except (ImageOutputError, OutputLockError, OSError, TypeError, ValueError) as error:
-        return _result(GenerationStatus.LOCAL_FAILURE, error, secrets=redaction_secrets)
+    except (ImageOutputError, OutputLockError, OSError, TypeError, ValueError):
+        return _result(GenerationStatus.LOCAL_FAILURE, "unable to prepare output target")
 
     if not isinstance(result, GenerationResult):
         return _result(
             GenerationStatus.LOCAL_FAILURE,
             "internal generator returned an invalid result",
-            secrets=redaction_secrets,
         )
     return result
 
@@ -333,7 +330,6 @@ def gen(
     retries: int = 2,
     overwrite: bool = False,
 ) -> bool:
-    redaction_secrets = _environment_redaction_secrets()
     result = generate_result(
         prompt,
         out_path,
@@ -342,6 +338,7 @@ def gen(
         progress=print,
     )
     if result.ok:
+        redaction_secrets = _environment_redaction_secrets()
         print(
             f"  OK: {safe_message(result.output_path, redaction_secrets)} "
             f"({result.safe_message})"

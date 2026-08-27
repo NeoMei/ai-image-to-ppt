@@ -137,6 +137,74 @@ class OpenAIResultTests(unittest.TestCase):
             self.assertNotIn(key, lock_failure.safe_message)
             urlopen.assert_not_called()
 
+    def test_early_validation_and_target_failures_never_read_environment_key(self):
+        cases = (
+            ("invalid prompt", "", "slide.jpg", 0, False, None),
+            ("invalid retries", "prompt", "slide.jpg", -1, False, None),
+            ("invalid overwrite", "prompt", "slide.jpg", 0, "yes", None),
+            ("invalid suffix", "prompt", "slide.gif", 0, False, None),
+            (
+                "target failure",
+                "prompt",
+                "slide.jpg",
+                0,
+                False,
+                mock.patch.object(
+                    gen_slide_openai,
+                    "prepare_target",
+                    side_effect=ImageOutputError("key-like-target-detail"),
+                ),
+            ),
+            (
+                "lock failure",
+                "prompt",
+                "slide.jpg",
+                0,
+                False,
+                mock.patch.object(
+                    gen_slide_openai,
+                    "output_lock",
+                    side_effect=gen_slide_openai.OutputLockError("key-like-lock-detail"),
+                ),
+            ),
+        )
+        for name, prompt, target, retries, overwrite, boundary_patch in cases:
+            with self.subTest(name=name), \
+                 mock.patch.object(
+                     gen_slide_openai,
+                     "_environment_redaction_secrets",
+                     return_value=("known-test-key",),
+                 ) as redact_key, \
+                 mock.patch.object(gen_slide_openai, "_load_api_key") as load_key, \
+                 mock.patch.object(gen_slide_openai.urllib.request, "urlopen") as urlopen:
+                if boundary_patch is None:
+                    result = gen_slide_openai.generate_result(
+                        prompt, target, retries=retries, overwrite=overwrite
+                    )
+                else:
+                    with boundary_patch:
+                        result = gen_slide_openai.generate_result(
+                            prompt, target, retries=retries, overwrite=overwrite
+                        )
+            self.assertFalse(result.ok)
+            redact_key.assert_not_called()
+            load_key.assert_not_called()
+            urlopen.assert_not_called()
+
+    def test_credential_stage_reads_environment_key_for_redaction(self):
+        with tempfile.TemporaryDirectory() as temp_dir, \
+             mock.patch.object(
+                 gen_slide_openai,
+                 "_environment_redaction_secrets",
+                 return_value=("test-key",),
+             ) as redact_key, \
+             mock.patch.object(gen_slide_openai, "_load_api_key", return_value=""):
+            result = gen_slide_openai.generate_result(
+                "prompt", str(Path(temp_dir) / "slide.jpg"), retries=0
+            )
+        self.assertEqual(result.status, GenerationStatus.AUTH_UNAVAILABLE)
+        redact_key.assert_called_once_with()
+
     def test_missing_or_invalid_key_stops_before_network(self):
         for key in ("", "bad key"):
             with self.subTest(key=repr(key)), tempfile.TemporaryDirectory() as temp_dir, \

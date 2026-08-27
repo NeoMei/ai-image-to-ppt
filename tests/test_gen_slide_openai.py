@@ -474,7 +474,7 @@ class OpenAIGenerationTests(unittest.TestCase):
              redirect_stdout(output):
             self.assertFalse(gen_slide_openai.gen("prompt", "slide.jpg", retries=-1))
         urlopen.assert_not_called()
-        self.assertIn("integer >= 0", output.getvalue())
+        self.assertIn("invalid generation arguments", output.getvalue())
 
     def test_non_retryable_400_stops_after_one_request(self):
         error = urllib.error.HTTPError(
