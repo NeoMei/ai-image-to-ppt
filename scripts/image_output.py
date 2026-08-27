@@ -62,6 +62,12 @@ class LoadedImage(NamedTuple):
     height: int
 
 
+class ValidatedBytes(NamedTuple):
+    """A bounded byte payload that deliberately has no image semantics."""
+
+    byte_count: int
+
+
 @dataclass(frozen=True)
 class ParentIdentity:
     path: Path
@@ -104,6 +110,15 @@ class TemporaryOutput:
 
     def __str__(self) -> str:
         return os.fspath(self)
+
+
+@dataclass(frozen=True)
+class PublishedOutput:
+    """The inode installed by one identity-bound publication."""
+
+    byte_count: int
+    device: int
+    inode: int
 
 
 TargetValue = Union[Path, PreparedTarget]
@@ -960,6 +975,16 @@ def _validate_temp(
     return loaded.byte_count
 
 
+def _validate_opaque_bytes(data: bytes, _target: TargetValue) -> ValidatedBytes:
+    """Accept bounded bytes for transaction compensation only.
+
+    Existing output snapshots are allowed to be non-images because preflight
+    protects filesystem safety, not image validity. New host data is validated
+    before it reaches this recovery-only path.
+    """
+    return ValidatedBytes(len(data))
+
+
 def _remove_published_target(
     temporary: TemporaryOutput,
     name: str,
@@ -987,7 +1012,8 @@ def _publish_temp(
     temp_path: Union[str, TemporaryOutput],
     target: TargetValue,
     overwrite: bool,
-) -> None:
+    expected_existing_identity: Optional[tuple] = None,
+) -> tuple:
     prepared = _as_prepared_target(target)
     if not isinstance(temp_path, TemporaryOutput):
         raise ImageOutputError("output temporary file is not identity-bound")
@@ -996,6 +1022,17 @@ def _publish_temp(
         _verify_temporary_identity(temp_path)
         _verify_temporary_name(temp_path)
         if overwrite:
+            if expected_existing_identity is not None:
+                current = os.stat(
+                    prepared.name,
+                    dir_fd=temp_path.parent_fd,
+                    follow_symlinks=False,
+                )
+                if (
+                    not stat.S_ISREG(current.st_mode)
+                    or (current.st_dev, current.st_ino) != expected_existing_identity
+                ):
+                    raise ImageOutputError("output identity changed before replacement")
             os.rename(
                 temp_path.name,
                 prepared.name,
@@ -1039,6 +1076,7 @@ def _publish_temp(
         _warn_retained_temp(
             "output was published but cleanup failed", temp_path, error
         )
+    return published.st_dev, published.st_ino
 
 
 def _publish_image_bytes(
@@ -1046,7 +1084,8 @@ def _publish_image_bytes(
     target: TargetValue,
     overwrite: bool,
     validator,
-) -> int:
+    expected_existing_identity: Optional[tuple] = None,
+) -> PublishedOutput:
     if not isinstance(data, bytes) or not data:
         raise ImageOutputError("image data must be non-empty bytes")
     if len(data) > MAX_IMAGE_BYTES:
@@ -1064,9 +1103,17 @@ def _publish_image_bytes(
             byte_count = _validate_temp(temporary, target)
         else:
             byte_count = _validate_temp(temporary, target, validator)
-        _publish_temp(temporary, target, overwrite)
+        if expected_existing_identity is None:
+            identity = _publish_temp(temporary, target, overwrite)
+        else:
+            identity = _publish_temp(
+                temporary,
+                target,
+                overwrite,
+                expected_existing_identity=expected_existing_identity,
+            )
         published = True
-        return byte_count
+        return PublishedOutput(byte_count, *identity)
     except ImageOutputError:
         raise
     except OSError as error:
@@ -1086,6 +1133,15 @@ def _publish_image_bytes(
 
 def publish_bytes(data: bytes, target: TargetValue, overwrite: bool = False) -> int:
     """Publish an image only when it passes the strict shared 16:9 boundary."""
+    return publish_bytes_with_identity(data, target, overwrite).byte_count
+
+
+def publish_bytes_with_identity(
+    data: bytes,
+    target: TargetValue,
+    overwrite: bool = False,
+) -> PublishedOutput:
+    """Strictly publish an image and return the exact installed inode."""
     return _publish_image_bytes(data, target, overwrite, validate_image_bytes)
 
 
@@ -1099,11 +1155,43 @@ def publish_decoded_image_bytes(
     This is for retaining an immutable raw artifact before a caller applies a
     stricter, source-specific transform. It must not be used for API outputs.
     """
+    return publish_decoded_image_bytes_with_identity(
+        data, target, overwrite
+    ).byte_count
+
+
+def publish_decoded_image_bytes_with_identity(
+    data: bytes,
+    target: TargetValue,
+    overwrite: bool = False,
+) -> PublishedOutput:
+    """Publish decode-validated bytes and return the exact installed inode."""
     return _publish_image_bytes(
         data,
         target,
         overwrite,
         validate_decoded_image_bytes,
+    )
+
+
+def publish_opaque_bytes_with_identity(
+    data: bytes,
+    target: TargetValue,
+    *,
+    expected_existing_identity: tuple,
+) -> PublishedOutput:
+    """Restore bounded snapshot bytes over one exact, identity-bound output.
+
+    This intentionally bypasses image validation: snapshots predate a failed
+    host transaction and may be arbitrary regular-file bytes. The expected
+    inode prevents compensation from replacing a different current file.
+    """
+    return _publish_image_bytes(
+        data,
+        target,
+        True,
+        _validate_opaque_bytes,
+        expected_existing_identity=expected_existing_identity,
     )
 
 

@@ -21,8 +21,6 @@ from image_output import (
     prepare_workspace_target,
     prepared_lock_target,
     preflight_output,
-    publish_decoded_image_bytes,
-    publish_bytes,
     read_bounded_image_stream,
     resolve_input_path,
     validate_image_bytes,
@@ -235,11 +233,29 @@ def _snapshot_output(target: PreparedTarget) -> _OutputSnapshot:
     identity = _identity(target.path)
     if identity is None:
         return _OutputSnapshot(target, None, None)
+    descriptor = None
     try:
-        with target.path.open("rb") as stream:
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(str(target.path), flags)
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or (opened.st_dev, opened.st_ino) != identity
+        ):
+            raise ImageOutputError("transaction output identity changed before reading")
+        with os.fdopen(os.dup(descriptor), "rb") as stream:
             data = read_bounded_image_stream(stream)
+        after = os.fstat(descriptor)
+        if (after.st_dev, after.st_ino) != identity:
+            raise ImageOutputError("transaction output identity changed during reading")
     except (ImageOutputError, OSError, ValueError) as error:
         raise ImageOutputError("could not snapshot transaction output") from error
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
     verify_parent_identity(target.parent)
     if _identity(target.path) != identity:
         raise ImageOutputError("transaction output identity changed before publication")
@@ -248,39 +264,48 @@ def _snapshot_output(target: PreparedTarget) -> _OutputSnapshot:
 
 def _remove_owned_output(target: PreparedTarget, expected: Tuple[int, int]) -> None:
     verify_parent_identity(target.parent)
-    if _identity(target.path) != expected:
-        raise ImageOutputError("transaction output identity changed during rollback")
+    descriptor = None
     try:
-        target.path.unlink()
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(str(target.parent.path), flags)
+        parent = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(parent.st_mode)
+            or (parent.st_dev, parent.st_ino)
+            != (target.parent.device, target.parent.inode)
+        ):
+            raise ImageOutputError("transaction parent identity changed during rollback")
+        current = os.stat(target.name, dir_fd=descriptor, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(current.st_mode)
+            or (current.st_dev, current.st_ino) != expected
+        ):
+            raise ImageOutputError("transaction output identity changed during rollback")
+        os.unlink(target.name, dir_fd=descriptor)
     except OSError as error:
         raise ImageOutputError("could not remove transaction output") from error
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
     verify_parent_identity(target.parent)
 
 
 def _restore_snapshot(
     snapshot: _OutputSnapshot,
-    expected_new_bytes: bytes,
-    strict: bool,
 ) -> None:
     """Compensate a failed two-file publication while both target locks hold."""
     current_identity = _identity(snapshot.target.path)
     if current_identity == snapshot.original_identity:
         return
-    if snapshot.published_identity is not None:
-        expected_identity = snapshot.published_identity
-    else:
+    if snapshot.published_identity is None:
         if current_identity is None:
             return
-        try:
-            with snapshot.target.path.open("rb") as stream:
-                current_bytes = read_bounded_image_stream(stream)
-        except (ImageOutputError, OSError, ValueError) as error:
-            raise ImageOutputError("could not inspect failed transaction output") from error
-        if _identity(snapshot.target.path) != current_identity:
-            raise ImageOutputError("transaction output identity changed during rollback")
-        if current_bytes != expected_new_bytes:
-            raise ImageOutputError("transaction output ownership changed during rollback")
-        expected_identity = current_identity
+        raise ImageOutputError("transaction output ownership is unknown during rollback")
+    expected_identity = snapshot.published_identity
 
     if snapshot.original_bytes is None:
         _remove_owned_output(snapshot.target, expected_identity)
@@ -288,8 +313,33 @@ def _restore_snapshot(
 
     if _identity(snapshot.target.path) != expected_identity:
         raise ImageOutputError("transaction output identity changed during rollback")
-    publisher = publish_bytes if strict else publish_decoded_image_bytes
-    publisher(snapshot.original_bytes, snapshot.target, overwrite=True)
+    image_output.publish_opaque_bytes_with_identity(
+        snapshot.original_bytes,
+        snapshot.target,
+        expected_existing_identity=expected_identity,
+    )
+
+
+def _publish_transaction_member(
+    data: bytes,
+    target: PreparedTarget,
+    overwrite: bool,
+    strict: bool,
+) -> Tuple[int, int]:
+    """Publish and return the inode installed by this transaction member."""
+    if strict:
+        published = image_output.publish_bytes_with_identity(
+            data, target, overwrite=overwrite
+        )
+    else:
+        published = image_output.publish_decoded_image_bytes_with_identity(
+            data, target, overwrite=overwrite
+        )
+    return published.device, published.inode
+
+
+def _transaction_checkpoint(_phase: str, _snapshot: _OutputSnapshot) -> None:
+    """A no-op boundary after publication ownership has been recorded."""
 
 
 def _publish_host_pair(
@@ -303,18 +353,19 @@ def _publish_host_pair(
     raw_snapshot = _snapshot_output(raw_target)
     master_snapshot = _snapshot_output(target)
     try:
-        publish_decoded_image_bytes(raw_data, raw_target, overwrite=overwrite)
-        raw_snapshot.published_identity = _identity(raw_target.path)
-        publish_bytes(normalized_data, target, overwrite=overwrite)
-        master_snapshot.published_identity = _identity(target.path)
+        raw_snapshot.published_identity = _publish_transaction_member(
+            raw_data, raw_target, overwrite, strict=False
+        )
+        _transaction_checkpoint("raw", raw_snapshot)
+        master_snapshot.published_identity = _publish_transaction_member(
+            normalized_data, target, overwrite, strict=True
+        )
+        _transaction_checkpoint("master", master_snapshot)
     except ImageOutputError as original_error:
         rollback_error = None
-        for snapshot, expected_data, strict in (
-            (master_snapshot, normalized_data, True),
-            (raw_snapshot, raw_data, False),
-        ):
+        for snapshot in (master_snapshot, raw_snapshot):
             try:
-                _restore_snapshot(snapshot, expected_data, strict)
+                _restore_snapshot(snapshot)
             except ImageOutputError as error:
                 rollback_error = error
         if rollback_error is not None:

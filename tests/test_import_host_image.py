@@ -101,10 +101,17 @@ class HostImageImportTests(unittest.TestCase):
             artifact = import_host_image.HostArtifact.inline_bytes(
                 patterned_image_bytes(), "image/png"
             )
+            real_publish = import_host_image._publish_transaction_member
+
+            def fail_master(data, target, overwrite, strict):
+                if strict:
+                    raise image_output.ImageOutputError("forced master failure")
+                return real_publish(data, target, overwrite, strict)
+
             with mock.patch.object(
                 import_host_image,
-                "publish_bytes",
-                side_effect=image_output.ImageOutputError("forced master failure"),
+                "_publish_transaction_member",
+                side_effect=fail_master,
             ):
                 failed = import_host_image.import_host_artifact(
                     artifact, "out/slide.png", root, provider="openai"
@@ -131,21 +138,17 @@ class HostImageImportTests(unittest.TestCase):
             raw.write_bytes(patterned_image_bytes())
             previous_master = master.read_bytes()
             previous_raw = raw.read_bytes()
-            real_publish = import_host_image.publish_bytes
-            attempts = 0
+            phases = []
 
-            def publish_then_fail_once(data, target, overwrite=False):
-                nonlocal attempts
-                attempts += 1
-                result = real_publish(data, target, overwrite=overwrite)
-                if attempts == 1:
+            def fail_after_master_publish(phase, _snapshot):
+                phases.append(phase)
+                if phase == "master":
                     raise image_output.ImageOutputError("forced master failure")
-                return result
 
             with mock.patch.object(
                 import_host_image,
-                "publish_bytes",
-                side_effect=publish_then_fail_once,
+                "_transaction_checkpoint",
+                side_effect=fail_after_master_publish,
             ):
                 failed = import_host_image.import_host_artifact(
                     import_host_image.HostArtifact.inline_bytes(
@@ -160,9 +163,128 @@ class HostImageImportTests(unittest.TestCase):
             self.assertEqual(failed.status, GenerationStatus.LOCAL_FAILURE)
             self.assertEqual(master.read_bytes(), previous_master)
             self.assertEqual(raw.read_bytes(), previous_raw)
-            self.assertEqual(attempts, 2)
+            self.assertEqual(phases, ["raw", "master"])
             self.assertEqual(list(root.rglob(".*.tmp")), [])
             self.assertEqual(list(root.rglob("*.backup")), [])
+
+    def test_force_prewrite_master_failure_restores_invalid_existing_raw_bytes(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            master = root / "out" / "slide.png"
+            raw = root / "out" / "raw" / "slide.png"
+            raw.parent.mkdir(parents=True)
+            master.write_bytes(image_bytes("PNG", (160, 90)))
+            previous_master = master.read_bytes()
+            previous_raw = b"old raw is deliberately not an image"
+            raw.write_bytes(previous_raw)
+            real_publish = import_host_image._publish_transaction_member
+
+            def fail_master(data, target, overwrite, strict):
+                if strict:
+                    raise image_output.ImageOutputError("forced pre-write failure")
+                return real_publish(data, target, overwrite, strict)
+
+            with mock.patch.object(
+                import_host_image,
+                "_publish_transaction_member",
+                side_effect=fail_master,
+            ):
+                failed = import_host_image.import_host_artifact(
+                    import_host_image.HostArtifact.inline_bytes(
+                        patterned_image_bytes(), "image/png"
+                    ),
+                    "out/slide.png",
+                    root,
+                    provider="openai",
+                    overwrite=True,
+                )
+
+            self.assertEqual(failed.status, GenerationStatus.LOCAL_FAILURE)
+            self.assertEqual(master.read_bytes(), previous_master)
+            self.assertEqual(raw.read_bytes(), previous_raw)
+            self.assertEqual(list(root.rglob(".*.tmp")), [])
+
+    def test_force_postwrite_failure_restores_invalid_existing_master_bytes(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            master = root / "out" / "slide.png"
+            raw = root / "out" / "raw" / "slide.png"
+            raw.parent.mkdir(parents=True)
+            previous_master = b"old master is deliberately not an image"
+            previous_raw = patterned_image_bytes()
+            master.write_bytes(previous_master)
+            raw.write_bytes(previous_raw)
+
+            def fail_after_master_publish(phase, _snapshot):
+                if phase == "master":
+                    raise image_output.ImageOutputError("forced post-write failure")
+
+            with mock.patch.object(
+                import_host_image,
+                "_transaction_checkpoint",
+                side_effect=fail_after_master_publish,
+            ):
+                failed = import_host_image.import_host_artifact(
+                    import_host_image.HostArtifact.inline_bytes(
+                        patterned_image_bytes(), "image/png"
+                    ),
+                    "out/slide.png",
+                    root,
+                    provider="openai",
+                    overwrite=True,
+                )
+
+            self.assertEqual(failed.status, GenerationStatus.LOCAL_FAILURE)
+            self.assertEqual(master.read_bytes(), previous_master)
+            self.assertEqual(raw.read_bytes(), previous_raw)
+            self.assertEqual(list(root.rglob(".*.tmp")), [])
+
+    def test_same_byte_external_replacement_is_not_treated_as_transaction_owned(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            master = root / "out" / "slide.png"
+            master.parent.mkdir(parents=True)
+            master.write_bytes(image_bytes("PNG", (160, 90)))
+            replacement_identity = None
+            replacement_bytes = None
+
+            def externally_replace_master(phase, snapshot):
+                nonlocal replacement_bytes, replacement_identity
+                if phase != "master":
+                    return
+                published = snapshot.target.path.read_bytes()
+                snapshot.target.path.unlink()
+                snapshot.target.path.write_bytes(published)
+                replacement_bytes = published
+                replacement_identity = (
+                    snapshot.target.path.stat().st_dev,
+                    snapshot.target.path.stat().st_ino,
+                )
+                raise image_output.ImageOutputError("external replacement after publish")
+
+            with mock.patch.object(
+                import_host_image,
+                "_transaction_checkpoint",
+                side_effect=externally_replace_master,
+            ):
+                failed = import_host_image.import_host_artifact(
+                    import_host_image.HostArtifact.inline_bytes(
+                        patterned_image_bytes(), "image/png"
+                    ),
+                    "out/slide.png",
+                    root,
+                    provider="openai",
+                    overwrite=True,
+                )
+
+            self.assertEqual(failed.status, GenerationStatus.LOCAL_FAILURE)
+            self.assertIsNotNone(replacement_identity)
+            self.assertEqual(master.read_bytes(), replacement_bytes)
+            self.assertEqual(
+                (master.stat().st_dev, master.stat().st_ino), replacement_identity
+            )
+            self.assertFalse((root / "out" / "raw" / "slide.png").exists())
+            self.assertEqual(list(root.rglob(".*.tmp")), [])
 
     def test_near_ratio_is_normalized_before_strict_validation(self):
         with tempfile.TemporaryDirectory() as temp_dir:
