@@ -240,6 +240,97 @@ class HostImageImportTests(unittest.TestCase):
             self.assertEqual(raw.read_bytes(), b"")
             self.assertEqual(list(root.rglob(".*.tmp")), [])
 
+    def test_external_master_deletion_before_prewrite_failure_is_incomplete(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            master = root / "out" / "slide.png"
+            raw = root / "out" / "raw" / "slide.png"
+            raw.parent.mkdir(parents=True)
+            master.write_bytes(image_bytes("PNG", (160, 90)))
+            previous_raw = patterned_image_bytes()
+            raw.write_bytes(previous_raw)
+            real_publish = import_host_image._publish_transaction_member
+
+            def externally_delete_then_fail(data, target, overwrite, strict):
+                if strict:
+                    target.path.unlink()
+                    raise image_output.ImageOutputError("forced pre-write failure")
+                return real_publish(data, target, overwrite, strict)
+
+            with mock.patch.object(
+                import_host_image,
+                "_publish_transaction_member",
+                side_effect=externally_delete_then_fail,
+            ):
+                failed = import_host_image.import_host_artifact(
+                    import_host_image.HostArtifact.inline_bytes(
+                        patterned_image_bytes(), "image/png"
+                    ),
+                    "out/slide.png",
+                    root,
+                    provider="openai",
+                    overwrite=True,
+                )
+
+            self.assertEqual(failed.status, GenerationStatus.LOCAL_FAILURE)
+            self.assertIn("rollback was incomplete", failed.safe_message)
+            self.assertFalse(master.exists())
+            self.assertEqual(raw.read_bytes(), previous_raw)
+            self.assertEqual(list(root.rglob(".*.tmp")), [])
+
+    def test_internal_parent_check_cleanup_recreates_old_master_snapshot(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            master = root / "out" / "slide.png"
+            raw = root / "out" / "raw" / "slide.png"
+            raw.parent.mkdir(parents=True)
+            previous_master = image_bytes("PNG", (160, 90))
+            previous_raw = patterned_image_bytes()
+            master.write_bytes(previous_master)
+            raw.write_bytes(previous_raw)
+            real_rename = image_output.os.rename
+            real_verify = image_output.verify_parent_identity
+            rename_count = 0
+            parent_check_failed = False
+
+            def count_rename(*args, **kwargs):
+                nonlocal rename_count
+                rename_count += 1
+                return real_rename(*args, **kwargs)
+
+            def fail_after_second_rename(parent):
+                nonlocal parent_check_failed
+                if rename_count == 2 and not parent_check_failed:
+                    parent_check_failed = True
+                    raise image_output.ImageOutputError("forced parent verification failure")
+                return real_verify(parent)
+
+            with mock.patch.object(
+                image_output.os, "rename", side_effect=count_rename
+            ), mock.patch.object(
+                image_output,
+                "verify_parent_identity",
+                side_effect=fail_after_second_rename,
+            ):
+                failed = import_host_image.import_host_artifact(
+                    import_host_image.HostArtifact.inline_bytes(
+                        patterned_image_bytes(), "image/png"
+                    ),
+                    "out/slide.png",
+                    root,
+                    provider="openai",
+                    overwrite=True,
+                )
+
+            self.assertTrue(parent_check_failed)
+            self.assertEqual(failed.status, GenerationStatus.LOCAL_FAILURE)
+            self.assertEqual(failed.safe_message, "host artifact could not be published")
+            self.assertTrue(master.exists())
+            if master.exists():
+                self.assertEqual(master.read_bytes(), previous_master)
+            self.assertEqual(raw.read_bytes(), previous_raw)
+            self.assertEqual(list(root.rglob(".*.tmp")), [])
+
     def test_force_postwrite_failure_restores_invalid_existing_master_bytes(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

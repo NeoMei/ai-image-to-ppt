@@ -63,6 +63,10 @@ class PublishedOutputError(ImageOutputError):
         self.inode = inode
 
 
+class RemovedPublishedOutputError(PublishedOutputError):
+    """A publisher proved it removed its own just-installed output."""
+
+
 class LoadedImage(NamedTuple):
     image: Optional[Image.Image]
     image_format: str
@@ -1013,7 +1017,7 @@ def _validate_expected_existing_identity(identity: object) -> tuple:
 def _remove_published_target(
     temporary: TemporaryOutput,
     name: str,
-) -> None:
+) -> bool:
     try:
         current = os.stat(
             name,
@@ -1025,12 +1029,13 @@ def _remove_published_target(
             or current.st_ino != temporary.inode
             or not stat.S_ISREG(current.st_mode)
         ):
-            return
+            return False
         os.unlink(name, dir_fd=temporary.parent_fd)
+        return True
     except FileNotFoundError:
-        return
+        return False
     except OSError:
-        return
+        return False
 
 
 def _publish_temp(
@@ -1087,14 +1092,20 @@ def _publish_temp(
             raise ImageOutputError("published output identity changed")
         try:
             verify_parent_identity(prepared.parent)
-        except ImageOutputError:
-            _remove_published_target(temp_path, prepared.name)
+        except ImageOutputError as error:
+            if _remove_published_target(temp_path, prepared.name):
+                raise RemovedPublishedOutputError(
+                    str(error),
+                    *installed_identity,
+                ) from error
             installed_identity = None
             raise
     except FileExistsError as error:
         raise ImageOutputError(
             f"output already exists; refusing to overwrite: {prepared.path}"
         ) from error
+    except RemovedPublishedOutputError:
+        raise
     except ImageOutputError as error:
         if installed_identity is not None:
             raise PublishedOutputError(
@@ -1234,6 +1245,20 @@ def publish_opaque_bytes_with_identity(
         data,
         target,
         expected_identity,
+    )
+
+
+def publish_opaque_bytes_if_missing(
+    data: bytes,
+    target: TargetValue,
+) -> PublishedOutput:
+    """Restore opaque snapshot bytes only if no current pathname exists."""
+    return _publish_image_bytes(
+        data,
+        target,
+        False,
+        _validate_opaque_bytes,
+        allow_empty=True,
     )
 
 

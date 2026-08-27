@@ -45,6 +45,7 @@ class _OutputSnapshot:
     original_bytes: Optional[bytes]
     original_identity: Optional[Tuple[int, int]]
     published_identity: Optional[Tuple[int, int]] = None
+    published_was_removed: bool = False
 
 
 class _PublishedMemberError(ImageOutputError):
@@ -53,6 +54,7 @@ class _PublishedMemberError(ImageOutputError):
     def __init__(self, error: image_output.PublishedOutputError):
         super().__init__(str(error))
         self.identity = (error.device, error.inode)
+        self.was_removed = isinstance(error, image_output.RemovedPublishedOutputError)
 
 
 @dataclass(frozen=True)
@@ -309,9 +311,21 @@ def _restore_snapshot(
     current_identity = _identity(snapshot.target.path)
     if current_identity == snapshot.original_identity:
         return
+    if snapshot.published_was_removed:
+        if current_identity is not None:
+            raise ImageOutputError("transaction output changed during rollback")
+        if snapshot.original_identity is None:
+            return
+        image_output.publish_opaque_bytes_if_missing(
+            snapshot.original_bytes,
+            snapshot.target,
+        )
+        return
     if snapshot.published_identity is None:
         if current_identity is None:
-            return
+            if snapshot.original_identity is None:
+                return
+            raise ImageOutputError("transaction output is missing during rollback")
         raise ImageOutputError("transaction output ownership is unknown during rollback")
     expected_identity = snapshot.published_identity
 
@@ -362,6 +376,7 @@ def _publish_and_record_transaction_member(
         )
     except _PublishedMemberError as error:
         snapshot.published_identity = error.identity
+        snapshot.published_was_removed = error.was_removed
         raise
 
 
