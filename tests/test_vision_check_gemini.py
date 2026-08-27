@@ -557,6 +557,10 @@ class GeminiVisionCliTests(unittest.TestCase):
         )
         self.assertEqual(help_result.returncode, 0)
         self.assertIn("usage:", help_result.stdout.lower())
+        self.assertIn(
+            f"0..{vision_check_gemini.MAX_RETRIES}",
+            " ".join(help_result.stdout.split()),
+        )
         self.assertNotIn("Traceback", help_result.stderr)
         self.assertEqual(missing_result.returncode, 2)
         self.assertIn("usage:", missing_result.stderr.lower())

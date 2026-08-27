@@ -616,20 +616,17 @@ class ExportImagesTests(unittest.TestCase):
                 if force:
                     pdf.write_bytes(b"old-pdf")
                     pptx.write_bytes(b"old-pptx")
-                real_write_journal = export_images._write_journal
-                writes = 0
+                marker_writes = 0
 
-                def fail_commit_write(journal, state, parent):
-                    nonlocal writes
-                    writes += 1
-                    if writes == 2:
-                        raise OSError("commit journal write failed")
-                    return real_write_journal(journal, state, parent)
+                def fail_commit_write(marker, state, parent):
+                    nonlocal marker_writes
+                    marker_writes += 1
+                    raise OSError("commit marker write failed")
 
                 stderr = io.StringIO()
                 with mock.patch.object(
                     export_images,
-                    "_write_journal",
+                    "_write_commit_marker",
                     side_effect=fail_commit_write,
                 ), redirect_stderr(stderr):
                     self.assertFalse(
@@ -638,8 +635,8 @@ class ExportImagesTests(unittest.TestCase):
                         )
                     )
 
-                self.assertEqual(writes, 2)
-                self.assertIn("commit journal write failed", stderr.getvalue())
+                self.assertEqual(marker_writes, 1)
+                self.assertIn("commit marker write failed", stderr.getvalue())
                 if force:
                     self.assertEqual(pdf.read_bytes(), b"old-pdf")
                     self.assertEqual(pptx.read_bytes(), b"old-pptx")
@@ -657,31 +654,30 @@ class ExportImagesTests(unittest.TestCase):
             prefix = root / "deck"
             pdf = prefix.with_suffix(".pdf")
             self._image(source)
-            real_write_journal = export_images._write_journal
-            writes = 0
+            real_write_marker = export_images._write_commit_marker
+            marker_writes = 0
 
-            def replace_after_commit(journal, state, parent):
-                nonlocal writes
-                writes += 1
-                result = real_write_journal(journal, state, parent)
-                if state["decision"] == "commit":
-                    pdf.unlink()
-                    pdf.write_bytes(b"external-pdf")
+            def replace_after_commit(marker, state, parent):
+                nonlocal marker_writes
+                marker_writes += 1
+                result = real_write_marker(marker, state, parent)
+                pdf.unlink()
+                pdf.write_bytes(b"external-pdf")
                 return result
 
             stderr = io.StringIO()
             with mock.patch.object(
                 export_images,
-                "_write_journal",
+                "_write_commit_marker",
                 side_effect=replace_after_commit,
             ), redirect_stderr(stderr):
                 self.assertFalse(
                     export_images.export_deck([str(source)], str(prefix))
                 )
 
-            self.assertEqual(writes, 2)
+            self.assertEqual(marker_writes, 1)
             self.assertEqual(pdf.read_bytes(), b"external-pdf")
-            self.assertEqual(len(list(root.glob(".deck.*journal*"))), 1)
+            self.assertEqual(len(list(root.glob(".deck.*journal*"))), 2)
             self.assertIn("external target preserved", stderr.getvalue())
 
     def test_recovery_preserves_external_replacement_and_recovery_assets(self):
@@ -754,6 +750,59 @@ class ExportImagesTests(unittest.TestCase):
             load_all.assert_not_called()
             self.assertTrue(journal.is_file())
             self.assertIn("invalid export recovery journal", stderr.getvalue())
+
+    def test_deep_recovery_journal_maps_to_oserror_without_side_effects(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            prefix = root / "deck"
+            journal = root / (
+                ".deck" + export_images.JOURNAL_SUFFIX
+            )
+            deep_json = ("[" * 10_000 + "0" + "]" * 10_000).encode("utf-8")
+            journal.write_bytes(deep_json)
+            targets = [
+                export_images.resolve_output_path(prefix.with_suffix(".pdf")),
+                export_images.resolve_output_path(prefix.with_suffix(".pptx")),
+            ]
+            parent = export_images.prepare_target(targets[0]).parent
+
+            with self.assertRaisesRegex(
+                OSError, "cannot read export recovery journal"
+            ):
+                export_images._load_journal(journal, targets, parent)
+
+            self.assertEqual(journal.read_bytes(), deep_json)
+            self.assertFalse(prefix.with_suffix(".pdf").exists())
+            self.assertFalse(prefix.with_suffix(".pptx").exists())
+            self.assertEqual(list(root.glob(".*.tmp.*")), [])
+            self.assertEqual(list(root.glob(".*.backup")), [])
+
+    def test_cli_deep_recovery_journal_is_controlled_and_preserved(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            prefix = root / "deck"
+            journal = root / (
+                ".deck" + export_images.JOURNAL_SUFFIX
+            )
+            deep_json = ("[" * 10_000 + "0" + "]" * 10_000).encode("utf-8")
+            journal.write_bytes(deep_json)
+            stderr = io.StringIO()
+
+            with mock.patch.object(export_images, "_load_all") as load_all, \
+                 redirect_stderr(stderr):
+                result = export_images.main(
+                    [str(prefix), str(root / "missing.png")]
+                )
+
+            self.assertEqual(result, 1)
+            load_all.assert_not_called()
+            self.assertIn("cannot read export recovery journal", stderr.getvalue())
+            self.assertNotIn("Traceback", stderr.getvalue())
+            self.assertEqual(journal.read_bytes(), deep_json)
+            self.assertFalse(prefix.with_suffix(".pdf").exists())
+            self.assertFalse(prefix.with_suffix(".pptx").exists())
+            self.assertEqual(list(root.glob(".*.tmp.*")), [])
+            self.assertEqual(list(root.glob(".*.backup")), [])
 
     def test_cli_pair_publication_rolls_back_if_second_publish_fails(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -889,14 +938,18 @@ class ExportImagesTests(unittest.TestCase):
 
             def replace_pdf_then_fail_pptx(source_path, target_path, *args, **kwargs):
                 nonlocal publish_count
-                publish_count += 1
                 target = Path(target_path)
+                if ".tmp" not in Path(source_path).name:
+                    return real_link(source_path, target_path, *args, **kwargs)
+                publish_count += 1
                 if publish_count == 1:
                     result = real_link(source_path, target_path, *args, **kwargs)
                     target.unlink()
                     target.write_bytes(b"external-pdf")
                     return result
-                raise OSError("forced second publish failure")
+                if publish_count == 2:
+                    raise OSError("forced second publish failure")
+                return real_link(source_path, target_path, *args, **kwargs)
 
             stderr = io.StringIO()
             with mock.patch.object(
@@ -927,6 +980,8 @@ class ExportImagesTests(unittest.TestCase):
 
             def create_external_pptx(source_path, target_path, *args, **kwargs):
                 nonlocal publish_count
+                if ".tmp" not in Path(source_path).name:
+                    return real_link(source_path, target_path, *args, **kwargs)
                 publish_count += 1
                 if publish_count == 2:
                     Path(target_path).write_bytes(b"external-pptx")
@@ -953,15 +1008,19 @@ class ExportImagesTests(unittest.TestCase):
             prefix = Path(temp_dir) / "deck"
             self._image(source)
             real_unlink = export_images.os.unlink
+            quarantine_unlinks = {}
 
             def deny_transaction_temp(path, *args, **kwargs):
                 candidate = Path(path)
                 if (
                     candidate.parent.resolve(strict=False)
                     == Path(temp_dir).resolve(strict=False)
-                    and ".tmp." in candidate.name
+                    and candidate.name.endswith(".quarantine")
                 ):
-                    raise PermissionError("forced temp cleanup denial")
+                    count = quarantine_unlinks.get(candidate, 0)
+                    quarantine_unlinks[candidate] = count + 1
+                    if count:
+                        raise PermissionError("forced temp cleanup denial")
                 return real_unlink(path, *args, **kwargs)
 
             stderr = io.StringIO()
@@ -974,8 +1033,8 @@ class ExportImagesTests(unittest.TestCase):
 
             self.assertTrue(prefix.with_suffix(".pdf").is_file())
             self.assertTrue(prefix.with_suffix(".pptx").is_file())
-            stale = list(Path(temp_dir).glob(".*.tmp.*"))
-            self.assertEqual(len(stale), 2)
+            stale = list(Path(temp_dir).glob("*.quarantine"))
+            self.assertEqual(len(stale), 3)
             self.assertIn("WARN:", stderr.getvalue())
             for path in stale:
                 self.assertIn(str(path), stderr.getvalue())
@@ -1065,40 +1124,35 @@ class ExportImagesTests(unittest.TestCase):
             self._image(source)
             pptx.write_bytes(b"old-pptx")
             real_link = export_images.os.link
-            real_replace = export_images.os.replace
-            real_unlink = export_images.os.unlink
+            real_rename = export_images.os.rename
             publish_count = 0
             restore_attempts = []
 
-            def fail_second_publish(source_path, target_path, *args, **kwargs):
+            def link_with_publish_failure(source_path, target_path, *args, **kwargs):
                 nonlocal publish_count
-                publish_count += 1
-                if publish_count == 2:
-                    raise OSError("forced second publish failure")
+                source_name = Path(source_path).name
+                if source_name.endswith(".quarantine"):
+                    restore_attempts.append(Path(target_path))
+                    return real_link(source_path, target_path, *args, **kwargs)
+                if ".tmp" in source_name:
+                    publish_count += 1
+                    if publish_count == 2:
+                        raise OSError("forced second publish failure")
                 return real_link(source_path, target_path, *args, **kwargs)
 
-            def fail_published_cleanup(path, *args, **kwargs):
-                if Path(path) == resolved_pdf:
+            def fail_published_cleanup(source_path, target_path, *args, **kwargs):
+                if Path(source_path) == resolved_pdf:
                     raise OSError("forced published unlink failure")
-                return real_unlink(path, *args, **kwargs)
-
-            def record_restore(source_path, target_path, *args, **kwargs):
-                if str(source_path).endswith(".backup"):
-                    restore_attempts.append(Path(target_path))
-                return real_replace(source_path, target_path, *args, **kwargs)
+                return real_rename(source_path, target_path, *args, **kwargs)
 
             with mock.patch.object(
                 export_images.os,
                 "link",
-                side_effect=fail_second_publish,
+                side_effect=link_with_publish_failure,
             ), mock.patch.object(
                 export_images.os,
-                "unlink",
+                "rename",
                 side_effect=fail_published_cleanup,
-            ), mock.patch.object(
-                export_images.os,
-                "replace",
-                side_effect=record_restore,
             ):
                 result = export_images.main(
                     ["--force", str(prefix), str(source)]
@@ -1123,7 +1177,7 @@ class ExportImagesTests(unittest.TestCase):
             first_temp.write_bytes(b"pdf")
             second_temp.write_bytes(b"pptx")
             real_link = export_images.os.link
-            real_unlink = export_images.os.unlink
+            real_rename = export_images.os.rename
             publish_count = 0
             primary = "PRIMARY-second-publish-" + ("P" * 1000)
 
@@ -1134,15 +1188,15 @@ class ExportImagesTests(unittest.TestCase):
                     raise OSError(primary)
                 return real_link(source_path, target_path, *args, **kwargs)
 
-            def fail_cleanup(path, *args, **kwargs):
-                if Path(path) == pdf:
+            def fail_cleanup(source_path, target_path, *args, **kwargs):
+                if Path(source_path) == pdf:
                     raise OSError("SECONDARY-cleanup")
-                return real_unlink(path, *args, **kwargs)
+                return real_rename(source_path, target_path, *args, **kwargs)
 
             with mock.patch.object(
                 export_images.os, "link", side_effect=fail_second_publish
             ), mock.patch.object(
-                export_images.os, "unlink", side_effect=fail_cleanup
+                export_images.os, "rename", side_effect=fail_cleanup
             ):
                 with self.assertRaises(OSError) as caught:
                     export_images._publish_pair(
@@ -1168,7 +1222,7 @@ class ExportImagesTests(unittest.TestCase):
             pdf = export_images.resolve_output_path(prefix.with_suffix(".pdf"))
             self._image(source)
             real_link = export_images.os.link
-            real_unlink = export_images.os.unlink
+            real_rename = export_images.os.rename
             publish_count = 0
 
             def fail_second_publish(source_path, target_path, *args, **kwargs):
@@ -1178,16 +1232,16 @@ class ExportImagesTests(unittest.TestCase):
                     raise OSError("PRIMARY-cli-publish")
                 return real_link(source_path, target_path, *args, **kwargs)
 
-            def fail_cleanup(path, *args, **kwargs):
-                if Path(path) == pdf:
+            def fail_cleanup(source_path, target_path, *args, **kwargs):
+                if Path(source_path) == pdf:
                     raise OSError("SECONDARY-cli-cleanup")
-                return real_unlink(path, *args, **kwargs)
+                return real_rename(source_path, target_path, *args, **kwargs)
 
             stderr = io.StringIO()
             with mock.patch.object(
                 export_images.os, "link", side_effect=fail_second_publish
             ), mock.patch.object(
-                export_images.os, "unlink", side_effect=fail_cleanup
+                export_images.os, "rename", side_effect=fail_cleanup
             ), redirect_stderr(stderr):
                 result = export_images.main([str(prefix), str(source)])
 
@@ -1256,34 +1310,31 @@ class ExportImagesTests(unittest.TestCase):
                 pdf.write_bytes(b"old-pdf")
                 pptx.write_bytes(b"old-pptx")
                 real_link = export_images.os.link
-                real_replace = export_images.os.replace
                 publish_count = 0
                 restore_attempts = []
 
-                def fail_second_publish(source_path, target_path, *args, **kwargs):
+                def link_with_failures(source_path, target_path, *args, **kwargs):
                     nonlocal publish_count
-                    publish_count += 1
-                    if publish_count == 2:
-                        raise OSError("forced second publish failure")
-                    return real_link(source_path, target_path, *args, **kwargs)
-
-                def fail_selected_restore(source_path, target_path, *args, **kwargs):
-                    if str(source_path).endswith(".backup"):
+                    source_name = Path(source_path).name
+                    if source_name.endswith(".quarantine") and Path(target_path).name in (
+                        "deck.pdf",
+                        "deck.pptx",
+                    ):
                         target = Path(target_path)
                         restore_attempts.append(target.name)
                         if target.name == failed_name:
                             raise OSError(f"forced restore failure for {failed_name}")
-                    return real_replace(source_path, target_path, *args, **kwargs)
+                    elif ".tmp" in source_name:
+                        publish_count += 1
+                        if publish_count == 2:
+                            raise OSError("forced second publish failure")
+                    return real_link(source_path, target_path, *args, **kwargs)
 
                 stderr = io.StringIO()
                 with mock.patch.object(
                     export_images.os,
                     "link",
-                    side_effect=fail_second_publish,
-                ), mock.patch.object(
-                    export_images.os,
-                    "replace",
-                    side_effect=fail_selected_restore,
+                    side_effect=link_with_failures,
                 ), redirect_stderr(stderr):
                     result = export_images.main(
                         ["--force", str(prefix), str(source)]

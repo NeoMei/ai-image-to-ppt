@@ -159,6 +159,7 @@ class RouterTests(unittest.TestCase):
         self.assertIn("Gemini: .png (default), .jpg/.jpeg", help_text)
         self.assertIn("JPEG suffix requests JPEG", help_text)
         self.assertIn("actual encoding and strict 16:9", help_text)
+        self.assertIn(f"0..{gen_slide.MAX_RETRIES}", help_text)
         self.assertNotIn("legacy", help_text.lower())
         self.assertNotIn("provider-returned", help_text)
 

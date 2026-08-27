@@ -60,6 +60,7 @@ All in `scripts/` directory. Copy to project or add to `PYTHONPATH`.
 | `prepare_editable_input.py` | Editable-converter handoff | Exact 1280x720 PNG |
 | `vision_check_gemini.py` | Gemini visual self-check | `gemini-3.6-flash` |
 | `export_images.py` | Local export | PDF + PPTX |
+| `cleanup_output_locks.py` | Explicit offline maintenance | Removes old stable hashed lock files |
 
 ## Workflow
 
@@ -156,19 +157,33 @@ if USE_CLI:
     )
 else:
     sys.path.insert(0, "scripts")
-    from export_images import export_pdf, export_pptx
+    from export_images import export_deck
 
-    export_pdf(SLIDES, "deck.pdf")
-    export_pptx(SLIDES, "deck.pptx")
+    if not export_deck(SLIDES, "deck_name"):
+        raise SystemExit("deck export failed")
 ```
 
 The CLI validates all source images before publishing, creates missing output
-directories, and uses a durable same-directory journal so an interrupted
-PDF/PPTX publication is recovered on the next export. Existing outputs are
-preserved unless `--force` is supplied. Transparent pixels are composited onto
-the style's cream `#f8f5f0` background rather than black. A deck is limited to
-128 slides and 512 MiB of aggregate source bytes; over-limit Python or CLI calls
-stop before image decoding or PDF/PPTX serialization.
+directories, and uses a same-directory recovery journal so interrupted PDF/PPTX
+publication can be repaired on the next export. On POSIX, file and directory
+fsync cover process crashes and power-loss metadata recovery. On Windows,
+recovery covers process crashes only and does not promise power-loss durability.
+Existing outputs are preserved unless `--force` is supplied. Transparent pixels
+are composited onto the style's cream `#f8f5f0` background rather than black. A
+deck is limited to 128 slides and 512 MiB of aggregate source bytes; over-limit
+Python or CLI calls stop before image decoding or PDF/PPTX serialization.
+
+Stable hashed lock files intentionally persist because automatically unlinking a
+lock file can split ownership between processes. Optional cleanup never runs
+automatically. Run it ONLY while no generation or export process is running:
+
+```bash
+python3 scripts/cleanup_output_locks.py --older-than-days 30
+```
+
+Because cleanup uses pathname age checks and removal, the offline precondition
+is the safety boundary for pathname races. Filesystem failures stop cleanup,
+return exit 1 without a traceback, and do not roll back earlier removals.
 
 ## Style Template (Educational Textbook)
 

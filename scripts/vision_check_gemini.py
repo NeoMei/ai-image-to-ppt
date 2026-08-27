@@ -289,7 +289,7 @@ def _parser() -> argparse.ArgumentParser:
         "--retries",
         type=_non_negative,
         default=2,
-        help="transient retry count (default: 2)",
+        help=f"transient retry count, 0..{MAX_RETRIES} (default: 2)",
     )
     return parser
 

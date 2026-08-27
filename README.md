@@ -68,12 +68,14 @@ python3 scripts/vision_check_gemini.py out/slide_01.jpg "精确数一下卡片�
 ```
 
 The export command validates every image before publishing either artifact,
-creates missing parent directories, and uses a durable same-directory journal
-to make interrupted PDF/PPTX publication recoverable on the next export. It
-refuses existing outputs by default; add `--force` to replace an existing pair
-with rollback and crash-recovery protection. One deck accepts at most 128 slides
-and 512 MiB of aggregate source image bytes; larger Python or CLI requests fail
-before image decoding or PDF/PPTX serialization.
+creates missing parent directories, and uses a same-directory recovery journal
+so interrupted PDF/PPTX publication can be repaired on the next export. On
+POSIX, file and directory fsync cover process crashes and power-loss metadata
+recovery. On Windows, recovery covers process crashes only and does not promise
+power-loss durability. It refuses existing outputs by default; add `--force` to
+replace an existing pair with rollback and crash-recovery protection. One deck
+accepts at most 128 slides and 512 MiB of aggregate source image bytes; larger
+Python or CLI requests fail before image decoding or PDF/PPTX serialization.
 
 脚本内调用（批量并发生成见 [SKILL.md](SKILL.md)）：
 
@@ -119,10 +121,10 @@ if USE_CLI:
     )
 else:
     sys.path.insert(0, "scripts")
-    from export_images import export_pdf, export_pptx
+    from export_images import export_deck
 
-    export_pdf(SLIDES, "deck.pdf")
-    export_pptx(SLIDES, "deck.pptx")
+    if not export_deck(SLIDES, "deck_name"):
+        raise SystemExit("deck export failed")
 ```
 
 ## Scripts
@@ -136,6 +138,7 @@ else:
 | `prepare_editable_input.py` | Editable-converter handoff | Deterministic 1280x720 PNG |
 | `vision_check_gemini.py` | Gemini visual self-check | `gemini-3.6-flash` |
 | `export_images.py` | Local export | PDF + PPTX |
+| `cleanup_output_locks.py` | Explicit offline maintenance | Removes old stable hashed lock files |
 
 The router does not automatically switch providers: choose fallback engines explicitly. Provider pricing can change; consult the [OpenAI API pricing documentation](https://developers.openai.com/api/docs/pricing) instead of relying on a fixed per-image estimate.
 
@@ -149,6 +152,18 @@ outputs by default and makes no provider request; pass `overwrite=True` in Pytho
 or `--force` on the CLI only when replacement is intentional.
 
 Concurrent work on the same output fails fast before contacting a provider.
+Stable hashed lock files intentionally persist because automatically unlinking a
+lock file can split ownership between processes. Optional cleanup never runs
+automatically. Run it ONLY while no generation or export process is running:
+
+```bash
+python3 scripts/cleanup_output_locks.py --older-than-days 30
+```
+
+Because cleanup uses pathname age checks and removal, the offline precondition
+is the safety boundary for pathname races. Filesystem failures stop cleanup,
+return exit 1 without a traceback, and do not roll back earlier removals.
+
 Generation outputs and inputs to ordinary export or editable preparation are
 capped at 50 MiB and 64 megapixels. Vision-check inputs have a separate 14 MiB
 limit. Parent-directory replacement is detected before publication, and

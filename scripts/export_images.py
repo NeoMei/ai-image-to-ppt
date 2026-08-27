@@ -10,6 +10,7 @@ import os
 import stat
 import sys
 import tempfile
+from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
 from typing import Callable, Iterable, List, Optional, Sequence
@@ -22,6 +23,7 @@ from image_output import (
     ParentIdentity,
     capture_path_base,
     load_image,
+    parse_json_response,
     prepare_target,
     prepared_lock_target,
     resolve_input_path,
@@ -36,10 +38,17 @@ SLIDE_H = Emu(6_858_000)  # exact 7.5 inches
 SLIDE_W = Emu(int(SLIDE_H) * 16 // 9)
 JOURNAL_VERSION = 1
 JOURNAL_SUFFIX = ".ai-image-to-ppt-export-journal.json"
+COMMIT_MARKER_SUFFIX = ".commit"
 MAX_JOURNAL_BYTES = 64 * 1024
 MAX_ERROR_SUMMARY = 300
 MAX_DECK_SLIDES = 128
 MAX_DECK_SOURCE_BYTES = 512 * 1024 * 1024
+
+
+@dataclass(frozen=True)
+class LoadedJournal:
+    state: object
+    identity: tuple
 
 
 def _flatten_transparency(image: Image.Image) -> Image.Image:
@@ -284,6 +293,10 @@ def _journal_path_for_targets(targets: Sequence[Path]) -> Path:
     return _journal_path(first.parent / prefix_name)
 
 
+def _commit_marker_path(journal: Path) -> Path:
+    return journal.with_name(journal.name + COMMIT_MARKER_SUFFIX)
+
+
 def _file_identity(path: Path) -> Optional[tuple]:
     try:
         current = os.stat(path, follow_symlinks=False)
@@ -305,23 +318,30 @@ def _bounded_error(error: object) -> str:
 
 def _sync_directory(path: Path) -> None:
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-    descriptor = None
     try:
         descriptor = os.open(str(path), flags)
-        os.fsync(descriptor)
     except OSError:
-        if os.name != "nt":
-            raise
-    finally:
-        if descriptor is not None:
+        if os.name == "nt":
+            return
+        raise
+    try:
+        os.fsync(descriptor)
+    except BaseException:
+        try:
             os.close(descriptor)
+        except OSError:
+            pass
+        raise
+    os.close(descriptor)
 
 
 def _write_journal(
     journal: Path,
     state: object,
     parent: ParentIdentity,
-) -> None:
+) -> tuple:
+    if not isinstance(state, dict) or state.get("decision") != "rollback":
+        raise ValueError("initial export journal must record rollback")
     encoded = json.dumps(
         state,
         ensure_ascii=False,
@@ -331,32 +351,97 @@ def _write_journal(
     if len(encoded) > MAX_JOURNAL_BYTES:
         raise OSError("export recovery journal exceeds its size limit")
 
+    # The first journal occupies its discoverable final name while it is made
+    # durable. A private .write name here could strand serialization temps.
     descriptor = None
-    temporary = None
+    journal_identity = None
     try:
         verify_parent_identity(parent)
-        descriptor, temporary = tempfile.mkstemp(
-            prefix=f".{journal.name}.",
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        flags |= getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(str(journal), flags, 0o600)
+        journal_stat = os.fstat(descriptor)
+        journal_identity = (journal_stat.st_dev, journal_stat.st_ino)
+        with os.fdopen(descriptor, "wb") as stream:
+            descriptor = None
+            stream.write(encoded)
+            stream.flush()
+            os.fsync(stream.fileno())
+        _sync_directory(parent.path)
+        return journal_identity
+    except BaseException:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        if journal_identity is not None:
+            _remove_owned_file(
+                journal,
+                journal_identity,
+                "export recovery journal",
+            )
+        raise
+
+
+def _write_commit_marker(
+    marker: Path,
+    state: object,
+    parent: ParentIdentity,
+) -> tuple:
+    """Install a complete commit record without replacing any existing name."""
+    encoded = json.dumps(
+        state,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    if len(encoded) > MAX_JOURNAL_BYTES:
+        raise OSError("export commit marker exceeds its size limit")
+
+    descriptor = None
+    temporary = None
+    temporary_identity = None
+    installed = False
+    try:
+        verify_parent_identity(parent)
+        descriptor, temporary_value = tempfile.mkstemp(
+            prefix=f".{marker.name}.",
             suffix=".write",
             dir=str(parent.path),
         )
+        temporary = Path(temporary_value)
+        temporary_stat = os.fstat(descriptor)
+        temporary_identity = (temporary_stat.st_dev, temporary_stat.st_ino)
         with os.fdopen(descriptor, "wb") as stream:
             descriptor = None
             stream.write(encoded)
             stream.flush()
             os.fsync(stream.fileno())
         verify_parent_identity(parent)
-        os.replace(temporary, journal)
-        temporary = None
+        os.link(temporary, marker, follow_symlinks=False)
+        installed = True
         _sync_directory(parent.path)
+        return temporary_identity
     finally:
         if descriptor is not None:
-            os.close(descriptor)
-        if temporary is not None:
             try:
-                os.unlink(temporary)
+                os.close(descriptor)
             except OSError:
                 pass
+        if temporary is not None and temporary_identity is not None:
+            error = _remove_owned_file(
+                temporary,
+                temporary_identity,
+                "commit marker temporary",
+            )
+            if error is not None and installed:
+                print(
+                    "  WARN: commit marker temporary cleanup is incomplete; "
+                    + _recovery_error("cannot remove temporary", temporary, error),
+                    file=sys.stderr,
+                )
 
 
 def _validated_identity(value: object, label: str) -> tuple:
@@ -373,24 +458,32 @@ def _load_journal(
     journal: Path,
     targets: Sequence[Path],
     parent: ParentIdentity,
-) -> object:
+) -> LoadedJournal:
+    descriptor = None
     try:
-        journal_stat = os.stat(journal, follow_symlinks=False)
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(str(journal), flags)
+        journal_stat = os.fstat(descriptor)
         if not stat.S_ISREG(journal_stat.st_mode):
             raise OSError("export recovery journal is not a regular file")
         if journal_stat.st_size > MAX_JOURNAL_BYTES:
             raise OSError("export recovery journal exceeds its size limit")
-        with journal.open("rb") as stream:
+        with os.fdopen(descriptor, "rb") as stream:
+            descriptor = None
             raw = stream.read(MAX_JOURNAL_BYTES + 1)
         if len(raw) > MAX_JOURNAL_BYTES:
             raise OSError("export recovery journal exceeds its size limit")
-        state = json.loads(raw)
+        state = parse_json_response(raw)
     except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as error:
         if isinstance(error, OSError) and str(error).startswith("export recovery"):
             raise
         raise OSError(
             f"cannot read export recovery journal {journal}: {_bounded_error(error)}"
         ) from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
 
     if not isinstance(state, dict) or state.get("version") != JOURNAL_VERSION:
         raise OSError("invalid export recovery journal version")
@@ -434,22 +527,93 @@ def _load_journal(
             _validated_identity(original_value, "original identity")
         elif backup_value is not None or original_value is not None:
             raise OSError("invalid export recovery journal original state")
-    return state
+    return LoadedJournal(
+        state=state,
+        identity=(journal_stat.st_dev, journal_stat.st_ino),
+    )
 
 
-def _remove_owned_file(
+def _quarantine_path(path: Path) -> Path:
+    descriptor = None
+    quarantine = None
+    try:
+        descriptor, value = tempfile.mkstemp(
+            prefix=".ai-image-to-ppt-recovery-",
+            suffix=".quarantine",
+            dir=str(path.parent),
+        )
+        quarantine = Path(value)
+        os.close(descriptor)
+        descriptor = None
+        os.unlink(quarantine)
+        return quarantine
+    except Exception:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        if quarantine is not None:
+            try:
+                os.unlink(quarantine)
+            except OSError:
+                pass
+        raise
+
+
+def _restore_quarantined_external(
+    quarantine: Path,
+    path: Path,
+    context: str,
+) -> OSError:
+    try:
+        os.link(quarantine, path, follow_symlinks=False)
+        restoration = "restored without clobbering the path"
+    except FileExistsError:
+        restoration = "path was recreated; both objects preserved"
+    except (OSError, TypeError, NotImplementedError) as error:
+        restoration = f"no-clobber restore failed ({_bounded_error(error)})"
+    return OSError(
+        f"{context} ownership changed; external file {restoration}; "
+        f"quarantine preserved at {quarantine}"
+    )
+
+
+def _take_owned_file(
     path: Path,
     expected_identity: tuple,
     context: str,
-) -> Optional[OSError]:
+) -> tuple:
+    """Atomically move one name aside, then verify what was actually moved."""
     try:
         current_identity = _file_identity(path)
     except OSError as error:
-        return error
+        return None, error
     if current_identity is None:
-        return None
+        return None, None
     if current_identity != expected_identity:
-        return OSError(f"{context} ownership changed; external file preserved")
+        return None, OSError(
+            f"{context} ownership changed; external file preserved"
+        )
+
+    try:
+        quarantine = _quarantine_path(path)
+        os.rename(path, quarantine)
+        _sync_directory(path.parent)
+        moved_identity = _file_identity(quarantine)
+    except FileNotFoundError:
+        return None, None
+    except OSError as error:
+        return None, error
+
+    if moved_identity != expected_identity:
+        return None, _restore_quarantined_external(
+            quarantine, path, context
+        )
+    return quarantine, None
+
+
+def _remove_quarantine(path: Path) -> Optional[OSError]:
     last_error = None
     for _attempt in range(2):
         try:
@@ -463,10 +627,34 @@ def _remove_owned_file(
     return last_error
 
 
-def _remove_journal(journal: Path, parent: ParentIdentity) -> None:
+def _remove_owned_file(
+    path: Path,
+    expected_identity: tuple,
+    context: str,
+) -> Optional[OSError]:
+    quarantine, error = _take_owned_file(path, expected_identity, context)
+    if error is not None or quarantine is None:
+        return error
+    cleanup_error = _remove_quarantine(quarantine)
+    if cleanup_error is None:
+        return None
+    return OSError(
+        f"{context} quarantine cleanup failed; owned file preserved at "
+        f"{quarantine}: {_bounded_error(cleanup_error)}"
+    )
+
+
+def _remove_journal(
+    journal: Path,
+    parent: ParentIdentity,
+    expected_identity: tuple,
+) -> None:
     verify_parent_identity(parent)
-    os.unlink(journal)
-    _sync_directory(parent.path)
+    error = _remove_owned_file(
+        journal, expected_identity, "export recovery journal"
+    )
+    if error is not None:
+        raise error
 
 
 def _recovery_error(label: str, path: Path, error: object) -> str:
@@ -477,6 +665,8 @@ def _recover_state(
     state: object,
     journal: Path,
     parent: ParentIdentity,
+    journal_identity: Optional[tuple] = None,
+    commit_marker: Optional[tuple] = None,
 ) -> List[str]:
     records = state["records"]
     decision = state["decision"]
@@ -544,11 +734,48 @@ def _recover_state(
                     continue
                 try:
                     if target_identity == original_identity:
-                        os.unlink(backup)
+                        error = _remove_owned_file(
+                            backup, original_identity, "backup"
+                        )
+                        if error is not None:
+                            raise error
                     else:
-                        os.replace(backup, target)
-                    _sync_directory(parent.path)
-                except OSError as error:
+                        if target_identity == temporary_identity:
+                            error = _remove_owned_file(
+                                target,
+                                temporary_identity,
+                                "published output",
+                            )
+                            if error is not None:
+                                raise error
+                        backup_quarantine, error = _take_owned_file(
+                            backup, original_identity, "backup"
+                        )
+                        if error is not None:
+                            raise error
+                        if backup_quarantine is None:
+                            raise OSError("backup is missing")
+                        try:
+                            os.link(
+                                backup_quarantine,
+                                target,
+                                follow_symlinks=False,
+                            )
+                            _sync_directory(parent.path)
+                        except Exception:
+                            try:
+                                os.link(
+                                    backup_quarantine,
+                                    backup,
+                                    follow_symlinks=False,
+                                )
+                            except Exception:
+                                pass
+                            raise
+                        cleanup_error = _remove_quarantine(backup_quarantine)
+                        if cleanup_error is not None:
+                            raise cleanup_error
+                except (OSError, TypeError, NotImplementedError) as error:
                     errors.append(
                         _recovery_error(
                             "cannot restore target",
@@ -643,10 +870,35 @@ def _recover_state(
 
     if cleanup_errors:
         return cleanup_errors
-    try:
-        _remove_journal(journal, parent)
-    except OSError as error:
-        return [_recovery_error("cannot remove journal", journal, error)]
+    if journal_identity is not None:
+        try:
+            _remove_journal(journal, parent, journal_identity)
+        except OSError as error:
+            return [_recovery_error("cannot remove journal", journal, error)]
+    elif os.path.lexists(journal):
+        return [
+            _recovery_error(
+                "cannot remove journal",
+                journal,
+                OSError("external recovery journal appeared; file preserved"),
+            )
+        ]
+
+    if commit_marker is not None:
+        marker, marker_identity = commit_marker
+        try:
+            verify_parent_identity(parent)
+            marker_error = _remove_owned_file(
+                marker,
+                marker_identity,
+                "export commit marker",
+            )
+            if marker_error is not None:
+                raise marker_error
+        except OSError as error:
+            return [
+                _recovery_error("cannot remove commit marker", marker, error)
+            ]
     return []
 
 
@@ -656,28 +908,62 @@ def _recover_transaction(
     parent: ParentIdentity,
 ) -> None:
     journal = _journal_path(output_prefix)
-    if not os.path.lexists(journal):
+    marker = _commit_marker_path(journal)
+    journal_exists = os.path.lexists(journal)
+    marker_exists = os.path.lexists(marker)
+    if not journal_exists and not marker_exists:
         return
-    state = _load_journal(journal, targets, parent)
-    errors = _recover_state(state, journal, parent)
+
+    marker_record = None
+    if marker_exists:
+        loaded_marker = _load_journal(marker, targets, parent)
+        if loaded_marker.state.get("decision") != "commit":
+            raise OSError("invalid export commit marker decision")
+        marker_record = (marker, loaded_marker.identity)
+        state = loaded_marker.state
+        expected_journal_identity = _validated_identity(
+            state.get("rollback_journal_identity"),
+            "rollback journal identity",
+        )
+    else:
+        state = None
+        expected_journal_identity = None
+
+    journal_identity = None
+    if journal_exists:
+        loaded = _load_journal(journal, targets, parent)
+        journal_identity = loaded.identity
+        if marker_record is None:
+            state = loaded.state
+        elif journal_identity != expected_journal_identity:
+            raise OSError(
+                "export recovery journal ownership changed; external file "
+                "and commit marker preserved"
+            )
+
+    errors = _recover_state(
+        state,
+        journal,
+        parent,
+        journal_identity=journal_identity,
+        commit_marker=marker_record,
+    )
     if errors:
         raise OSError(
             "unfinished export recovery was incomplete; " + "; ".join(errors)
         )
 
 
-def _publish_pair(
+def _build_transaction_state(
     temporary_paths: Sequence[str],
     targets: Sequence[Path],
     force: bool,
-    parent: Optional[ParentIdentity] = None,
-) -> None:
+    parent: ParentIdentity,
+) -> object:
     if not isinstance(force, bool):
         raise ValueError("force must be a boolean")
     if len(temporary_paths) != len(targets) or not targets:
         raise ValueError("temporary and target pairs must be non-empty and aligned")
-    if parent is None:
-        parent = prepare_target(Path(targets[0])).parent
     verify_parent_identity(parent)
     targets = tuple(Path(target) for target in targets)
     if any(target.parent != parent.path for target in targets):
@@ -720,15 +1006,51 @@ def _publish_pair(
             "backup": str(backup) if backup is not None else None,
         })
 
-    journal = _journal_path_for_targets(targets)
-    if os.path.lexists(journal):
-        raise OSError(f"unfinished export recovery journal already exists: {journal}")
-    state = {
+    return {
         "version": JOURNAL_VERSION,
         "decision": "rollback",
         "records": records,
     }
-    _write_journal(journal, state, parent)
+
+
+def _begin_transaction(
+    temporary_paths: Sequence[str],
+    targets: Sequence[Path],
+    force: bool,
+    parent: ParentIdentity,
+) -> tuple:
+    state = _build_transaction_state(
+        temporary_paths, targets, force, parent
+    )
+    journal = _journal_path_for_targets(targets)
+    marker = _commit_marker_path(journal)
+    if os.path.lexists(journal) or os.path.lexists(marker):
+        raise OSError(
+            "unfinished export recovery record already exists: "
+            f"{journal if os.path.lexists(journal) else marker}"
+        )
+    journal_identity = _write_journal(journal, state, parent)
+    return state, journal, journal_identity
+
+
+def _publish_pair(
+    temporary_paths: Sequence[str],
+    targets: Sequence[Path],
+    force: bool,
+    parent: Optional[ParentIdentity] = None,
+    transaction: Optional[tuple] = None,
+) -> None:
+    if parent is None:
+        parent = prepare_target(Path(targets[0])).parent
+    if transaction is None:
+        state, journal, journal_identity = _begin_transaction(
+            temporary_paths, targets, force, parent
+        )
+    else:
+        state, journal, journal_identity = transaction
+    records = state["records"]
+    commit_marker = _commit_marker_path(journal)
+    commit_marker_identity = None
 
     try:
         for record in records:
@@ -771,10 +1093,22 @@ def _publish_pair(
 
         committed_state = dict(state)
         committed_state["decision"] = "commit"
-        _write_journal(journal, committed_state, parent)
+        committed_state["rollback_journal_identity"] = _identity_list(
+            journal_identity
+        )
+        commit_marker_identity = _write_commit_marker(
+            commit_marker,
+            committed_state,
+            parent,
+        )
         state = committed_state
     except Exception as publication_error:
-        recovery_errors = _recover_state(state, journal, parent)
+        recovery_errors = _recover_state(
+            state,
+            journal,
+            parent,
+            journal_identity=journal_identity,
+        )
         if recovery_errors:
             raise OSError(
                 "publication failed: "
@@ -784,7 +1118,13 @@ def _publish_pair(
             ) from publication_error
         raise
 
-    cleanup_errors = _recover_state(state, journal, parent)
+    cleanup_errors = _recover_state(
+        state,
+        journal,
+        parent,
+        journal_identity=journal_identity,
+        commit_marker=(commit_marker, commit_marker_identity),
+    )
     blocking_errors = [
         error
         for error in cleanup_errors
@@ -807,22 +1147,58 @@ def _export_deck_owned(
     parent: ParentIdentity,
     force: bool = False,
 ) -> None:
-    """Build PDF and PPTX, then publish them with durable crash recovery."""
+    """Build PDF and PPTX, then publish them with crash recovery."""
     output_prefix = os.path.abspath(output_prefix)
     targets = (Path(f"{output_prefix}.pdf"), Path(f"{output_prefix}.pptx"))
     verify_parent_identity(parent)
     images = _load_all(files)
     temporary_paths = []
+    transaction = None
+    publication_started = False
     try:
         for target in targets:
             temporary_paths.append(_temporary_path(target, parent=parent))
+        transaction = _begin_transaction(
+            temporary_paths, targets, force, parent
+        )
         _save_pdf(images, temporary_paths[0])
         _sync_file(temporary_paths[0])
         _save_pptx(images, temporary_paths[1])
         _sync_file(temporary_paths[1])
-        _publish_pair(temporary_paths, targets, force=force, parent=parent)
+        publication_started = True
+        _publish_pair(
+            temporary_paths,
+            targets,
+            force=force,
+            parent=parent,
+            transaction=transaction,
+        )
+    except Exception as preparation_error:
+        if (
+            not publication_started
+            and transaction is not None
+            and os.path.lexists(transaction[1])
+        ):
+            recovery_errors = _recover_state(
+                transaction[0],
+                transaction[1],
+                parent,
+                journal_identity=transaction[2],
+            )
+            if recovery_errors:
+                raise OSError(
+                    "export preparation failed: "
+                    f"{_bounded_error(preparation_error)}; "
+                    "recovery was incomplete; "
+                    + "; ".join(recovery_errors)
+                ) from preparation_error
+        raise
     finally:
-        if not os.path.lexists(_journal_path(Path(output_prefix))):
+        final_journal = _journal_path(Path(output_prefix))
+        if (
+            not os.path.lexists(final_journal)
+            and not os.path.lexists(_commit_marker_path(final_journal))
+        ):
             for temporary in temporary_paths:
                 _cleanup_temp(temporary, "export preparation cleanup failed")
     for label, target in zip(("PDF", "PPTX"), targets):
@@ -869,7 +1245,12 @@ def export_deck(
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Normalize images and export a PDF/PPTX pair."
+        description="Normalize images and export a PDF/PPTX pair.",
+        epilog=(
+            "Recovery boundary: POSIX file and directory fsync cover process "
+            "crashes and power-loss metadata. Windows covers process crashes "
+            "only; power-loss durability is not promised."
+        ),
     )
     parser.add_argument("output_prefix", help="Output path without .pdf/.pptx")
     parser.add_argument("images", nargs="+", help="Ordered slide image paths")

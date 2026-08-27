@@ -86,7 +86,7 @@ def _parser() -> argparse.ArgumentParser:
         "--retries",
         type=_non_negative_int,
         default=2,
-        help="Non-negative retry count (default: 2)",
+        help=f"Retry count, 0..{MAX_RETRIES} (default: 2)",
     )
     parser.add_argument(
         "--force",

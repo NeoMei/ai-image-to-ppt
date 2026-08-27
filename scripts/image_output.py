@@ -40,6 +40,8 @@ PROVIDER_RESPONSE_READ_CHUNK_BYTES = 64 * 1024
 MAX_PROVIDER_RESPONSE_READS = 4096
 MAX_RETRIES = 10
 MAX_JSON_NESTING = 100
+MAX_JSON_NODES = 100_000
+MAX_JSON_CONTAINER_ITEMS = 10_000
 
 
 class ImageOutputError(ValueError):
@@ -109,18 +111,35 @@ def parse_json_response(raw_response: object) -> object:
     except (TypeError, ValueError, UnicodeError, RecursionError) as error:
         raise ImageOutputError("provider response is not valid JSON") from error
 
-    # CPython's JSON decoder recursion behavior differs by version. Enforce an
-    # explicit, iterative limit so the public error contract is deterministic.
-    pending = [(parsed, 0)]
-    while pending:
-        value, depth = pending.pop()
-        if not isinstance(value, (dict, list)):
-            continue
-        if depth > MAX_JSON_NESTING:
+    # CPython's JSON decoder recursion behavior differs by version. Enforce
+    # deterministic resource limits with one iterator frame per active level;
+    # never allocate one pending traversal tuple per sibling.
+    stack = []
+    value = parsed
+    depth = 0
+    node_count = 0
+    while True:
+        node_count += 1
+        if node_count > MAX_JSON_NODES:
             raise ImageOutputError("provider response is not valid JSON")
-        children = value.values() if isinstance(value, dict) else value
-        pending.extend((child, depth + 1) for child in children)
-    return parsed
+
+        if isinstance(value, (dict, list)):
+            if depth > MAX_JSON_NESTING or len(value) > MAX_JSON_CONTAINER_ITEMS:
+                raise ImageOutputError("provider response is not valid JSON")
+            children = value.values() if isinstance(value, dict) else value
+            stack.append((iter(children), depth + 1))
+
+        while stack:
+            children, child_depth = stack[-1]
+            try:
+                value = next(children)
+            except StopIteration:
+                stack.pop()
+                continue
+            depth = child_depth
+            break
+        else:
+            return parsed
 
 
 def output_format(out_path: str) -> str:

@@ -58,8 +58,12 @@ class DocumentationTests(unittest.TestCase):
             self.assertIn("USE_CLI = True", document)
             self.assertIn("if USE_CLI:", document)
             self.assertIn("else:", document)
-            self.assertIn('export_pdf(SLIDES, "deck.pdf")', document)
-            self.assertIn('export_pptx(SLIDES, "deck.pptx")', document)
+            self.assertIn("from export_images import export_deck", document)
+            self.assertIn('if not export_deck(SLIDES, "deck_name"):', document)
+            self.assertIn('raise SystemExit("deck export failed")', document)
+            self.assertNotIn("from export_images import export_pdf", document)
+            self.assertNotIn('export_pdf(SLIDES, "deck.pdf")', document)
+            self.assertNotIn('export_pptx(SLIDES, "deck.pptx")', document)
 
     def test_export_manifest_rejects_duplicate_slide_ids_across_suffixes(self):
         for document in (self.readme, self.skill):
@@ -129,8 +133,41 @@ class DocumentationTests(unittest.TestCase):
             normalized = " ".join(document.split())
             self.assertIn("recover", normalized.lower())
             self.assertIn("next export", normalized.lower())
+            self.assertIn(
+                "On POSIX, file and directory fsync cover process crashes and "
+                "power-loss metadata recovery.",
+                normalized,
+            )
+            self.assertIn(
+                "On Windows, recovery covers process crashes only and does not "
+                "promise power-loss durability.",
+                normalized,
+            )
             self.assertNotIn("transactionally", normalized.lower())
             self.assertNotIn("transactional pair", normalized.lower())
+
+    def test_stable_output_lock_cleanup_is_explicitly_offline(self):
+        for document in (self.readme, self.skill):
+            normalized = " ".join(document.split())
+            self.assertIn("cleanup_output_locks.py --older-than-days 30", document)
+            self.assertIn(
+                "Stable hashed lock files intentionally persist",
+                normalized,
+            )
+            self.assertIn(
+                "ONLY while no generation or export process is running",
+                normalized,
+            )
+            self.assertIn("never runs automatically", normalized)
+            self.assertIn(
+                "offline precondition is the safety boundary for pathname races",
+                normalized,
+            )
+            self.assertIn(
+                "Filesystem failures stop cleanup, return exit 1 without a "
+                "traceback, and do not roll back earlier removals.",
+                normalized,
+            )
 
 
 if __name__ == "__main__":
