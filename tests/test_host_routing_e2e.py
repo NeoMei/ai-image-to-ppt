@@ -16,11 +16,12 @@ class TranscriptExecutor:
         self.outcomes = dict(outcomes)
         self.message = message
         self.calls = []
+        self.results = []
 
     def __call__(self, candidate):
         status = GenerationStatus(self.outcomes[candidate.key])
         self.calls.append((candidate.key, status.value))
-        return GenerationResult(
+        result = GenerationResult(
             status,
             candidate.provider,
             candidate.channel,
@@ -29,6 +30,8 @@ class TranscriptExecutor:
             else None,
             self.message,
         )
+        self.results.append(result)
+        return result
 
 
 TRANSCRIPTS = {
@@ -68,6 +71,15 @@ class HostRoutingEndToEndTests(unittest.TestCase):
                 self.assertEqual(page.outcome, "success")
                 self.assertEqual(page.candidate.key, expected_calls[-1][0])
                 self.assertEqual(router.sticky_candidate.key, expected_calls[-1][0])
+                successful_result = page.attempts[-1].result
+                expected_channel, expected_provider = expected_calls[-1][0].split("-", 1)
+                self.assertIs(successful_result, executor.results[-1])
+                self.assertEqual(successful_result.provider, expected_provider)
+                self.assertEqual(successful_result.channel, expected_channel)
+                self.assertEqual(
+                    successful_result.output_path,
+                    f"/workspace/generated/{expected_calls[-1][0]}.png",
+                )
                 self.assertFalse(router.stopped)
 
     def test_three_page_sticky_switches_forward_on_page_two(self):
@@ -169,6 +181,76 @@ class HostRoutingEndToEndTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             router.route_page(2, lambda candidate: self.fail("must not regenerate"))
         self.assertEqual(generated.calls, [("host-openai", "success")])
+
+    def test_cached_page_after_selection_preserves_route_for_the_next_generation(self):
+        router = SerialStickyRouter()
+        selected = TranscriptExecutor({"host-openai": "success"})
+        cached_calls = []
+        continued = TranscriptExecutor({"host-openai": "success"})
+
+        router.route_page(1, selected)
+        sticky_before = router.sticky_candidate
+        search_before = router.search_candidate
+        switches_before = router.switches
+        cached = router.route_page(
+            2,
+            lambda candidate: cached_calls.append(candidate.key) or self.fail("must not execute"),
+            cached=True,
+        )
+        router.route_page(3, continued)
+
+        self.assertEqual(cached.outcome, "cached")
+        self.assertEqual(cached_calls, [])
+        self.assertIs(router.sticky_candidate, sticky_before)
+        self.assertIs(router.search_candidate, search_before)
+        self.assertEqual(router.switches, switches_before)
+        self.assertEqual(continued.calls, [("host-openai", "success")])
+
+    def test_cross_provider_sticky_candidate_never_retries_earlier_candidates(self):
+        router = SerialStickyRouter()
+        page_one = TranscriptExecutor(
+            {
+                "host-openai": "unavailable",
+                "api-openai": "auth_unavailable",
+                "host-gemini": "success",
+            }
+        )
+        page_two = TranscriptExecutor({"host-gemini": "success"})
+
+        router.route_page(1, page_one)
+        router.route_page(2, page_two)
+
+        self.assertEqual(
+            page_one.calls,
+            [
+                ("host-openai", "unavailable"),
+                ("api-openai", "auth_unavailable"),
+                ("host-gemini", "success"),
+            ],
+        )
+        self.assertEqual(page_two.calls, [("host-gemini", "success")])
+        self.assertEqual(router.sticky_candidate.key, "host-gemini")
+
+    def test_channel_only_result_mismatch_fails_closed_without_committing_page(self):
+        router = SerialStickyRouter()
+        router.route_page(1, TranscriptExecutor({"host-openai": "success"}))
+        report_before = router.report()
+
+        def wrong_channel(candidate):
+            return GenerationResult(
+                GenerationStatus.SUCCESS,
+                candidate.provider,
+                "api" if candidate.channel == "host" else "host",
+                "/workspace/generated/mismatched.png",
+            )
+
+        with self.assertRaises(RuntimeError):
+            router.route_page(2, wrong_channel)
+
+        self.assertEqual(router.report(), report_before)
+        retry = TranscriptExecutor({"host-openai": "success"})
+        router.route_page(2, retry)
+        self.assertEqual(retry.calls, [("host-openai", "success")])
 
 
 if __name__ == "__main__":
