@@ -52,7 +52,10 @@ class RawResponse(JsonResponse):
 class StreamResponse:
     def __init__(self, data, headers=None):
         self.stream = io.BytesIO(data)
-        self.headers = headers or {"Content-Length": str(len(data))}
+        self.headers = headers or {
+            "Content-Length": str(len(data)),
+            "Content-Type": "image/jpeg",
+        }
 
     def __enter__(self):
         return self
@@ -332,7 +335,10 @@ class GeminiContractTests(unittest.TestCase):
 class DoubaoContractTests(unittest.TestCase):
     def test_requested_suffix_sets_output_format_and_download_is_bounded(self):
         generated = JsonResponse({"data": [{"url": "https://cdn.invalid/image"}]})
-        downloaded = StreamResponse(image_bytes("PNG"))
+        downloaded = StreamResponse(
+            image_bytes("PNG"),
+            {"Content-Length": str(len(image_bytes("PNG"))), "Content-Type": "image/png"},
+        )
         with tempfile.TemporaryDirectory() as td, \
              mock.patch.object(gen_slide_doubao, "_load_api_key", return_value="key"), \
              mock.patch.object(

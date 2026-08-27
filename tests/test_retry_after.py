@@ -58,7 +58,10 @@ class JsonResponse:
 class StreamResponse:
     def __init__(self, payload):
         self.stream = io.BytesIO(payload)
-        self.headers = {"Content-Length": str(len(payload))}
+        self.headers = {
+            "Content-Length": str(len(payload)),
+            "Content-Type": "image/jpeg",
+        }
 
     def __enter__(self):
         return self

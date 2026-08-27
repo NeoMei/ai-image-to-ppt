@@ -44,7 +44,14 @@ class JsonResponse:
 class StreamResponse:
     def __init__(self, data, headers=None):
         self.stream = io.BytesIO(data)
-        self.headers = headers or {"Content-Length": str(len(data))}
+        self.headers = (
+            {
+                "Content-Length": str(len(data)),
+                "Content-Type": "image/jpeg",
+            }
+            if headers is None
+            else headers
+        )
 
     def __enter__(self):
         return self
@@ -289,6 +296,64 @@ class DoubaoResultTests(unittest.TestCase):
                 self.assertEqual(target.read_bytes(), b"existing")
                 self.assertEqual(urlopen.call_count, 2)
                 self.assertEqual(list(target.parent.glob(f".{target.name}.*.tmp")), [])
+
+    def test_download_content_type_must_match_the_target_before_publication(self):
+        rejected_headers = (
+            {"Content-Length": str(len(image_bytes()))},
+            {"Content-Length": str(len(image_bytes())), "Content-Type": ""},
+            {"Content-Length": str(len(image_bytes())), "Content-Type": 3},
+            {"Content-Length": str(len(image_bytes())), "Content-Type": "text/html"},
+            {"Content-Length": str(len(image_bytes())), "Content-Type": "image/png"},
+        )
+        for headers in rejected_headers:
+            with self.subTest(headers=headers), tempfile.TemporaryDirectory() as temp_dir, \
+                 mock.patch.object(gen_slide_doubao.time, "sleep") as sleep:
+                target = Path(temp_dir) / "slide.jpg"
+                target.write_bytes(b"existing")
+                result, urlopen = self._generate(
+                    [generated_url(), StreamResponse(image_bytes(), headers)],
+                    target,
+                    retries=2,
+                    overwrite=True,
+                )
+                self.assertEqual(result.status, GenerationStatus.INVALID_OUTPUT)
+                self.assertFalse(result.can_fallback)
+                self.assertEqual(target.read_bytes(), b"existing")
+                self.assertEqual(urlopen.call_count, 2)
+                sleep.assert_not_called()
+
+    def test_download_accepts_a_matching_content_type_with_parameters(self):
+        headers = {
+            "Content-Length": str(len(image_bytes())),
+            "Content-Type": "image/jpeg; charset=binary",
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = Path(temp_dir) / "slide.jpg"
+            result, urlopen = self._generate(
+                [generated_url(), StreamResponse(image_bytes(), headers)], target
+            )
+            self.assertTrue(target.exists())
+        self.assertEqual(result.status, GenerationStatus.SUCCESS)
+        self.assertEqual(urlopen.call_count, 2)
+
+    def test_content_type_rejection_redacts_the_api_key(self):
+        key = "known-test-key"
+        headers = {
+            "Content-Length": str(len(image_bytes())),
+            "Content-Type": f"image/png; credential={key}",
+        }
+        with tempfile.TemporaryDirectory() as temp_dir, \
+             mock.patch.dict(os.environ, {"DOUBAO_API_KEY": key}, clear=True), \
+             mock.patch.object(
+                 gen_slide_doubao.urllib.request,
+                 "urlopen",
+                 side_effect=[generated_url(), StreamResponse(image_bytes(), headers)],
+             ):
+            result = gen_slide_doubao.generate_result(
+                "prompt", str(Path(temp_dir) / "slide.jpg"), retries=0
+            )
+        self.assertEqual(result.status, GenerationStatus.INVALID_OUTPUT)
+        self.assertNotIn(key, result.safe_message)
 
     def test_download_publication_failure_is_local_failure_and_preserves_target(self):
         with tempfile.TemporaryDirectory() as temp_dir, \

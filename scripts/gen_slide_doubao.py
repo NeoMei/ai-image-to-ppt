@@ -15,7 +15,7 @@ from typing import Callable, Optional, Sequence
 from generation_result import GenerationResult, GenerationStatus, classify_http_failure, safe_message
 from image_output import (
     MAX_IMAGE_BYTES, ImageOutputError, ImageStreamError, PreparedTarget,
-    output_format, parse_json_response, prepare_target, prepared_lock_target,
+    expected_mime_type, output_format, parse_json_response, prepare_target, prepared_lock_target,
     preflight_output, publish_bytes, read_bounded_image_stream,
     read_response_body, resolve_output_path, validate_image_bytes, validate_retries,
 )
@@ -102,6 +102,19 @@ def _remote_http_result(error: urllib.error.HTTPError, key: str) -> tuple[Genera
     return status, message
 
 
+def _validate_download_content_type(response, target: PreparedTarget) -> None:
+    headers = getattr(response, "headers", {})
+    try:
+        content_type = headers.get("Content-Type")
+    except AttributeError as error:
+        raise ImageOutputError("download Content-Type must be non-empty text") from error
+    if not isinstance(content_type, str) or not content_type.strip():
+        raise ImageOutputError("download Content-Type must be non-empty text")
+    media_type = content_type.split(";", 1)[0].strip().lower()
+    if media_type != expected_mime_type(str(target)):
+        raise ImageOutputError("download Content-Type does not match output target")
+
+
 def _download_with_retries(image_url: str, target: PreparedTarget, retries: int, overwrite: bool, key: str, progress: Optional[Callable[[str], None]]) -> GenerationResult:
     """Download one generated URL; retries remain inside this exact URL."""
     secrets = (key,) if key else ()
@@ -109,6 +122,7 @@ def _download_with_retries(image_url: str, target: PreparedTarget, retries: int,
         request = urllib.request.Request(image_url)
         try:
             with urllib.request.urlopen(request, timeout=DOWNLOAD_TIMEOUT) as response:
+                _validate_download_content_type(response, target)
                 image = read_bounded_image_stream(response, max_bytes=MAX_IMAGE_BYTES)
         except urllib.error.HTTPError as error:
             status, message = _remote_http_result(error, key)
