@@ -54,6 +54,15 @@ class ImageStreamError(ImageOutputError):
     """Raised for a retryable transport failure while reading image bytes."""
 
 
+class PublishedOutputError(ImageOutputError):
+    """A post-install failure that still identifies the installed inode."""
+
+    def __init__(self, message: str, device: int, inode: int):
+        super().__init__(message)
+        self.device = device
+        self.inode = inode
+
+
 class LoadedImage(NamedTuple):
     image: Optional[Image.Image]
     image_format: str
@@ -985,6 +994,22 @@ def _validate_opaque_bytes(data: bytes, _target: TargetValue) -> ValidatedBytes:
     return ValidatedBytes(len(data))
 
 
+def _validate_expected_existing_identity(identity: object) -> tuple:
+    if not isinstance(identity, tuple) or len(identity) != 2:
+        raise ImageOutputError("expected output identity is invalid")
+    device, inode = identity
+    if (
+        isinstance(device, bool)
+        or isinstance(inode, bool)
+        or not isinstance(device, int)
+        or not isinstance(inode, int)
+        or device < 0
+        or inode < 0
+    ):
+        raise ImageOutputError("expected output identity is invalid")
+    return identity
+
+
 def _remove_published_target(
     temporary: TemporaryOutput,
     name: str,
@@ -1017,6 +1042,7 @@ def _publish_temp(
     prepared = _as_prepared_target(target)
     if not isinstance(temp_path, TemporaryOutput):
         raise ImageOutputError("output temporary file is not identity-bound")
+    installed_identity = None
     try:
         verify_parent_identity(prepared.parent)
         _verify_temporary_identity(temp_path)
@@ -1047,6 +1073,7 @@ def _publish_temp(
                 dst_dir_fd=temp_path.parent_fd,
                 follow_symlinks=False,
             )
+        installed_identity = (temp_path.device, temp_path.inode)
         published = os.stat(
             prepared.name,
             dir_fd=temp_path.parent_fd,
@@ -1062,12 +1089,25 @@ def _publish_temp(
             verify_parent_identity(prepared.parent)
         except ImageOutputError:
             _remove_published_target(temp_path, prepared.name)
+            installed_identity = None
             raise
     except FileExistsError as error:
         raise ImageOutputError(
             f"output already exists; refusing to overwrite: {prepared.path}"
         ) from error
+    except ImageOutputError as error:
+        if installed_identity is not None:
+            raise PublishedOutputError(
+                str(error),
+                *installed_identity,
+            ) from error
+        raise
     except OSError as error:
+        if installed_identity is not None:
+            raise PublishedOutputError(
+                "published output could not be verified",
+                *installed_identity,
+            ) from error
         raise ImageOutputError(f"failed to publish image atomically: {error}") from error
 
     try:
@@ -1085,8 +1125,9 @@ def _publish_image_bytes(
     overwrite: bool,
     validator,
     expected_existing_identity: Optional[tuple] = None,
+    allow_empty: bool = False,
 ) -> PublishedOutput:
-    if not isinstance(data, bytes) or not data:
+    if not isinstance(data, bytes) or (not data and not allow_empty):
         raise ImageOutputError("image data must be non-empty bytes")
     if len(data) > MAX_IMAGE_BYTES:
         raise ImageOutputError(
@@ -1186,12 +1227,29 @@ def publish_opaque_bytes_with_identity(
     host transaction and may be arbitrary regular-file bytes. The expected
     inode prevents compensation from replacing a different current file.
     """
+    expected_identity = _validate_expected_existing_identity(
+        expected_existing_identity
+    )
+    return _publish_opaque_bytes(
+        data,
+        target,
+        expected_identity,
+    )
+
+
+def _publish_opaque_bytes(
+    data: bytes,
+    target: TargetValue,
+    expected_existing_identity: tuple,
+) -> PublishedOutput:
+    """Atomically restore bounded opaque bytes, including an empty snapshot."""
     return _publish_image_bytes(
         data,
         target,
         True,
         _validate_opaque_bytes,
         expected_existing_identity=expected_existing_identity,
+        allow_empty=True,
     )
 
 

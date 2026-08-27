@@ -47,6 +47,14 @@ class _OutputSnapshot:
     published_identity: Optional[Tuple[int, int]] = None
 
 
+class _PublishedMemberError(ImageOutputError):
+    """A member failed after install, with its inode still available to rollback."""
+
+    def __init__(self, error: image_output.PublishedOutputError):
+        super().__init__(str(error))
+        self.identity = (error.device, error.inode)
+
+
 @dataclass(frozen=True)
 class HostArtifact:
     kind: HostArtifactKind
@@ -327,15 +335,34 @@ def _publish_transaction_member(
     strict: bool,
 ) -> Tuple[int, int]:
     """Publish and return the inode installed by this transaction member."""
-    if strict:
-        published = image_output.publish_bytes_with_identity(
-            data, target, overwrite=overwrite
-        )
-    else:
-        published = image_output.publish_decoded_image_bytes_with_identity(
-            data, target, overwrite=overwrite
-        )
+    try:
+        if strict:
+            published = image_output.publish_bytes_with_identity(
+                data, target, overwrite=overwrite
+            )
+        else:
+            published = image_output.publish_decoded_image_bytes_with_identity(
+                data, target, overwrite=overwrite
+            )
+    except image_output.PublishedOutputError as error:
+        raise _PublishedMemberError(error) from error
     return published.device, published.inode
+
+
+def _publish_and_record_transaction_member(
+    snapshot: _OutputSnapshot,
+    data: bytes,
+    overwrite: bool,
+    strict: bool,
+) -> None:
+    """Record ownership even if a post-install publication check reports failure."""
+    try:
+        snapshot.published_identity = _publish_transaction_member(
+            data, snapshot.target, overwrite, strict
+        )
+    except _PublishedMemberError as error:
+        snapshot.published_identity = error.identity
+        raise
 
 
 def _transaction_checkpoint(_phase: str, _snapshot: _OutputSnapshot) -> None:
@@ -353,12 +380,12 @@ def _publish_host_pair(
     raw_snapshot = _snapshot_output(raw_target)
     master_snapshot = _snapshot_output(target)
     try:
-        raw_snapshot.published_identity = _publish_transaction_member(
-            raw_data, raw_target, overwrite, strict=False
+        _publish_and_record_transaction_member(
+            raw_snapshot, raw_data, overwrite, strict=False
         )
         _transaction_checkpoint("raw", raw_snapshot)
-        master_snapshot.published_identity = _publish_transaction_member(
-            normalized_data, target, overwrite, strict=True
+        _publish_and_record_transaction_member(
+            master_snapshot, normalized_data, overwrite, strict=True
         )
         _transaction_checkpoint("master", master_snapshot)
     except ImageOutputError as original_error:
