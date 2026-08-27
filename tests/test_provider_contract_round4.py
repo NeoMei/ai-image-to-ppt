@@ -174,15 +174,17 @@ class ProviderAbsoluteOutputTests(unittest.TestCase):
 
                 os.chdir(temp)
                 try:
-                    owned_result = True
-                    if provider in (gen_slide_openai, gen_slide_gemini):
-                        owned_result = GenerationResult(
-                            GenerationStatus.SUCCESS,
-                            "openai" if provider is gen_slide_openai else "gemini",
-                            "api",
-                            str(expected),
-                            "generated",
-                        )
+                    owned_result = GenerationResult(
+                        GenerationStatus.SUCCESS,
+                        (
+                            "openai" if provider is gen_slide_openai
+                            else "gemini" if provider is gen_slide_gemini
+                            else "doubao"
+                        ),
+                        "api",
+                        str(expected),
+                        "generated",
+                    )
                     with mock.patch.object(
                         provider, "output_lock", side_effect=changing_cwd_lock
                     ), mock.patch.object(
@@ -221,12 +223,7 @@ class ProviderAbsoluteOutputTests(unittest.TestCase):
                         )
 
                 self.assertFalse(result)
-                expected_message = (
-                    "unable to prepare output target"
-                    if provider in (gen_slide_openai, gen_slide_gemini)
-                    else "not a regular file"
-                )
-                self.assertIn(expected_message, output.getvalue())
+                self.assertIn("unable to prepare output target", output.getvalue())
                 load_key.assert_not_called()
                 urlopen.assert_not_called()
                 self.assertEqual(referent.read_bytes(), b"keep-me")

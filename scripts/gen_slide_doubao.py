@@ -5,27 +5,19 @@ import argparse
 import http.client
 import json
 import os
-import re
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Callable, Optional, Sequence
 
+from generation_result import GenerationResult, GenerationStatus, classify_http_failure, safe_message
 from image_output import (
-    MAX_IMAGE_BYTES,
-    ImageOutputError,
-    ImageStreamError,
-    output_format,
-    parse_json_response,
-    prepare_target,
-    prepared_lock_target,
-    preflight_output,
-    publish_stream,
-    read_response_body,
-    resolve_output_path,
-    validate_retries,
+    MAX_IMAGE_BYTES, ImageOutputError, ImageStreamError, PreparedTarget,
+    output_format, parse_json_response, prepare_target, prepared_lock_target,
+    preflight_output, publish_bytes, read_bounded_image_stream,
+    read_response_body, resolve_output_path, validate_image_bytes, validate_retries,
 )
 from output_lock import OutputLockError, output_lock
 from provider_credentials import APIKeyError, load_api_key, validate_api_key
@@ -36,14 +28,9 @@ URL = "https://ark.cn-beijing.volces.com/api/v3/images/generations"
 MODEL = "doubao-seedream-5-0-260128"
 SIZE = "2560x1440"
 DOWNLOAD_TIMEOUT = 120
-KEY_LIKE_PATTERN = re.compile(r"(?<![A-Za-z0-9_-])sk-[A-Za-z0-9_-]+")
-TRANSPORT_ERRORS = (
-    ImageStreamError,
-    urllib.error.URLError,
-    TimeoutError,
-    OSError,
-    http.client.HTTPException,
-)
+DOUBAO_POLICY_CODES = frozenset({"content_filter", "content_policy_violation", "input_text_risk", "output_image_risk"})
+DOUBAO_RETRYABLE_CODES = frozenset({"quota_exceeded", "rate_limit_exceeded", "resource_exhausted"})
+TRANSPORT_ERRORS = (ImageStreamError, urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException)
 
 
 def _load_api_key() -> str:
@@ -51,27 +38,45 @@ def _load_api_key() -> str:
 
 
 def _redact(message: object, key: str) -> str:
-    text = str(message)
-    if key:
-        text = text.replace(key, "[REDACTED]")
-    return KEY_LIKE_PATTERN.sub("[REDACTED]", text)[:300]
+    return safe_message(message, (key,))
 
 
-def _http_error_message(error: urllib.error.HTTPError, key: str) -> str:
-    if error.code in (401, 403):
-        return "authentication failed; check DOUBAO_API_KEY or ~/.secrets/doubao_api_key"
+def _environment_redaction_secrets() -> Sequence[str]:
+    """Collect the configured environment key only after local setup succeeds."""
+    key = os.environ.get("DOUBAO_API_KEY")
+    return (key,) if isinstance(key, str) and key else ()
+
+
+def _result(status: GenerationStatus, message: object, output_path: Optional[str] = None, secrets: Sequence[str] = ()) -> GenerationResult:
+    return GenerationResult(status, "doubao", "api", output_path=output_path, safe_message=safe_message(message, secrets))
+
+
+def _error_details(error: urllib.error.HTTPError, key: str):
+    code = None
+    message = None
     try:
         raw_body = read_response_body(error)
         if isinstance(raw_body, bytes):
             raw_body = raw_body.decode("utf-8")
         payload = parse_json_response(raw_body)
-        if isinstance(payload, dict) and isinstance(payload.get("error"), dict):
-            message = payload["error"].get("message")
-            if isinstance(message, (str, int, float, bool)) and message:
-                return _redact(message, key)
+        if not isinstance(payload, dict):
+            raise TypeError("HTTP error envelope must be an object")
+        details = payload.get("error")
+        if not isinstance(details, dict):
+            raise TypeError("HTTP error details must be an object")
+        candidate_code = details.get("code")
+        if isinstance(candidate_code, str) and candidate_code:
+            code = candidate_code
+        candidate_message = details.get("message")
+        if isinstance(candidate_message, (str, int, float, bool)) and candidate_message:
+            message = candidate_message
     except Exception:
         pass
-    return _redact(error.reason or "request failed", key)
+    return code, _redact(message or error.reason or "request failed", key)
+
+
+def _http_error_message(error: urllib.error.HTTPError, key: str) -> str:
+    return _error_details(error, key)[1]
 
 
 def _extract_image_url(payload: object) -> str:
@@ -89,167 +94,152 @@ def _extract_image_url(payload: object) -> str:
     return image_url
 
 
-def _retryable_http(error: urllib.error.HTTPError) -> bool:
-    return error.code == 429 or error.code >= 500
+def _remote_http_result(error: urllib.error.HTTPError, key: str) -> tuple[GenerationStatus, str]:
+    error_code, message = _error_details(error, key)
+    status = classify_http_failure(error.code, error_code, DOUBAO_POLICY_CODES, DOUBAO_RETRYABLE_CODES)
+    if status is GenerationStatus.AUTH_UNAVAILABLE:
+        message = f"authentication failed; check DOUBAO_API_KEY; provider says: {message}"
+    return status, message
 
 
-def _download_image(
-    image_url: str,
-    target: Path,
-    retries: int,
-    overwrite: bool,
-    key: str,
-) -> Optional[int]:
+def _download_with_retries(image_url: str, target: PreparedTarget, retries: int, overwrite: bool, key: str, progress: Optional[Callable[[str], None]]) -> GenerationResult:
+    """Download one generated URL; retries remain inside this exact URL."""
+    secrets = (key,) if key else ()
     for attempt in range(retries + 1):
         request = urllib.request.Request(image_url)
         try:
             with urllib.request.urlopen(request, timeout=DOWNLOAD_TIMEOUT) as response:
-                return publish_stream(
-                    response,
-                    target,
-                    overwrite=overwrite,
-                    max_bytes=MAX_IMAGE_BYTES,
-                )
+                image = read_bounded_image_stream(response, max_bytes=MAX_IMAGE_BYTES)
         except urllib.error.HTTPError as error:
-            print(
-                f"  HTTP {error.code}: image download failed: "
-                f"{_http_error_message(error, key)} (attempt {attempt + 1})"
-            )
-            if _retryable_http(error) and attempt < retries:
+            status, message = _remote_http_result(error, key)
+            if status is GenerationStatus.RETRYABLE_EXHAUSTED and (error.code == 429 or error.code >= 500) and attempt < retries:
+                if progress is not None:
+                    progress(f"  HTTP {error.code}: image download failed: {message} (attempt {attempt + 1})")
                 time.sleep(retry_delay(attempt, error.headers))
                 continue
-            return None
-        except (ImageStreamError,) + TRANSPORT_ERRORS as error:
-            print(f"  ERR: {_redact(error, key)} (attempt {attempt + 1})")
+            return _result(status, message, secrets=secrets)
+        except TRANSPORT_ERRORS as error:
+            message = _redact(error, key)
             if attempt < retries:
+                if progress is not None:
+                    progress(f"  ERR: {message} (attempt {attempt + 1})")
                 time.sleep(retry_delay(attempt))
                 continue
-            return None
+            return _result(GenerationStatus.RETRYABLE_EXHAUSTED, message, secrets=secrets)
         except (ImageOutputError, TypeError, ValueError) as error:
-            print(f"  ERR: invalid downloaded image or output failure: {_redact(error, key)}")
-            return None
-    return None
+            return _result(GenerationStatus.INVALID_OUTPUT, f"invalid downloaded image: {_redact(error, key)}", secrets=secrets)
+
+        try:
+            validate_image_bytes(image, target)
+        except (ImageOutputError, TypeError, ValueError) as error:
+            return _result(GenerationStatus.INVALID_OUTPUT, f"invalid downloaded image: {_redact(error, key)}", secrets=secrets)
+        try:
+            byte_count = publish_bytes(image, target, overwrite=overwrite)
+        except (ImageOutputError, OSError) as error:
+            return _result(GenerationStatus.LOCAL_FAILURE, f"output failure: {_redact(error, key)}", secrets=secrets)
+        return _result(GenerationStatus.SUCCESS, f"{byte_count // 1024}KB, Doubao", str(target.path), secrets=secrets)
+    return _result(GenerationStatus.RETRYABLE_EXHAUSTED, "download retries exhausted", secrets=secrets)
 
 
-def _gen_owned(
-    prompt: str,
-    out_path: str,
-    retries: int = 2,
-    overwrite: bool = False,
-) -> bool:
-    """Generate one strict 16:9 image. Return True only after atomic publication."""
+def _download_image_result(image_url: str, target: PreparedTarget, retries: int, overwrite: bool, key: str, progress: Optional[Callable[[str], None]]) -> GenerationResult:
+    return _download_with_retries(image_url, target, retries, overwrite, key, progress)
+
+
+def _gen_owned(prompt: str, target: PreparedTarget, retries: int = 2, overwrite: bool = False, progress: Optional[Callable[[str], None]] = None) -> GenerationResult:
+    """Generate while the caller owns a prepared output lock."""
     try:
-        retries = validate_retries(retries)
-        requested_format = output_format(out_path)
-        target = preflight_output(out_path, overwrite=overwrite)
-    except ImageOutputError as error:
-        print(f"  ERR: {error}")
-        return False
+        requested_format = output_format(str(target))
+        preflight_output(target, overwrite=overwrite)
+    except ImageOutputError:
+        return _result(GenerationStatus.LOCAL_FAILURE, "unable to prepare output target")
 
+    redaction_secrets = _environment_redaction_secrets()
     key = _load_api_key()
+    secrets = tuple(redaction_secrets) + ((key,) if isinstance(key, str) and key else ())
     if not key:
-        print(
-            "  ERR: Doubao API key not found. Set DOUBAO_API_KEY or create "
-            "~/.secrets/doubao_api_key (see README.md)"
-        )
-        return False
+        return _result(GenerationStatus.AUTH_UNAVAILABLE, "Doubao API key not found. Set DOUBAO_API_KEY or create ~/.secrets/doubao_api_key (see README.md)", secrets=secrets)
     try:
         key = validate_api_key(key)
     except APIKeyError as error:
-        print(f"  ERR: Doubao API key is invalid: {error}")
-        return False
+        return _result(GenerationStatus.AUTH_UNAVAILABLE, f"Doubao API key is invalid: {error}", secrets=secrets)
 
     body = json.dumps({
-        "model": os.environ.get("DOUBAO_IMAGE_MODEL", MODEL),
-        "prompt": prompt,
-        "size": SIZE,
-        "response_format": "url",
-        "output_format": requested_format,
-        "watermark": False,
-        "sequential_image_generation": "disabled",
+        "model": os.environ.get("DOUBAO_IMAGE_MODEL", MODEL), "prompt": prompt,
+        "size": SIZE, "response_format": "url", "output_format": requested_format,
+        "watermark": False, "sequential_image_generation": "disabled",
     }).encode("utf-8")
-
-    image_url = None
     for attempt in range(retries + 1):
-        request = urllib.request.Request(
-            URL,
-            data=body,
-            headers={
-                "Authorization": f"Bearer {key}",
-                "Content-Type": "application/json",
-            },
-        )
+        request = urllib.request.Request(URL, data=body, headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"})
         try:
             with urllib.request.urlopen(request, timeout=180) as response:
                 raw_response = read_response_body(response)
         except urllib.error.HTTPError as error:
-            print(
-                f"  HTTP {error.code}: {_http_error_message(error, key)} "
-                f"(attempt {attempt + 1})"
-            )
-            if _retryable_http(error) and attempt < retries:
+            status, message = _remote_http_result(error, key)
+            if status is GenerationStatus.RETRYABLE_EXHAUSTED and (error.code == 429 or error.code >= 500) and attempt < retries:
+                if progress is not None:
+                    progress(f"  HTTP {error.code}: {message} (attempt {attempt + 1})")
                 time.sleep(retry_delay(attempt, error.headers))
                 continue
-            return False
+            return _result(status, message, secrets=secrets)
         except TRANSPORT_ERRORS as error:
-            print(f"  ERR: {_redact(error, key)} (attempt {attempt + 1})")
+            message = _redact(error, key)
             if attempt < retries:
+                if progress is not None:
+                    progress(f"  ERR: {message} (attempt {attempt + 1})")
                 time.sleep(retry_delay(attempt))
                 continue
-            return False
+            return _result(GenerationStatus.RETRYABLE_EXHAUSTED, message, secrets=secrets)
         except ImageOutputError as error:
-            print(f"  ERR: invalid provider response: {_redact(error, key)}")
-            return False
+            return _result(GenerationStatus.INVALID_OUTPUT, f"invalid provider response: {_redact(error, key)}", secrets=secrets)
 
         try:
             payload = parse_json_response(raw_response)
             image_url = _extract_image_url(payload)
-        except (TypeError, ValueError, UnicodeError) as error:
-            print(f"  ERR: invalid image response: {_redact(error, key)}")
-            return False
-        break
-
-    if image_url is None:
-        return False
-
-    byte_count = _download_image(image_url, target, retries, overwrite, key)
-    if byte_count is None:
-        return False
-    print(f"  OK: {_redact(target, key)} ({byte_count // 1024}KB)")
-    return True
+        except (ImageOutputError, TypeError, ValueError, UnicodeError) as error:
+            return _result(GenerationStatus.INVALID_OUTPUT, f"invalid image response: {_redact(error, key)}", secrets=secrets)
+        return _download_image_result(image_url, target, retries, overwrite, key, progress)
+    return _result(GenerationStatus.RETRYABLE_EXHAUSTED, "request retries exhausted", secrets=secrets)
 
 
-def gen(
-    prompt: str,
-    out_path: str,
-    retries: int = 2,
-    overwrite: bool = False,
-) -> bool:
+def _generate_result_with_lock(prompt: str, out_path: str, retries: int, overwrite: bool, progress: Optional[Callable[[str], None]]) -> GenerationResult:
     try:
         retries = validate_retries(retries)
-    except ImageOutputError as error:
-        print(f"  ERR: {error}")
-        return False
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise ImageOutputError("prompt must be non-empty text")
+        if not isinstance(overwrite, bool):
+            raise ImageOutputError("overwrite must be a boolean")
+        output_format(out_path)
+    except (ImageOutputError, TypeError, ValueError):
+        return _result(GenerationStatus.INVALID_INPUT, "invalid generation arguments")
     try:
         target = prepare_target(resolve_output_path(out_path))
-    except ImageOutputError as error:
-        print(f"  ERR: {error}")
-        return False
-    try:
         with output_lock(prepared_lock_target(target)):
-            return _gen_owned(prompt, target, retries, overwrite)
-    except OutputLockError as error:
-        print(f"  ERR: {error}")
-        return False
+            result = _gen_owned(prompt, target, retries, overwrite, progress)
+    except (ImageOutputError, OutputLockError, OSError, TypeError, ValueError):
+        return _result(GenerationStatus.LOCAL_FAILURE, "unable to prepare output target")
+    if not isinstance(result, GenerationResult):
+        return _result(GenerationStatus.LOCAL_FAILURE, "internal generator returned an invalid result")
+    return result
+
+
+def generate_result(prompt: str, out_path: str, retries: int = 2, overwrite: bool = False, progress: Optional[Callable[[str], None]] = None) -> GenerationResult:
+    return _generate_result_with_lock(prompt, out_path, retries, overwrite, progress)
+
+
+def gen(prompt: str, out_path: str, retries: int = 2, overwrite: bool = False) -> bool:
+    result = generate_result(prompt, out_path, retries=retries, overwrite=overwrite, progress=print)
+    if result.ok:
+        print(f"  OK: {safe_message(result.output_path, _environment_redaction_secrets())} ({result.safe_message})")
+    else:
+        print(f"  ERR: {result.safe_message}")
+    return result.ok
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("output_path", help="Output .jpg, .jpeg, .png, or .webp")
     parser.add_argument("prompt", help="Slide image prompt")
-    parser.add_argument(
-        "--force", action="store_true", help="Atomically replace an existing output"
-    )
+    parser.add_argument("--force", action="store_true", help="Atomically replace an existing output")
     return parser
 
 
