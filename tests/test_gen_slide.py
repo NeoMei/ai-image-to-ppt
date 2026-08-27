@@ -156,6 +156,35 @@ class RouterTests(unittest.TestCase):
         self.assertEqual(len(stdout.getvalue().splitlines()), 1)
         self.assertNotIn("sk-not-a-real-secret", stdout.getvalue())
 
+    def test_json_cli_discards_large_repeated_provider_stdout_without_stringio(self):
+        expected = GenerationResult(
+            GenerationStatus.AUTH_UNAVAILABLE,
+            "openai",
+            "api",
+            safe_message="missing key",
+        )
+
+        def noisy_generate(*args, **kwargs):
+            large_chunk = "provider-noise-" * 100_000
+            for _ in range(3):
+                print(large_chunk)
+            return expected
+
+        provider = SimpleNamespace(generate_result=noisy_generate)
+        stdout = io.StringIO()
+        with mock.patch.object(gen_slide.importlib, "import_module", return_value=provider), \
+             mock.patch.object(
+                 io,
+                 "StringIO",
+                 side_effect=AssertionError("JSON discard must not buffer provider output"),
+             ), redirect_stdout(stdout):
+            exit_code = gen_slide.main(["slide.jpg", "prompt", "--json"])
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(json.loads(stdout.getvalue())["status"], "auth_unavailable")
+        self.assertEqual(len(stdout.getvalue().splitlines()), 1)
+        self.assertNotIn("provider-noise", stdout.getvalue())
+
     def test_cli_passes_explicit_engine_and_retry_count(self):
         result = GenerationResult(
             GenerationStatus.POLICY_REFUSED,

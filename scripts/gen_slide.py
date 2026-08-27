@@ -3,7 +3,6 @@
 
 import argparse
 import importlib
-import io
 import re
 from contextlib import redirect_stdout
 from typing import Callable, Optional, Sequence
@@ -21,6 +20,18 @@ _ANSI_ESCAPE = re.compile(
     r"\x1b(?:\][^\x1b\x07]*(?:\x07|\x1b\\)|[@-_][0-?]*[ -/]*[@-~]|[0-?]*[ -/]*[@-~])"
 )
 _CONTROL_CHARACTERS = re.compile(r"[\x00-\x1f\x7f-\x9f]+")
+
+
+class _DiscardTextSink:
+    """A text stream that accepts output without retaining it."""
+
+    encoding = "utf-8"
+
+    def write(self, text: str) -> int:
+        return len(text)
+
+    def flush(self) -> None:
+        pass
 
 
 def _non_negative_int(value: str) -> int:
@@ -192,7 +203,7 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = _parser().parse_args(argv)
     if args.json:
-        with redirect_stdout(io.StringIO()):
+        with redirect_stdout(_DiscardTextSink()):
             result = generate_result(
                 args.prompt,
                 args.out_path,
