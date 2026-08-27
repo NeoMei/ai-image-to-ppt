@@ -104,10 +104,166 @@ def validate_retries(retries: object) -> int:
     return retries
 
 
+def _scan_json_structure(raw_response: object) -> None:
+    """Bound JSON structure before the standard decoder allocates containers."""
+    if not isinstance(raw_response, (str, bytes, bytearray)):
+        raise ValueError("JSON input must be text or bytes")
+
+    is_bytes = not isinstance(raw_response, str)
+    if is_bytes:
+        if raw_response.startswith((b"\xff\xfe", b"\xfe\xff", b"\x00\x00\xfe\xff", b"\xff\xfe\x00\x00")):
+            raise ValueError("provider JSON must use UTF-8")
+        index = 3 if raw_response.startswith(b"\xef\xbb\xbf") else 0
+        quote, slash = 34, 92
+        left_array, right_array = 91, 93
+        left_object, right_object = 123, 125
+        comma, colon = 44, 58
+        whitespace = (9, 10, 13, 32)
+    else:
+        index = 0
+        quote, slash = '"', "\\"
+        left_array, right_array = "[", "]"
+        left_object, right_object = "{", "}"
+        comma, colon = ",", ":"
+        whitespace = ("\t", "\n", "\r", " ")
+
+    length = len(raw_response)
+    stack = []
+    root_state = "value"
+    node_count = 0
+
+    def skip_string(position: int) -> int:
+        position += 1
+        while position < length:
+            current = raw_response[position]
+            if current == slash:
+                position += 2
+                continue
+            if current == quote:
+                return position + 1
+            position += 1
+        raise ValueError("unterminated JSON string")
+
+    def consume_value(position: int) -> int:
+        nonlocal node_count, root_state
+        if stack:
+            context = stack[-1]
+            if context[0] == "array":
+                context[2] += 1
+                if context[2] > MAX_JSON_CONTAINER_ITEMS:
+                    raise ValueError("JSON container has too many items")
+                context[1] = "comma_or_end"
+            else:
+                context[1] = "comma_or_end"
+        else:
+            root_state = "end"
+
+        node_count += 1
+        if node_count > MAX_JSON_NODES:
+            raise ValueError("JSON has too many nodes")
+
+        current = raw_response[position]
+        if current == quote:
+            return skip_string(position)
+        if current in (left_array, left_object):
+            if len(stack) > MAX_JSON_NESTING:
+                raise ValueError("JSON nesting is too deep")
+            if current == left_array:
+                stack.append(["array", "value_or_end", 0])
+            else:
+                stack.append(["object", "key_or_end", 0])
+            return position + 1
+
+        start = position
+        while position < length:
+            current = raw_response[position]
+            if current in whitespace or current in (comma, right_array, right_object):
+                break
+            position += 1
+        if position == start:
+            raise ValueError("expected JSON value")
+        return position
+
+    while True:
+        while index < length and raw_response[index] in whitespace:
+            index += 1
+
+        if not stack:
+            if root_state == "end":
+                if index != length:
+                    raise ValueError("trailing JSON data")
+                return
+            if index == length:
+                raise ValueError("empty JSON input")
+            index = consume_value(index)
+            continue
+
+        context = stack[-1]
+        kind, state = context[0], context[1]
+        if index == length:
+            raise ValueError("incomplete JSON container")
+        current = raw_response[index]
+
+        if kind == "array":
+            if state == "value_or_end" and current == right_array:
+                stack.pop()
+                index += 1
+            elif state in ("value_or_end", "value"):
+                index = consume_value(index)
+            elif state == "comma_or_end" and current == comma:
+                context[1] = "value"
+                index += 1
+            elif state == "comma_or_end" and current == right_array:
+                stack.pop()
+                index += 1
+            else:
+                raise ValueError("invalid JSON array structure")
+            continue
+
+        if state in ("key_or_end", "key"):
+            if state == "key_or_end" and current == right_object:
+                stack.pop()
+                index += 1
+            elif current == quote:
+                context[2] += 1
+                if context[2] > MAX_JSON_CONTAINER_ITEMS:
+                    raise ValueError("JSON container has too many items")
+                index = skip_string(index)
+                context[1] = "colon"
+            else:
+                raise ValueError("invalid JSON object key")
+        elif state == "colon" and current == colon:
+            context[1] = "value"
+            index += 1
+        elif state == "value":
+            index = consume_value(index)
+        elif state == "comma_or_end" and current == comma:
+            context[1] = "key"
+            index += 1
+        elif state == "comma_or_end" and current == right_object:
+            stack.pop()
+            index += 1
+        else:
+            raise ValueError("invalid JSON object structure")
+
+
+def _object_without_duplicate_keys(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON object key")
+        result[key] = value
+    return result
+
+
 def parse_json_response(raw_response: object) -> object:
     """Parse bounded provider JSON without leaking decoder recursion failures."""
     try:
-        parsed = json.loads(raw_response)
+        _scan_json_structure(raw_response)
+        parsed = json.loads(
+            raw_response,
+            object_pairs_hook=_object_without_duplicate_keys,
+        )
     except (TypeError, ValueError, UnicodeError, RecursionError) as error:
         raise ImageOutputError("provider response is not valid JSON") from error
 

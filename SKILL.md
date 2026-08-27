@@ -97,7 +97,7 @@ def gen_one(name, prompt):
     ok = gen(prompt, path)
     return name, "done" if ok else "failed"
 
-with ThreadPoolExecutor(max_workers=8) as ex:
+with ThreadPoolExecutor(max_workers=2) as ex:
     futures = {ex.submit(gen_one, n, p): n for n, p in PROMPTS.items()}
     for f in as_completed(futures):
         name, status = f.result()
@@ -257,13 +257,21 @@ See `examples/chapters_meta.py` for a filled-in example.
 | Gemini vision model unavailable | Use the current default `gemini-3.6-flash` or set `GEMINI_VISION_MODEL` to an enabled compatible model |
 | doubao chat 404 | Vision models need separate endpoint activation; image gen works |
 
-## Real-World Reference
+## Historical Real-World Reference
 
-`agentic-design-patterns` project: 28 chapters × 8 pages = 224 slides generated in **276 seconds** (8 concurrent), plus 17 overview slides in 44s. All exported to 58 individual PDF + PPTX files. ~12 sample slides passed Gemini visual self-check.
+This is a historical case only from 2026-07-25, during the nano banana / Doubao
+provider period: the `agentic-design-patterns` project generated 28 chapters × 8
+pages = 224 slides in **276 seconds** (8 concurrent), plus 17 overview slides in
+44s. All were exported to 58 individual PDF + PPTX files, and about 12 sample
+slides passed Gemini visual self-check. This does not represent current GPT Image
+2 performance.
 
 ## Tips
 
-- **Concurrency sweet spot**: 4-8 workers. Higher triggers rate limits.
+- **Concurrency**: Start with low concurrency (for example, 1-2 workers), then
+  increase gradually based on the current provider, model, account quota, and
+  observed 429 responses. Do not treat the historical numbers above as a
+  universal limit or performance target.
 - **OpenAI defaults and overrides**: Confirmed defaults are `gpt-image-2`, `2048x1152`, and `medium`. Override them with `OPENAI_IMAGE_MODEL`, `OPENAI_IMAGE_SIZE`, and `OPENAI_IMAGE_QUALITY` when needed.
 - **Retry behavior**: Providers retry some transient failures internally; surface final failures for manual handling. There is no automatic provider fallback.
 - **Output extensions**: OpenAI and Doubao accept `.jpg`, `.jpeg`, `.png`, and `.webp`. Gemini accepts `.png`, `.jpg`, and `.jpeg`: PNG by default, while a JPEG suffix requests `IMAGE_JPEG`. Unsupported Gemini suffixes fail before credential lookup or network access. Only Gemini validates the provider-declared response MIME type. All providers validate the actual image encoding and strict 16:9 dimensions before publication.

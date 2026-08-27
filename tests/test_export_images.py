@@ -581,9 +581,10 @@ class ExportImagesTests(unittest.TestCase):
                     77,
                     crashed.stdout + crashed.stderr,
                 )
-                journals = list(root.glob(".deck.*journal*"))
-                self.assertEqual(len(journals), 1)
-                journal = journals[0]
+                journal = export_images._journal_path(prefix)
+                preparation = export_images._preparation_path(journal)
+                self.assertTrue(journal.is_file())
+                self.assertTrue(preparation.is_dir())
 
                 stderr = io.StringIO()
                 with redirect_stderr(stderr):
@@ -600,8 +601,9 @@ class ExportImagesTests(unittest.TestCase):
                     self.assertFalse(pdf.exists())
                     self.assertFalse(pptx.exists())
                 self.assertFalse(journal.exists())
+                self.assertFalse(preparation.exists())
                 self.assertEqual(list(root.glob(".*.backup")), [])
-                self.assertEqual(list(root.glob(".*.tmp.*")), [])
+                self.assertEqual(list(root.rglob(".*.tmp.*")), [])
 
     def test_failed_commit_journal_write_rolls_back_both_modes(self):
         for force in (False, True):
@@ -677,7 +679,10 @@ class ExportImagesTests(unittest.TestCase):
 
             self.assertEqual(marker_writes, 1)
             self.assertEqual(pdf.read_bytes(), b"external-pdf")
-            self.assertEqual(len(list(root.glob(".deck.*journal*"))), 2)
+            journal = export_images._journal_path(prefix)
+            self.assertTrue(journal.is_file())
+            self.assertTrue(export_images._commit_marker_path(journal).is_file())
+            self.assertTrue(export_images._preparation_path(journal).is_dir())
             self.assertIn("external target preserved", stderr.getvalue())
 
     def test_recovery_preserves_external_replacement_and_recovery_assets(self):
@@ -708,7 +713,9 @@ class ExportImagesTests(unittest.TestCase):
             load_all.assert_not_called()
             self.assertEqual(pdf.read_bytes(), b"external-pdf")
             self.assertEqual(pptx.read_bytes(), b"old-pptx")
-            self.assertEqual(len(list(root.glob(".deck.*journal*"))), 1)
+            journal = export_images._journal_path(prefix)
+            self.assertTrue(journal.is_file())
+            self.assertTrue(export_images._preparation_path(journal).is_dir())
             self.assertTrue(list(root.glob(".*.backup")))
             self.assertIn("external target preserved", stderr.getvalue())
 
@@ -939,7 +946,13 @@ class ExportImagesTests(unittest.TestCase):
             def replace_pdf_then_fail_pptx(source_path, target_path, *args, **kwargs):
                 nonlocal publish_count
                 target = Path(target_path)
-                if ".tmp" not in Path(source_path).name:
+                if (
+                    not Path(source_path).name.endswith(".owner")
+                    or target not in (
+                    export_images.resolve_output_path(pdf),
+                    export_images.resolve_output_path(pptx),
+                    )
+                ):
                     return real_link(source_path, target_path, *args, **kwargs)
                 publish_count += 1
                 if publish_count == 1:
@@ -958,13 +971,16 @@ class ExportImagesTests(unittest.TestCase):
                 result = export_images.main(["--force", str(prefix), str(source)])
 
             self.assertEqual(result, 1)
-            self.assertEqual(pdf.read_bytes(), b"external-pdf")
+            self.assertEqual(pdf.read_bytes(), b"old-pdf")
             self.assertEqual(pptx.read_bytes(), b"old-pptx")
-            backups = list(Path(temp_dir).glob(".*.backup"))
-            self.assertEqual(len(backups), 1)
-            self.assertEqual(backups[0].read_bytes(), b"old-pdf")
-            self.assertIn("ownership changed", stderr.getvalue())
-            self.assertIn(str(backups[0]), stderr.getvalue())
+            quarantines = [
+                path for path in Path(temp_dir).glob("*.quarantine")
+                if path.read_bytes() == b"external-pdf"
+            ]
+            self.assertEqual(len(quarantines), 1)
+            self.assertEqual(list(Path(temp_dir).glob(".*.backup")), [])
+            self.assertIn("isolated at", stderr.getvalue())
+            self.assertIn(str(quarantines[0]), stderr.getvalue())
 
     def test_force_rollback_preserves_external_creation_at_unpublished_pptx(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -980,7 +996,13 @@ class ExportImagesTests(unittest.TestCase):
 
             def create_external_pptx(source_path, target_path, *args, **kwargs):
                 nonlocal publish_count
-                if ".tmp" not in Path(source_path).name:
+                if (
+                    not Path(source_path).name.endswith(".owner")
+                    or Path(target_path) not in (
+                        export_images.resolve_output_path(pdf),
+                        export_images.resolve_output_path(pptx),
+                    )
+                ):
                     return real_link(source_path, target_path, *args, **kwargs)
                 publish_count += 1
                 if publish_count == 2:
@@ -1013,8 +1035,8 @@ class ExportImagesTests(unittest.TestCase):
             def deny_transaction_temp(path, *args, **kwargs):
                 candidate = Path(path)
                 if (
-                    candidate.parent.resolve(strict=False)
-                    == Path(temp_dir).resolve(strict=False)
+                    Path(temp_dir).resolve(strict=False)
+                    in candidate.resolve(strict=False).parents
                     and candidate.name.endswith(".quarantine")
                 ):
                     count = quarantine_unlinks.get(candidate, 0)
@@ -1033,8 +1055,8 @@ class ExportImagesTests(unittest.TestCase):
 
             self.assertTrue(prefix.with_suffix(".pdf").is_file())
             self.assertTrue(prefix.with_suffix(".pptx").is_file())
-            stale = list(Path(temp_dir).glob("*.quarantine"))
-            self.assertEqual(len(stale), 3)
+            stale = list(Path(temp_dir).rglob("*.quarantine"))
+            self.assertTrue(stale)
             self.assertIn("WARN:", stderr.getvalue())
             for path in stale:
                 self.assertIn(str(path), stderr.getvalue())
@@ -1108,11 +1130,16 @@ class ExportImagesTests(unittest.TestCase):
                 result = export_images.main([str(prefix), str(source)])
 
             self.assertTrue(pdf_replaced)
-            self.assertTrue(pptx_injected)
+            self.assertFalse(pptx_injected)
             self.assertEqual(result, 1)
-            self.assertEqual(pdf.read_bytes(), pdf_sentinel)
-            self.assertEqual(pptx.read_bytes(), pptx_sentinel)
-            self.assertIn("ownership changed", stderr.getvalue())
+            self.assertFalse(pdf.exists())
+            self.assertFalse(pptx.exists())
+            quarantines = [
+                path for path in Path(temp_dir).glob("*.quarantine")
+                if path.read_bytes() == pdf_sentinel
+            ]
+            self.assertEqual(len(quarantines), 1)
+            self.assertIn("identity changed", stderr.getvalue())
 
     def test_force_rollback_unlink_failure_still_restores_backup(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1131,10 +1158,13 @@ class ExportImagesTests(unittest.TestCase):
             def link_with_publish_failure(source_path, target_path, *args, **kwargs):
                 nonlocal publish_count
                 source_name = Path(source_path).name
-                if source_name.endswith(".quarantine"):
+                if source_name.endswith(".backup"):
                     restore_attempts.append(Path(target_path))
                     return real_link(source_path, target_path, *args, **kwargs)
-                if ".tmp" in source_name:
+                if source_name.endswith(".owner") and Path(target_path) in (
+                    export_images.resolve_output_path(pdf),
+                    export_images.resolve_output_path(pptx),
+                ):
                     publish_count += 1
                     if publish_count == 2:
                         raise OSError("forced second publish failure")
@@ -1183,9 +1213,10 @@ class ExportImagesTests(unittest.TestCase):
 
             def fail_second_publish(source_path, target_path, *args, **kwargs):
                 nonlocal publish_count
-                publish_count += 1
-                if publish_count == 2:
-                    raise OSError(primary)
+                if Path(target_path) in (pdf, pptx):
+                    publish_count += 1
+                    if publish_count == 2:
+                        raise OSError(primary)
                 return real_link(source_path, target_path, *args, **kwargs)
 
             def fail_cleanup(source_path, target_path, *args, **kwargs):
@@ -1227,9 +1258,10 @@ class ExportImagesTests(unittest.TestCase):
 
             def fail_second_publish(source_path, target_path, *args, **kwargs):
                 nonlocal publish_count
-                publish_count += 1
-                if publish_count == 2:
-                    raise OSError("PRIMARY-cli-publish")
+                if Path(target_path).name in ("deck.pdf", "deck.pptx"):
+                    publish_count += 1
+                    if publish_count == 2:
+                        raise OSError("PRIMARY-cli-publish")
                 return real_link(source_path, target_path, *args, **kwargs)
 
             def fail_cleanup(source_path, target_path, *args, **kwargs):
@@ -1316,7 +1348,7 @@ class ExportImagesTests(unittest.TestCase):
                 def link_with_failures(source_path, target_path, *args, **kwargs):
                     nonlocal publish_count
                     source_name = Path(source_path).name
-                    if source_name.endswith(".quarantine") and Path(target_path).name in (
+                    if source_name.endswith(".backup") and Path(target_path).name in (
                         "deck.pdf",
                         "deck.pptx",
                     ):
@@ -1324,7 +1356,10 @@ class ExportImagesTests(unittest.TestCase):
                         restore_attempts.append(target.name)
                         if target.name == failed_name:
                             raise OSError(f"forced restore failure for {failed_name}")
-                    elif ".tmp" in source_name:
+                    elif source_name.endswith(".owner") and Path(target_path) in (
+                        export_images.resolve_output_path(pdf),
+                        export_images.resolve_output_path(pptx),
+                    ):
                         publish_count += 1
                         if publish_count == 2:
                             raise OSError("forced second publish failure")

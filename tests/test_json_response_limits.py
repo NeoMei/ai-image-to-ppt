@@ -37,6 +37,63 @@ class RawResponse:
 
 
 class JsonResponseLimitTests(unittest.TestCase):
+    def test_duplicate_object_keys_are_rejected_instead_of_collapsed(self):
+        payload = '{"data": 0, "data": 1, "data": 2}'
+
+        with self.assertRaisesRegex(
+            image_output.ImageOutputError,
+            "provider response is not valid JSON",
+        ):
+            image_output.parse_json_response(payload)
+
+    def test_container_item_limit_is_enforced_before_json_decode(self):
+        limit = image_output.MAX_JSON_CONTAINER_ITEMS
+        payload = b"[" + b",".join([b"null"] * (limit + 1)) + b"]"
+
+        with mock.patch.object(
+            image_output.json,
+            "loads",
+            side_effect=AssertionError("oversized JSON reached json.loads"),
+        ) as loads, self.assertRaisesRegex(
+            image_output.ImageOutputError,
+            "provider response is not valid JSON",
+        ):
+            image_output.parse_json_response(payload)
+
+        loads.assert_not_called()
+
+    def test_total_node_limit_is_enforced_before_json_decode(self):
+        items_per_group = min(image_output.MAX_JSON_CONTAINER_ITEMS, 1000)
+        group_count = image_output.MAX_JSON_NODES // (items_per_group + 1) + 1
+        group = b"[" + b",".join([b"null"] * items_per_group) + b"]"
+        payload = b"[" + b",".join([group] * group_count) + b"]"
+
+        with mock.patch.object(
+            image_output.json,
+            "loads",
+            side_effect=AssertionError("oversized JSON reached json.loads"),
+        ) as loads, self.assertRaisesRegex(
+            image_output.ImageOutputError,
+            "provider response is not valid JSON",
+        ):
+            image_output.parse_json_response(payload)
+
+        loads.assert_not_called()
+
+    def test_predecode_scan_ignores_escaped_structure_inside_large_strings(self):
+        encoded = "W10sOnt9LFxcXFwi" * (1024 * 1024 // 16)
+        payload = json.dumps({
+            "data": [{
+                "b64_json": encoded,
+                "note": "escaped quote: \\\" and brackets: [ ] { } , :",
+            }]
+        })
+
+        parsed = image_output.parse_json_response(payload)
+
+        self.assertEqual(parsed["data"][0]["b64_json"], encoded)
+        self.assertIn("[ ] { } , :", parsed["data"][0]["note"])
+
     def test_wide_array_and_object_exceeding_item_limit_are_controlled(self):
         limit = image_output.MAX_JSON_CONTAINER_ITEMS
         payloads = (

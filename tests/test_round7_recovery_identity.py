@@ -315,8 +315,20 @@ class PreparationJournalCrashTests(unittest.TestCase):
                 Image.new("RGB", (160, 90), "navy").save(source)
                 crashed = self._crash(phase, source, prefix)
                 self.assertEqual(crashed.returncode, 77, crashed.stderr)
-                self.assertTrue(export_images._journal_path(prefix).exists())
-                self.assertEqual(len(list(root.glob(".*.tmp.*"))), 2)
+                journal = export_images._journal_path(prefix)
+                preparation = export_images._preparation_path(journal)
+                self.assertTrue(preparation.is_dir())
+                if phase == "journal-fsync":
+                    self.assertFalse(journal.exists())
+                else:
+                    self.assertTrue(journal.is_file())
+                    self.assertEqual(
+                        len([
+                            path for path in root.rglob(".*.tmp.*")
+                            if not path.name.endswith(".owner")
+                        ]),
+                        2,
+                    )
 
                 stderr = io.StringIO()
                 with redirect_stderr(stderr):
@@ -325,8 +337,9 @@ class PreparationJournalCrashTests(unittest.TestCase):
                     )
 
                 self.assertFalse(result)
-                self.assertFalse(export_images._journal_path(prefix).exists())
-                self.assertEqual(list(root.glob(".*.tmp.*")), [])
+                self.assertFalse(journal.exists())
+                self.assertFalse(preparation.exists())
+                self.assertEqual(list(root.rglob(".*.tmp.*")), [])
                 self.assertEqual(list(root.glob(".*.backup")), [])
                 self.assertFalse(prefix.with_suffix(".pdf").exists())
                 self.assertFalse(prefix.with_suffix(".pptx").exists())
@@ -341,7 +354,10 @@ class PreparationJournalCrashTests(unittest.TestCase):
             Image.new("RGB", (160, 90), "navy").save(source)
             crashed = self._crash("pdf-serialize", source, prefix)
             self.assertEqual(crashed.returncode, 77, crashed.stderr)
-            temporary = sorted(root.glob(".*.tmp.*"))[0]
+            temporary = sorted(
+                path for path in root.rglob(".*.tmp.*")
+                if not path.name.endswith(".owner")
+            )[0]
             temporary.unlink()
             temporary.write_bytes(b"external-temp")
 

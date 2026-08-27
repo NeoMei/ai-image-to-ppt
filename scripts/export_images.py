@@ -39,6 +39,9 @@ SLIDE_W = Emu(int(SLIDE_H) * 16 // 9)
 JOURNAL_VERSION = 1
 JOURNAL_SUFFIX = ".ai-image-to-ppt-export-journal.json"
 COMMIT_MARKER_SUFFIX = ".commit"
+PREPARATION_SUFFIX = ".prepare"
+JOURNAL_WRITE_NAME = "rollback.journal-write"
+COMMIT_WRITE_NAME = "commit.journal-write"
 MAX_JOURNAL_BYTES = 64 * 1024
 MAX_ERROR_SUMMARY = 300
 MAX_DECK_SLIDES = 128
@@ -85,7 +88,10 @@ def normalize(image: Image.Image) -> Image.Image:
 
 def _load(path: str) -> Image.Image:
     try:
-        return normalize(load_image(Path(path)).image)
+        loaded = load_image(Path(path))
+        image = normalize(loaded.image)
+        image.info["ai_image_to_ppt_source_bytes"] = loaded.byte_count
+        return image
     except ImageOutputError as error:
         raise OSError(str(error)) from error
 
@@ -297,6 +303,10 @@ def _commit_marker_path(journal: Path) -> Path:
     return journal.with_name(journal.name + COMMIT_MARKER_SUFFIX)
 
 
+def _preparation_path(journal: Path) -> Path:
+    return journal.with_name(journal.name + PREPARATION_SUFFIX)
+
+
 def _file_identity(path: Path) -> Optional[tuple]:
     try:
         current = os.stat(path, follow_symlinks=False)
@@ -335,13 +345,81 @@ def _sync_directory(path: Path) -> None:
     os.close(descriptor)
 
 
-def _write_journal(
-    journal: Path,
+def _directory_identity(path: Path, context: str) -> tuple:
+    metadata = path.lstat()
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise OSError(f"{context} is not a real directory: {path}")
+    return metadata.st_dev, metadata.st_ino
+
+
+def _begin_preparation(journal: Path, parent: ParentIdentity) -> tuple:
+    preparation = _preparation_path(journal)
+    verify_parent_identity(parent)
+    try:
+        os.mkdir(preparation, 0o700)
+    except FileExistsError as error:
+        raise OSError(
+            f"unfinished export preparation already exists: {preparation}"
+        ) from error
+    identity = _directory_identity(preparation, "export preparation")
+    try:
+        _sync_directory(parent.path)
+    except BaseException:
+        try:
+            os.rmdir(preparation)
+        except OSError:
+            pass
+        raise
+    return preparation, identity
+
+
+def _create_prepared_temporary(
+    target: Path,
+    parent: ParentIdentity,
+    preparation: Path,
+) -> tuple:
+    verify_parent_identity(parent)
+    if preparation.parent != parent.path:
+        raise OSError("export preparation must share the output directory")
+    descriptor = None
+    temporary = None
+    owner = None
+    try:
+        descriptor, value = tempfile.mkstemp(
+            prefix=f".{target.name}.",
+            suffix=f".tmp{target.suffix}",
+            dir=str(preparation),
+        )
+        temporary = Path(value)
+        temporary_stat = os.fstat(descriptor)
+        identity = (temporary_stat.st_dev, temporary_stat.st_ino)
+        os.close(descriptor)
+        descriptor = None
+        owner = temporary.with_name(temporary.name + ".owner")
+        os.link(temporary, owner, follow_symlinks=False)
+        _sync_directory(preparation)
+        return str(temporary), str(owner), identity
+    except BaseException:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        for candidate in (owner, temporary):
+            if candidate is not None:
+                try:
+                    os.unlink(candidate)
+                except OSError:
+                    pass
+        raise
+
+
+def _write_record(
+    record: Path,
     state: object,
     parent: ParentIdentity,
+    write_name: str,
 ) -> tuple:
-    if not isinstance(state, dict) or state.get("decision") != "rollback":
-        raise ValueError("initial export journal must record rollback")
     encoded = json.dumps(
         state,
         ensure_ascii=False,
@@ -349,40 +427,53 @@ def _write_journal(
         sort_keys=True,
     ).encode("utf-8")
     if len(encoded) > MAX_JOURNAL_BYTES:
-        raise OSError("export recovery journal exceeds its size limit")
+        raise OSError("export recovery record exceeds its size limit")
 
-    # The first journal occupies its discoverable final name while it is made
-    # durable. A private .write name here could strand serialization temps.
+    preparation = _preparation_path(
+        record if not record.name.endswith(COMMIT_MARKER_SUFFIX)
+        else record.with_name(record.name[: -len(COMMIT_MARKER_SUFFIX)])
+    )
+    writer = preparation / write_name
     descriptor = None
-    journal_identity = None
+    identity = None
+    installed = False
     try:
         verify_parent_identity(parent)
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
         flags |= getattr(os, "O_CLOEXEC", 0)
         flags |= getattr(os, "O_NOFOLLOW", 0)
-        descriptor = os.open(str(journal), flags, 0o600)
-        journal_stat = os.fstat(descriptor)
-        journal_identity = (journal_stat.st_dev, journal_stat.st_ino)
+        descriptor = os.open(str(writer), flags, 0o600)
+        writer_stat = os.fstat(descriptor)
+        identity = (writer_stat.st_dev, writer_stat.st_ino)
         with os.fdopen(descriptor, "wb") as stream:
             descriptor = None
             stream.write(encoded)
             stream.flush()
             os.fsync(stream.fileno())
+        verify_parent_identity(parent)
+        os.link(writer, record, follow_symlinks=False)
+        installed = True
         _sync_directory(parent.path)
-        return journal_identity
+        return identity
     except BaseException:
         if descriptor is not None:
             try:
                 os.close(descriptor)
             except OSError:
                 pass
-        if journal_identity is not None:
-            _remove_owned_file(
-                journal,
-                journal_identity,
-                "export recovery journal",
-            )
+        if not installed and identity is not None:
+            _remove_owned_file(writer, identity, "recovery record writer")
         raise
+
+
+def _write_journal(
+    journal: Path,
+    state: object,
+    parent: ParentIdentity,
+) -> tuple:
+    if not isinstance(state, dict) or state.get("decision") != "rollback":
+        raise ValueError("initial export journal must record rollback")
+    return _write_record(journal, state, parent, JOURNAL_WRITE_NAME)
 
 
 def _write_commit_marker(
@@ -391,57 +482,7 @@ def _write_commit_marker(
     parent: ParentIdentity,
 ) -> tuple:
     """Install a complete commit record without replacing any existing name."""
-    encoded = json.dumps(
-        state,
-        ensure_ascii=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("utf-8")
-    if len(encoded) > MAX_JOURNAL_BYTES:
-        raise OSError("export commit marker exceeds its size limit")
-
-    descriptor = None
-    temporary = None
-    temporary_identity = None
-    installed = False
-    try:
-        verify_parent_identity(parent)
-        descriptor, temporary_value = tempfile.mkstemp(
-            prefix=f".{marker.name}.",
-            suffix=".write",
-            dir=str(parent.path),
-        )
-        temporary = Path(temporary_value)
-        temporary_stat = os.fstat(descriptor)
-        temporary_identity = (temporary_stat.st_dev, temporary_stat.st_ino)
-        with os.fdopen(descriptor, "wb") as stream:
-            descriptor = None
-            stream.write(encoded)
-            stream.flush()
-            os.fsync(stream.fileno())
-        verify_parent_identity(parent)
-        os.link(temporary, marker, follow_symlinks=False)
-        installed = True
-        _sync_directory(parent.path)
-        return temporary_identity
-    finally:
-        if descriptor is not None:
-            try:
-                os.close(descriptor)
-            except OSError:
-                pass
-        if temporary is not None and temporary_identity is not None:
-            error = _remove_owned_file(
-                temporary,
-                temporary_identity,
-                "commit marker temporary",
-            )
-            if error is not None and installed:
-                print(
-                    "  WARN: commit marker temporary cleanup is incomplete; "
-                    + _recovery_error("cannot remove temporary", temporary, error),
-                    file=sys.stderr,
-                )
+    return _write_record(marker, state, parent, COMMIT_WRITE_NAME)
 
 
 def _validated_identity(value: object, label: str) -> tuple:
@@ -493,6 +534,12 @@ def _load_journal(
     if not isinstance(records, list) or len(records) != len(targets):
         raise OSError("invalid export recovery journal records")
 
+    base_journal = (
+        journal.with_name(journal.name[: -len(COMMIT_MARKER_SUFFIX)])
+        if journal.name.endswith(COMMIT_MARKER_SUFFIX)
+        else journal
+    )
+    preparation = _preparation_path(base_journal)
     for expected_target, record in zip(targets, records):
         if not isinstance(record, dict) or record.get("target") != str(expected_target):
             raise OSError("invalid export recovery journal target")
@@ -502,12 +549,22 @@ def _load_journal(
         temporary = Path(temporary_value)
         if (
             not temporary.is_absolute()
-            or temporary.parent != parent.path
+            or temporary.parent not in (parent.path, preparation)
             or not temporary.name.startswith(f".{expected_target.name}.")
             or ".tmp" not in temporary.name
         ):
             raise OSError("invalid export recovery journal temporary path")
         _validated_identity(record.get("temporary_identity"), "temporary identity")
+        owner_value = record.get("owner")
+        if owner_value is not None:
+            owner = Path(owner_value) if isinstance(owner_value, str) else None
+            if (
+                owner is None
+                or not owner.is_absolute()
+                or owner.parent != temporary.parent
+                or owner.name != temporary.name + ".owner"
+            ):
+                raise OSError("invalid export recovery journal temporary owner")
 
         existed = record.get("existed")
         if not isinstance(existed, bool):
@@ -644,6 +701,72 @@ def _remove_owned_file(
     )
 
 
+def _cleanup_preparation(
+    preparation: Path,
+    parent: ParentIdentity,
+    expected_identity: Optional[tuple] = None,
+) -> List[str]:
+    try:
+        current_identity = _directory_identity(
+            preparation, "export preparation"
+        )
+    except FileNotFoundError:
+        return []
+    except OSError as error:
+        return [_recovery_error("cannot inspect preparation", preparation, error)]
+    if expected_identity is not None and current_identity != expected_identity:
+        return [
+            _recovery_error(
+                "cannot remove preparation",
+                preparation,
+                OSError("preparation ownership changed; directory preserved"),
+            )
+        ]
+
+    errors = []
+    try:
+        children = list(preparation.iterdir())
+    except OSError as error:
+        return [_recovery_error("cannot scan preparation", preparation, error)]
+    for child in children:
+        try:
+            metadata = child.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            errors.append(_recovery_error("cannot inspect preparation file", child, error))
+            continue
+        if not stat.S_ISREG(metadata.st_mode):
+            errors.append(
+                _recovery_error(
+                    "cannot remove preparation file",
+                    child,
+                    OSError("unexpected non-regular preparation entry preserved"),
+                )
+            )
+            continue
+        error = _remove_owned_file(
+            child,
+            (metadata.st_dev, metadata.st_ino),
+            "preparation file",
+        )
+        if error is not None:
+            errors.append(
+                _recovery_error("cannot remove preparation file", child, error)
+            )
+    if errors:
+        return errors
+    try:
+        verify_parent_identity(parent)
+        os.rmdir(preparation)
+        _sync_directory(parent.path)
+    except FileNotFoundError:
+        return []
+    except OSError as error:
+        return [_recovery_error("cannot remove preparation", preparation, error)]
+    return []
+
+
 def _remove_journal(
     journal: Path,
     parent: ParentIdentity,
@@ -659,6 +782,79 @@ def _remove_journal(
 
 def _recovery_error(label: str, path: Path, error: object) -> str:
     return f"{label} {path}: {_bounded_error(error)}"
+
+
+def _record_source(record: object) -> Path:
+    owner = record.get("owner")
+    return Path(owner) if isinstance(owner, str) else Path(record["temporary"])
+
+
+def _link_owned_source(
+    source: Path,
+    target: Path,
+    expected_identity: tuple,
+    parent: ParentIdentity,
+    context: str,
+) -> None:
+    source_identity = _file_identity(source)
+    if source_identity != expected_identity:
+        raise OSError(f"{context} ownership changed; source preserved")
+    os.link(source, target, follow_symlinks=False)
+    _sync_directory(parent.path)
+    target_identity = _file_identity(target)
+    if target_identity == expected_identity:
+        return
+    if target_identity is not None:
+        quarantine, isolation_error = _take_owned_file(
+            target, target_identity, f"untrusted {context}"
+        )
+        if isolation_error is not None:
+            raise OSError(
+                f"{context} identity changed and final-name isolation failed: "
+                f"{_bounded_error(isolation_error)}"
+            )
+        if quarantine is not None:
+            raise OSError(
+                f"{context} identity changed during publication; external file "
+                f"isolated at {quarantine}"
+            )
+    raise OSError(f"{context} identity changed during publication")
+
+
+def _retired_backup_path(backup: Path) -> Path:
+    return backup.with_name(backup.name + ".retired")
+
+
+def _retire_backup(backup: Path, expected_identity: tuple) -> Optional[OSError]:
+    retired = _retired_backup_path(backup)
+    try:
+        backup_identity = _file_identity(backup)
+        retired_identity = _file_identity(retired)
+    except OSError as error:
+        return error
+    if retired_identity is not None and retired_identity != expected_identity:
+        return OSError("retired backup ownership changed; external file preserved")
+    if backup_identity is not None:
+        if backup_identity != expected_identity:
+            return OSError("backup ownership changed; external file preserved")
+        if retired_identity is not None:
+            return OSError("both backup recovery names exist; files preserved")
+        try:
+            os.rename(backup, retired)
+            _sync_directory(backup.parent)
+        except OSError as error:
+            return error
+        try:
+            retired_identity = _file_identity(retired)
+        except OSError as error:
+            return error
+        if retired_identity != expected_identity:
+            return OSError(
+                "backup ownership changed while retiring; stable recovery file preserved"
+            )
+    if retired_identity is None:
+        return None
+    return _remove_owned_file(retired, expected_identity, "retired backup")
 
 
 def _recover_state(
@@ -691,6 +887,9 @@ def _recover_state(
                 )
                 try:
                     backup_identity = _file_identity(backup)
+                    retired_identity = _file_identity(
+                        _retired_backup_path(backup)
+                    )
                 except OSError as error:
                     errors.append(
                         _recovery_error("cannot inspect backup", backup, error)
@@ -699,6 +898,14 @@ def _recover_state(
 
                 if backup_identity is None:
                     if target_identity == original_identity:
+                        if retired_identity == original_identity:
+                            error = _retire_backup(backup, original_identity)
+                            if error is not None:
+                                errors.append(
+                                    _recovery_error(
+                                        "cannot remove retired backup", backup, error
+                                    )
+                                )
                         continue
                     errors.append(
                         _recovery_error(
@@ -734,9 +941,7 @@ def _recover_state(
                     continue
                 try:
                     if target_identity == original_identity:
-                        error = _remove_owned_file(
-                            backup, original_identity, "backup"
-                        )
+                        error = _retire_backup(backup, original_identity)
                         if error is not None:
                             raise error
                     else:
@@ -748,33 +953,16 @@ def _recover_state(
                             )
                             if error is not None:
                                 raise error
-                        backup_quarantine, error = _take_owned_file(
-                            backup, original_identity, "backup"
+                        _link_owned_source(
+                            backup,
+                            target,
+                            original_identity,
+                            parent,
+                            "backup",
                         )
+                        error = _retire_backup(backup, original_identity)
                         if error is not None:
                             raise error
-                        if backup_quarantine is None:
-                            raise OSError("backup is missing")
-                        try:
-                            os.link(
-                                backup_quarantine,
-                                target,
-                                follow_symlinks=False,
-                            )
-                            _sync_directory(parent.path)
-                        except Exception:
-                            try:
-                                os.link(
-                                    backup_quarantine,
-                                    backup,
-                                    follow_symlinks=False,
-                                )
-                            except Exception:
-                                pass
-                            raise
-                        cleanup_error = _remove_quarantine(backup_quarantine)
-                        if cleanup_error is not None:
-                            raise cleanup_error
                 except (OSError, TypeError, NotImplementedError) as error:
                     errors.append(
                         _recovery_error(
@@ -804,12 +992,13 @@ def _recover_state(
         for record in records:
             target = Path(record["target"])
             temporary = Path(record["temporary"])
+            source = _record_source(record)
             temporary_identity = _validated_identity(
                 record["temporary_identity"], "temporary identity"
             )
             try:
                 target_identity = _file_identity(target)
-                temporary_current = _file_identity(temporary)
+                temporary_current = _file_identity(source)
             except OSError as error:
                 errors.append(_recovery_error("cannot inspect committed output", target, error))
                 continue
@@ -834,8 +1023,13 @@ def _recover_state(
                 )
                 continue
             try:
-                os.link(temporary, target)
-                _sync_directory(parent.path)
+                _link_owned_source(
+                    source,
+                    target,
+                    temporary_identity,
+                    parent,
+                    "committed output",
+                )
             except OSError as error:
                 errors.append(
                     _recovery_error("cannot complete committed output", target, error)
@@ -857,12 +1051,22 @@ def _recover_state(
             cleanup_errors.append(
                 _recovery_error("cannot remove temporary", temporary, error)
             )
+        owner_value = record.get("owner")
+        if isinstance(owner_value, str):
+            owner = Path(owner_value)
+            error = _remove_owned_file(
+                owner, temporary_identity, "temporary owner"
+            )
+            if error is not None:
+                cleanup_errors.append(
+                    _recovery_error("cannot remove temporary owner", owner, error)
+                )
         if record["existed"]:
             backup = Path(record["backup"])
             original_identity = _validated_identity(
                 record["original_identity"], "original identity"
             )
-            error = _remove_owned_file(backup, original_identity, "backup")
+            error = _retire_backup(backup, original_identity)
             if error is not None:
                 cleanup_errors.append(
                     _recovery_error("cannot remove backup", backup, error)
@@ -899,6 +1103,11 @@ def _recover_state(
             return [
                 _recovery_error("cannot remove commit marker", marker, error)
             ]
+    preparation_errors = _cleanup_preparation(
+        _preparation_path(journal), parent
+    )
+    if preparation_errors:
+        return preparation_errors
     return []
 
 
@@ -909,9 +1118,18 @@ def _recover_transaction(
 ) -> None:
     journal = _journal_path(output_prefix)
     marker = _commit_marker_path(journal)
+    preparation = _preparation_path(journal)
     journal_exists = os.path.lexists(journal)
     marker_exists = os.path.lexists(marker)
+    preparation_exists = os.path.lexists(preparation)
     if not journal_exists and not marker_exists:
+        if preparation_exists:
+            errors = _cleanup_preparation(preparation, parent)
+            if errors:
+                raise OSError(
+                    "unfinished export preparation cleanup was incomplete; "
+                    + "; ".join(errors)
+                )
         return
 
     marker_record = None
@@ -931,7 +1149,22 @@ def _recover_transaction(
 
     journal_identity = None
     if journal_exists:
-        loaded = _load_journal(journal, targets, parent)
+        try:
+            loaded = _load_journal(journal, targets, parent)
+        except OSError:
+            writer = preparation / JOURNAL_WRITE_NAME
+            if not preparation_exists or _file_identity(writer) != _file_identity(journal):
+                raise
+            journal_identity = _file_identity(journal)
+            error = _remove_owned_file(
+                journal, journal_identity, "incomplete export recovery journal"
+            )
+            if error is not None:
+                raise error
+            errors = _cleanup_preparation(preparation, parent)
+            if errors:
+                raise OSError("; ".join(errors))
+            return
         journal_identity = loaded.identity
         if marker_record is None:
             state = loaded.state
@@ -959,11 +1192,14 @@ def _build_transaction_state(
     targets: Sequence[Path],
     force: bool,
     parent: ParentIdentity,
+    owner_paths: Optional[Sequence[str]] = None,
 ) -> object:
     if not isinstance(force, bool):
         raise ValueError("force must be a boolean")
     if len(temporary_paths) != len(targets) or not targets:
         raise ValueError("temporary and target pairs must be non-empty and aligned")
+    if owner_paths is not None and len(owner_paths) != len(targets):
+        raise ValueError("temporary owner and target pairs must be aligned")
     verify_parent_identity(parent)
     targets = tuple(Path(target) for target in targets)
     if any(target.parent != parent.path for target in targets):
@@ -975,13 +1211,23 @@ def _build_transaction_state(
         raise FileExistsError(f"output already exists; use --force: {names}")
 
     records = []
-    for temporary_value, target in zip(temporary_paths, targets):
+    owners = owner_paths if owner_paths is not None else [None] * len(targets)
+    preparation = _preparation_path(_journal_path_for_targets(targets))
+    for temporary_value, owner_value, target in zip(temporary_paths, owners, targets):
         temporary = Path(temporary_value)
-        if temporary.parent != parent.path:
+        if temporary.parent not in (parent.path, preparation):
             raise OSError("paired temporary files must share the output directory")
         temporary_stat = os.stat(temporary, follow_symlinks=False)
         if not stat.S_ISREG(temporary_stat.st_mode):
             raise OSError(f"refusing non-regular temporary output: {temporary}")
+        owner = Path(owner_value) if owner_value is not None else None
+        if owner is not None:
+            if owner.parent != temporary.parent:
+                raise OSError("temporary owner must share the preparation directory")
+            owner_stat = os.stat(owner, follow_symlinks=False)
+            owner_identity = (owner_stat.st_dev, owner_stat.st_ino)
+            if owner_identity != (temporary_stat.st_dev, temporary_stat.st_ino):
+                raise OSError("temporary owner identity does not match output")
         existed = os.path.lexists(target)
         original_identity = None
         backup = None
@@ -997,6 +1243,7 @@ def _build_transaction_state(
             "temporary_identity": _identity_list(
                 (temporary_stat.st_dev, temporary_stat.st_ino)
             ),
+            "owner": str(owner) if owner is not None else None,
             "existed": existed,
             "original_identity": (
                 _identity_list(original_identity)
@@ -1018,9 +1265,10 @@ def _begin_transaction(
     targets: Sequence[Path],
     force: bool,
     parent: ParentIdentity,
+    owner_paths: Optional[Sequence[str]] = None,
 ) -> tuple:
     state = _build_transaction_state(
-        temporary_paths, targets, force, parent
+        temporary_paths, targets, force, parent, owner_paths=owner_paths
     )
     journal = _journal_path_for_targets(targets)
     marker = _commit_marker_path(journal)
@@ -1029,8 +1277,67 @@ def _begin_transaction(
             "unfinished export recovery record already exists: "
             f"{journal if os.path.lexists(journal) else marker}"
         )
+    preparation = _preparation_path(journal)
+    if not os.path.lexists(preparation):
+        _begin_preparation(journal, parent)
     journal_identity = _write_journal(journal, state, parent)
     return state, journal, journal_identity
+
+
+def _warn_cleanup(message: str) -> None:
+    try:
+        print(message, file=sys.stderr)
+    except Exception:
+        pass
+
+
+def _finish_visible_commit(
+    marker: Path,
+    journal: Path,
+    targets: Sequence[Path],
+    parent: ParentIdentity,
+    journal_identity: tuple,
+) -> bool:
+    if not os.path.lexists(marker):
+        return False
+    try:
+        loaded = _load_journal(marker, targets, parent)
+        state = loaded.state
+        if state.get("decision") != "commit":
+            return False
+        expected = _validated_identity(
+            state.get("rollback_journal_identity"),
+            "rollback journal identity",
+        )
+        if expected != journal_identity:
+            return False
+    except (OSError, ValueError):
+        return False
+
+    cleanup_errors = _recover_state(
+        state,
+        journal,
+        parent,
+        journal_identity=journal_identity,
+        commit_marker=(marker, loaded.identity),
+    )
+    blocking_errors = [
+        error
+        for error in cleanup_errors
+        if error.startswith((
+            "cannot inspect committed output",
+            "cannot complete committed output",
+        ))
+    ]
+    if blocking_errors:
+        raise OSError(
+            "committed export verification failed; " + "; ".join(blocking_errors)
+        )
+    for error in cleanup_errors:
+        _warn_cleanup(
+            f"  WARN: committed export cleanup is incomplete; {error}"
+        )
+    return True
 
 
 def _publish_pair(
@@ -1088,8 +1395,21 @@ def _publish_pair(
             temporary = Path(record["temporary"])
             target = Path(record["target"])
             verify_parent_identity(parent)
-            os.link(temporary, target)
-            _sync_directory(parent.path)
+            temporary_identity = _validated_identity(
+                record["temporary_identity"], "temporary identity"
+            )
+            if _file_identity(temporary) != temporary_identity:
+                raise OSError(
+                    f"temporary output ownership changed; external file preserved: "
+                    f"{temporary}"
+                )
+            _link_owned_source(
+                _record_source(record),
+                target,
+                temporary_identity,
+                parent,
+                "published output",
+            )
 
         committed_state = dict(state)
         committed_state["decision"] = "commit"
@@ -1103,6 +1423,18 @@ def _publish_pair(
         )
         state = committed_state
     except Exception as publication_error:
+        if _finish_visible_commit(
+            commit_marker,
+            journal,
+            targets,
+            parent,
+            journal_identity,
+        ):
+            _warn_cleanup(
+                "  WARN: commit marker was installed before a later failure; "
+                f"committed outputs were preserved: {_bounded_error(publication_error)}"
+            )
+            return
         recovery_errors = _recover_state(
             state,
             journal,
@@ -1138,7 +1470,9 @@ def _publish_pair(
             "committed export verification failed; " + "; ".join(blocking_errors)
         )
     for error in cleanup_errors:
-        print(f"  WARN: committed export cleanup is incomplete; {error}", file=sys.stderr)
+        _warn_cleanup(
+            f"  WARN: committed export cleanup is incomplete; {error}"
+        )
 
 
 def _export_deck_owned(
@@ -1152,14 +1486,36 @@ def _export_deck_owned(
     targets = (Path(f"{output_prefix}.pdf"), Path(f"{output_prefix}.pptx"))
     verify_parent_identity(parent)
     images = _load_all(files)
+    actual_source_bytes = sum(
+        image.info.get("ai_image_to_ppt_source_bytes", 0)
+        for image in images
+        if isinstance(image, Image.Image)
+    )
+    if actual_source_bytes > MAX_DECK_SOURCE_BYTES:
+        raise ValueError(
+            "deck aggregate source bytes exceed maximum of "
+            f"{MAX_DECK_SOURCE_BYTES} bytes"
+        )
     temporary_paths = []
+    owner_paths = []
     transaction = None
+    preparation = None
     publication_started = False
     try:
+        journal = _journal_path(Path(output_prefix))
+        preparation = _begin_preparation(journal, parent)
         for target in targets:
-            temporary_paths.append(_temporary_path(target, parent=parent))
+            temporary, owner, _identity = _create_prepared_temporary(
+                target, parent, preparation[0]
+            )
+            temporary_paths.append(temporary)
+            owner_paths.append(owner)
         transaction = _begin_transaction(
-            temporary_paths, targets, force, parent
+            temporary_paths,
+            targets,
+            force,
+            parent,
+            owner_paths=owner_paths,
         )
         _save_pdf(images, temporary_paths[0])
         _sync_file(temporary_paths[0])
@@ -1176,21 +1532,16 @@ def _export_deck_owned(
     except Exception as preparation_error:
         if (
             not publication_started
-            and transaction is not None
-            and os.path.lexists(transaction[1])
+            and preparation is not None
         ):
-            recovery_errors = _recover_state(
-                transaction[0],
-                transaction[1],
-                parent,
-                journal_identity=transaction[2],
-            )
-            if recovery_errors:
+            try:
+                _recover_transaction(Path(output_prefix), targets, parent)
+            except OSError as recovery_error:
                 raise OSError(
                     "export preparation failed: "
                     f"{_bounded_error(preparation_error)}; "
                     "recovery was incomplete; "
-                    + "; ".join(recovery_errors)
+                    f"{_bounded_error(recovery_error)}"
                 ) from preparation_error
         raise
     finally:
@@ -1198,6 +1549,7 @@ def _export_deck_owned(
         if (
             not os.path.lexists(final_journal)
             and not os.path.lexists(_commit_marker_path(final_journal))
+            and not os.path.lexists(_preparation_path(final_journal))
         ):
             for temporary in temporary_paths:
                 _cleanup_temp(temporary, "export preparation cleanup failed")

@@ -169,6 +169,31 @@ class DocumentationTests(unittest.TestCase):
                 normalized,
             )
 
+    def test_historical_performance_reference_is_scoped_away_from_gpt_image_2(self):
+        normalized = " ".join(self.skill.split())
+        self.assertIn("2026-07-25", normalized)
+        self.assertIn("nano banana / Doubao provider period", normalized)
+        self.assertIn("historical case only", normalized)
+        self.assertIn(
+            "does not represent current GPT Image 2 performance",
+            normalized,
+        )
+
+    def test_concurrency_guidance_starts_low_and_adapts_to_current_limits(self):
+        normalized = " ".join(self.skill.split())
+        self.assertIn(
+            "Start with low concurrency (for example, 1-2 workers)",
+            normalized,
+        )
+        self.assertIn(
+            "current provider, model, account quota, and observed 429 responses",
+            normalized,
+        )
+        self.assertIn("ThreadPoolExecutor(max_workers=2)", self.skill)
+        self.assertNotIn("ThreadPoolExecutor(max_workers=8)", self.skill)
+        self.assertNotIn("Concurrency sweet spot", self.skill)
+        self.assertNotIn("Higher triggers rate limits", self.skill)
+
 
 if __name__ == "__main__":
     unittest.main()
