@@ -1,10 +1,10 @@
 """Deterministic host-first routing policy for slide-image batches.
 
-The Skill owns host capability discovery and calls.  This module deliberately
-does not inspect a host, read credentials, or invoke a provider: it turns those
-already-classified attempts into the fixed six-candidate, serial sticky policy.
+The Skill owns host capability discovery and calls. This module receives only
+classified attempts and makes the six-candidate serial routing decision.
 """
 
+import re
 from dataclasses import dataclass
 from threading import RLock
 from typing import Callable, Dict, Optional, Tuple
@@ -71,38 +71,57 @@ class PageRoutingResult:
 
 
 AttemptExecutor = Callable[[RoutingCandidate], GenerationResult]
+_ANSI_ESCAPE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|[@-_])?")
+_UNSAFE_CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
+_WHITESPACE = re.compile(r"\s+")
+
+
+def _safe_reason(message: object) -> str:
+    """Make a user-safe reason incapable of creating another report line."""
+    value = _ANSI_ESCAPE.sub(" ", safe_message(message))
+    value = _UNSAFE_CONTROL.sub(" ", value)
+    value = _WHITESPACE.sub(" ", value).strip()
+    return value.replace(":", ";")
 
 
 def _ordered_redacted_summary(attempts: Tuple[AttemptRecord, ...]) -> str:
-    """Return an ordered user-safe exhaustion summary without raw responses."""
+    """Return an ordered, one-line-per-candidate exhaustion summary."""
     return "\n".join(
         f"{attempt.candidate.key}: {attempt.result.status.value}: "
-        f"{safe_message(attempt.result.safe_message) or 'no safe reason provided'}"
+        f"{_safe_reason(attempt.result.safe_message) or 'no safe reason provided'}"
         for attempt in attempts
     )
 
 
 class SerialStickyRouter:
-    """Route pages serially, pinning the first successful candidate.
+    """Route pages serially with transactional, forward-only sticky state.
 
-    `route_page` holds one lock through the supplied executor, so callers cannot
-    accidentally make parallel generation calls through the same batch state.
-    Page numbers must strictly increase; successful and cached pages are never
-    retried.  A fallback can only advance the sticky candidate, while a fatal
-    result or full exhaustion closes the batch.
+    The search cursor starts at host OpenAI, while the selected sticky candidate
+    remains ``None`` until a page actually succeeds. A lock serializes calls and
+    an explicit active-call guard rejects executor reentry even on this thread's
+    reentrant lock. Executor failures are not route results: they leave all
+    state untouched, fail closed, and permit retrying the same page.
     """
 
     def __init__(self) -> None:
-        self._sticky_index = 0
+        self._search_index = 0
+        self._selected_index: Optional[int] = None
         self._last_page_number = 0
         self._stopped = False
+        self._active_call = False
         self._pages: Dict[int, PageRoutingResult] = {}
         self._switches: list[SwitchRecord] = []
         self._lock = RLock()
 
     @property
-    def sticky_candidate(self) -> RoutingCandidate:
-        return CANDIDATES[self._sticky_index]
+    def sticky_candidate(self) -> Optional[RoutingCandidate]:
+        if self._selected_index is None:
+            return None
+        return CANDIDATES[self._selected_index]
+
+    @property
+    def search_candidate(self) -> RoutingCandidate:
+        return CANDIDATES[self._search_index]
 
     @property
     def stopped(self) -> bool:
@@ -123,76 +142,87 @@ class SerialStickyRouter:
         *,
         cached: bool = False,
     ) -> PageRoutingResult:
-        """Route exactly one page through the current sticky candidate onward."""
+        """Route exactly one page and commit state only after a decision."""
         with self._lock:
+            if self._active_call:
+                raise RuntimeError("route_page cannot be called from an active executor")
             self._validate_page(page_number, execute, cached)
-            self._last_page_number = page_number
-            if cached:
-                page = PageRoutingResult(page_number, "cached", None, ())
-                self._pages[page_number] = page
-                return page
+            self._active_call = True
+            try:
+                if cached:
+                    return self._commit_page(PageRoutingResult(page_number, "cached", None, ()))
 
-            start_index = self._sticky_index
-            attempts = []
-            for candidate in CANDIDATES[start_index:]:
-                result = execute(candidate)
-                self._validate_result(candidate, result)
-                attempt = AttemptRecord(page_number, candidate, result)
-                attempts.append(attempt)
-                immutable_attempts = tuple(attempts)
-                if result.status is GenerationStatus.SUCCESS:
-                    if candidate.index > start_index:
-                        self._switches.append(
-                            SwitchRecord(
+                start_index = self._search_index
+                selected_before = self._selected_index
+                attempts = []
+                for candidate in CANDIDATES[start_index:]:
+                    try:
+                        result = execute(candidate)
+                        self._validate_result(candidate, result)
+                    except Exception as error:
+                        raise RuntimeError(
+                            "candidate executor failed; route state was not committed"
+                        ) from error
+                    attempt = AttemptRecord(page_number, candidate, result)
+                    attempts.append(attempt)
+                    immutable_attempts = tuple(attempts)
+                    if result.status is GenerationStatus.SUCCESS:
+                        switch = None
+                        if selected_before is not None and candidate.index > selected_before:
+                            switch = SwitchRecord(
                                 page_number,
-                                CANDIDATES[start_index],
+                                CANDIDATES[selected_before],
                                 candidate,
                                 "; ".join(
-                                    f"{prior.candidate.key}: "
-                                    f"{prior.result.status.value}: "
-                                    f"{safe_message(prior.result.safe_message)}"
+                                    f"{prior.candidate.key}: {prior.result.status.value}: "
+                                    f"{_safe_reason(prior.result.safe_message)}"
                                     for prior in attempts[:-1]
                                 ),
                             )
+                        page = PageRoutingResult(
+                            page_number, "success", candidate, immutable_attempts
                         )
-                    self._sticky_index = candidate.index
-                    page = PageRoutingResult(
-                        page_number, "success", candidate, immutable_attempts
-                    )
-                    self._pages[page_number] = page
-                    return page
-                if result.status in FATAL_STATUSES:
-                    self._stopped = True
-                    page = PageRoutingResult(
-                        page_number,
-                        "fatal",
-                        candidate,
-                        immutable_attempts,
-                        safe_message(result.safe_message),
-                    )
-                    self._pages[page_number] = page
-                    return page
-                if result.status not in FALLBACK_STATUSES:
-                    raise RuntimeError(f"unclassified generation status: {result.status}")
+                        return self._commit_page(
+                            page,
+                            search_index=candidate.index,
+                            selected_index=candidate.index,
+                            switch=switch,
+                        )
+                    if result.status in FATAL_STATUSES:
+                        return self._commit_page(
+                            PageRoutingResult(
+                                page_number,
+                                "fatal",
+                                candidate,
+                                immutable_attempts,
+                                _safe_reason(result.safe_message),
+                            ),
+                            stopped=True,
+                        )
+                    if result.status not in FALLBACK_STATUSES:
+                        raise RuntimeError(f"unclassified generation status: {result.status}")
 
-            immutable_attempts = tuple(attempts)
-            self._stopped = True
-            page = PageRoutingResult(
-                page_number,
-                "exhausted",
-                None,
-                immutable_attempts,
-                _ordered_redacted_summary(immutable_attempts),
-            )
-            self._pages[page_number] = page
-            return page
+                immutable_attempts = tuple(attempts)
+                return self._commit_page(
+                    PageRoutingResult(
+                        page_number,
+                        "exhausted",
+                        None,
+                        immutable_attempts,
+                        _ordered_redacted_summary(immutable_attempts),
+                    ),
+                    stopped=True,
+                )
+            finally:
+                self._active_call = False
 
     def report(self) -> dict:
         """Return a JSON-ready record for the Skill's final batch report."""
         return {
             "batch_mode": "serial-sticky-monotonic",
             "stopped": self.stopped,
-            "sticky_candidate": self.sticky_candidate.key,
+            "search_candidate": self.search_candidate.key,
+            "sticky_candidate": self.sticky_candidate.key if self.sticky_candidate else None,
             "pages": [
                 {
                     "page": page.page_number,
@@ -212,6 +242,27 @@ class SerialStickyRouter:
                 for switch in self.switches
             ],
         }
+
+    def _commit_page(
+        self,
+        page: PageRoutingResult,
+        *,
+        search_index: Optional[int] = None,
+        selected_index: Optional[int] = None,
+        stopped: bool = False,
+        switch: Optional[SwitchRecord] = None,
+    ) -> PageRoutingResult:
+        """Commit one terminal decision after all of its work has succeeded."""
+        if search_index is not None:
+            self._search_index = search_index
+        if selected_index is not None:
+            self._selected_index = selected_index
+        if switch is not None:
+            self._switches.append(switch)
+        self._pages[page.page_number] = page
+        self._last_page_number = page.page_number
+        self._stopped = stopped
+        return page
 
     def _validate_page(
         self, page_number: int, execute: AttemptExecutor, cached: bool

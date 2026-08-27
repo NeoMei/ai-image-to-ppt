@@ -56,12 +56,17 @@ python3 scripts/gen_slide.py out/slide_01.jpg "<prompt>" --engine doubao
 
 OpenAI uses `gpt-image-2` at 2048×1152/medium by default. Gemini uses
 `gemini-3.1-flash-image`, targets 16:9 2K, and uses PNG by default; the optional
-vision check uses `gemini-3.6-flash`. OpenAI and Doubao accept `.jpg`, `.jpeg`,
+vision check uses `gemini-3.6-flash`. Doubao uses the current
+`doubao-seedream-5-0-260128` default model. OpenAI and Doubao accept `.jpg`, `.jpeg`,
 `.png`, and `.webp`; Gemini accepts `.png`, `.jpg`, and `.jpeg`.
 
 All sources are decoded and checked for actual format and strict 16:9 before
-publication. Existing outputs are protected unless `--force` is explicit;
-image inputs and generation outputs are capped at 50 MiB and 64 MP.
+publication. Existing outputs are protected unless `--force` is explicit; use
+`--force` only for intentional replacement with rollback and crash-recovery
+protection. Image inputs and generation outputs are capped at 50 MiB and 64 MP.
+Vision-check inputs have a separate 14 MiB limit. Transient provider retries
+honor bounded `Retry-After` guidance. Parent-directory replacement is detected
+before publication and fails closed.
 
 ## Editable-converter handoff
 
@@ -87,12 +92,21 @@ and uses a same-directory recovery journal after interrupted output. A deck is
 limited to 128 slides and 512 MiB aggregate source bytes. Clearly over-limit
 manifests are rejected during path preflight, before image decoding. If source
 files change after preflight, actual loaded bytes are accumulated after each
-image load and rejected before PDF/PPTX serialization. Stable output locks
-persist intentionally; run cleanup only while no generation or export process is active:
+image load and rejected before PDF/PPTX serialization. On POSIX, file and
+directory fsync cover process crashes and power-loss metadata recovery. On
+Windows, recovery covers process crashes only and does not promise power-loss
+durability.
+
+Stable output locks persist intentionally. Cleanup never runs automatically;
+run it ONLY while no generation or export process is active:
 
 ```bash
 python3 scripts/cleanup_output_locks.py --older-than-days 30
 ```
+
+Because cleanup uses pathname age checks and removal, the offline precondition
+is the safety boundary for pathname races. Filesystem failures stop cleanup,
+return exit 1 without a traceback, and do not roll back earlier removals.
 
 ## Development
 

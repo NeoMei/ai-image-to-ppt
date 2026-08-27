@@ -53,6 +53,22 @@ class DocumentationTests(unittest.TestCase):
             self.assertIn("1280×720 PNG", document)
             self.assertIn("prepare_editable_input.py", document)
 
+    def test_readme_keeps_provider_and_safety_recovery_boundaries(self):
+        normalized = " ".join(self.readme.split())
+        for expected in (
+            "`doubao-seedream-5-0-260128`",
+            "14 MiB",
+            "bounded `Retry-After`",
+            "Parent-directory replacement",
+            "On POSIX, file and directory fsync cover process crashes and power-loss metadata recovery.",
+            "On Windows, recovery covers process crashes only and does not promise power-loss durability.",
+            "rollback and crash-recovery protection",
+            "never runs automatically",
+            "offline precondition is the safety boundary for pathname races",
+            "Filesystem failures stop cleanup, return exit 1 without a traceback, and do not roll back earlier removals.",
+        ):
+            self.assertIn(expected, normalized)
+
 
 if __name__ == "__main__":
     unittest.main()
