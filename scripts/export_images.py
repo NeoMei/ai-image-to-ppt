@@ -1457,30 +1457,39 @@ def _recover_transaction(
 
     journal_identity = None
     if journal_exists:
-        try:
-            loaded = _load_journal(journal, targets, parent)
-        except OSError:
-            writer = preparation / JOURNAL_WRITE_NAME
-            if not preparation_exists or _file_identity(writer) != _file_identity(journal):
-                raise
+        if marker_record is not None:
+            # A durable commit marker contains the complete recovery state and
+            # binds it to the rollback journal inode. Once it exists, the commit
+            # decision is authoritative even if the older rollback JSON was
+            # truncated after the marker was installed.
             journal_identity = _file_identity(journal)
-            error = _remove_owned_file(
-                journal, journal_identity, "incomplete export recovery journal"
-            )
-            if error is not None:
-                raise error
-            errors = _cleanup_preparation(preparation, parent, targets)
-            if errors:
-                raise OSError("; ".join(errors))
-            return
-        journal_identity = loaded.identity
-        if marker_record is None:
+            if journal_identity != expected_journal_identity:
+                raise OSError(
+                    "export recovery journal ownership changed; external file "
+                    "and commit marker preserved"
+                )
+        else:
+            try:
+                loaded = _load_journal(journal, targets, parent)
+            except OSError:
+                writer = preparation / JOURNAL_WRITE_NAME
+                if (
+                    not preparation_exists
+                    or _file_identity(writer) != _file_identity(journal)
+                ):
+                    raise
+                journal_identity = _file_identity(journal)
+                error = _remove_owned_file(
+                    journal, journal_identity, "incomplete export recovery journal"
+                )
+                if error is not None:
+                    raise error
+                errors = _cleanup_preparation(preparation, parent, targets)
+                if errors:
+                    raise OSError("; ".join(errors))
+                return
+            journal_identity = loaded.identity
             state = loaded.state
-        elif journal_identity != expected_journal_identity:
-            raise OSError(
-                "export recovery journal ownership changed; external file "
-                "and commit marker preserved"
-            )
 
     errors = _recover_state(
         state,
