@@ -38,6 +38,7 @@ MAX_ENCODED_IMAGE_BYTES = 4 * ((MAX_IMAGE_BYTES + 2) // 3)
 MAX_PROVIDER_RESPONSE_BYTES = MAX_ENCODED_IMAGE_BYTES + 1024 * 1024
 PROVIDER_RESPONSE_READ_CHUNK_BYTES = 64 * 1024
 MAX_PROVIDER_RESPONSE_READS = 4096
+IMAGE_STREAM_READ_CHUNK_BYTES = 64 * 1024
 MAX_RETRIES = 10
 MAX_JSON_NESTING = 100
 MAX_JSON_NODES = 100_000
@@ -409,6 +410,52 @@ def read_response_body(response) -> bytes:
     return bytes(data)
 
 
+def read_bounded_image_stream(stream, max_bytes: int = MAX_IMAGE_BYTES) -> bytes:
+    """Read image bytes without allowing an unbounded stream allocation."""
+    if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes <= 0:
+        raise ImageOutputError("maximum image size must be a positive integer")
+
+    headers = getattr(stream, "headers", {})
+    try:
+        content_length = headers.get("Content-Length")
+    except AttributeError:
+        content_length = None
+    if content_length:
+        try:
+            declared_length = int(content_length)
+        except (TypeError, ValueError) as error:
+            raise ImageOutputError("download Content-Length is invalid") from error
+        if declared_length < 0 or declared_length > max_bytes:
+            raise ImageOutputError(
+                f"download exceeds maximum image size of {max_bytes} bytes"
+            )
+
+    data = bytearray()
+    max_reads = min(
+        MAX_PROVIDER_RESPONSE_READS,
+        (max_bytes + IMAGE_STREAM_READ_CHUNK_BYTES - 1)
+        // IMAGE_STREAM_READ_CHUNK_BYTES + 1,
+    )
+    for _read_count in range(max_reads):
+        remaining = max_bytes - len(data)
+        try:
+            chunk = stream.read(min(IMAGE_STREAM_READ_CHUNK_BYTES, remaining + 1))
+        except TypeError as error:
+            raise ImageOutputError("image stream does not support bounded reads") from error
+        except (OSError, http.client.HTTPException) as error:
+            raise ImageStreamError(f"image stream read failed: {error}") from error
+        if not isinstance(chunk, bytes):
+            raise ImageOutputError("image stream returned non-byte data")
+        if not chunk:
+            return bytes(data)
+        data.extend(chunk)
+        if len(data) > max_bytes:
+            raise ImageOutputError(
+                f"image data exceeds maximum size of {max_bytes} bytes"
+            )
+    raise ImageOutputError("image stream returned too many chunks")
+
+
 def _validate_dimensions(width: int, height: int) -> None:
     if width <= 0 or height <= 0:
         raise ImageOutputError("image dimensions must be positive")
@@ -419,28 +466,20 @@ def _validate_dimensions(width: int, height: int) -> None:
         )
 
 
-def load_image(
-    path: Path,
+def _load_image_data(
+    data: bytes,
     verify: bool = False,
     copy_image: bool = True,
 ) -> LoadedImage:
     """Load one image under shared byte, pixel, and Pillow bomb limits."""
-    image_path = Path(path)
     try:
-        stated_size = image_path.stat().st_size
-        if stated_size <= 0:
+        if not isinstance(data, bytes) or not data:
             raise ImageOutputError("image data is empty")
-        if stated_size > MAX_IMAGE_BYTES:
+        if len(data) > MAX_IMAGE_BYTES:
             raise ImageOutputError(
-                f"image exceeds maximum size of {MAX_IMAGE_BYTES} bytes"
+                f"image data exceeds maximum size of {MAX_IMAGE_BYTES} bytes"
             )
-        with image_path.open("rb") as source:
-            data = source.read(MAX_IMAGE_BYTES + 1)
         byte_count = len(data)
-        if byte_count > MAX_IMAGE_BYTES:
-            raise ImageOutputError(
-                f"image exceeds maximum size of {MAX_IMAGE_BYTES} bytes"
-            )
 
         with warnings.catch_warnings():
             warnings.simplefilter("error", Image.DecompressionBombWarning)
@@ -462,6 +501,56 @@ def load_image(
         raise ImageOutputError(f"data is not a valid image: {error}") from error
 
     return LoadedImage(loaded, image_format, byte_count, width, height)
+
+
+def load_image(
+    path: Path,
+    verify: bool = False,
+    copy_image: bool = True,
+) -> LoadedImage:
+    """Load one image under shared byte, pixel, and Pillow bomb limits."""
+    image_path = Path(path)
+    try:
+        stated_size = image_path.stat().st_size
+        if stated_size <= 0:
+            raise ImageOutputError("image data is empty")
+        if stated_size > MAX_IMAGE_BYTES:
+            raise ImageOutputError(
+                f"image exceeds maximum size of {MAX_IMAGE_BYTES} bytes"
+            )
+        with image_path.open("rb") as source:
+            data = source.read(MAX_IMAGE_BYTES + 1)
+        if len(data) > MAX_IMAGE_BYTES:
+            raise ImageOutputError(
+                f"image exceeds maximum size of {MAX_IMAGE_BYTES} bytes"
+            )
+    except ImageOutputError:
+        raise
+    except (OSError, ValueError) as error:
+        raise ImageOutputError(f"data is not a valid image: {error}") from error
+    return _load_image_data(data, verify=verify, copy_image=copy_image)
+
+
+def validate_image_bytes(data: bytes, target: object) -> LoadedImage:
+    if not isinstance(data, bytes) or not data:
+        raise ImageOutputError("image data must be non-empty bytes")
+    if len(data) > MAX_IMAGE_BYTES:
+        raise ImageOutputError(
+            f"image data exceeds maximum size of {MAX_IMAGE_BYTES} bytes"
+        )
+    loaded = _load_image_data(data, verify=True, copy_image=False)
+    expected = PIL_FORMATS[output_format(str(target))]
+    if loaded.image_format != expected:
+        raise ImageOutputError(
+            f"image format {loaded.image_format or '<unknown>'} does not match "
+            f"{Path(str(target)).suffix.lower()}"
+        )
+    if loaded.width * 9 != loaded.height * 16:
+        raise ImageOutputError(
+            f"generated image must be exactly 16:9; received "
+            f"{loaded.width}x{loaded.height}"
+        )
+    return loaded
 
 
 def prepare_target(target: Path) -> PreparedTarget:
@@ -498,6 +587,32 @@ def prepare_target(target: Path) -> PreparedTarget:
             parent_stat.st_ino,
         ),
     )
+
+
+def prepare_workspace_target(target: object, workspace_root: object) -> PreparedTarget:
+    """Capture a writable output target that cannot leave a workspace root."""
+    try:
+        root = Path(workspace_root).expanduser().resolve(strict=True)
+        if not root.is_dir():
+            raise ImageOutputError("workspace root must be an existing directory")
+        raw = Path(target).expanduser()
+        if ".." in raw.parts:
+            raise ImageOutputError("output target must not traverse outside workspace")
+        absolute = raw if raw.is_absolute() else root / raw
+        resolved = resolve_output_path(absolute, base=root)
+        if resolved.parent != root and root not in resolved.parent.parents:
+            raise ImageOutputError("output target escapes workspace root")
+        prepared = prepare_target(resolved)
+        if (
+            prepared.parent.real_path != root
+            and root not in prepared.parent.real_path.parents
+        ):
+            raise ImageOutputError("resolved output parent escapes workspace root")
+        return prepared
+    except ImageOutputError:
+        raise
+    except (OSError, TypeError, ValueError, RuntimeError) as error:
+        raise ImageOutputError(f"invalid workspace target: {error}") from error
 
 
 def verify_parent_identity(parent: ParentIdentity) -> None:
@@ -556,14 +671,14 @@ def preflight_output(
         target = prepared.path
         verify_parent_identity(prepared.parent)
         if os.path.lexists(target):
-            if not overwrite:
-                raise ImageOutputError(
-                    f"output already exists; refusing to overwrite: {target}"
-                )
             mode = target.lstat().st_mode
             if not stat.S_ISREG(mode):
                 raise ImageOutputError(
                     "output path exists and is not a regular file"
+                )
+            if not overwrite:
+                raise ImageOutputError(
+                    f"output already exists; refusing to overwrite: {target}"
                 )
         descriptor, probe_path = tempfile.mkstemp(
             prefix=".write-test.", dir=str(prepared.parent.path)
@@ -650,22 +765,11 @@ def _validate_temp(path: str, target: TargetValue) -> int:
     prepared = _as_prepared_target(target)
     try:
         verify_parent_identity(prepared.parent)
-        loaded = load_image(Path(path), verify=True, copy_image=False)
-        width, height = loaded.width, loaded.height
-        actual_format = loaded.image_format
+        with Path(path).open("rb") as stream:
+            data = read_bounded_image_stream(stream)
+        loaded = validate_image_bytes(data, prepared)
     except ImageOutputError:
         raise
-
-    expected_format = PIL_FORMATS[output_format(str(prepared))]
-    if actual_format != expected_format:
-        raise ImageOutputError(
-            f"image format {actual_format or '<unknown>'} does not match "
-            f"{prepared.suffix.lower()}"
-        )
-    if width <= 0 or height <= 0 or width * 9 != height * 16:
-        raise ImageOutputError(
-            f"generated image must be exactly 16:9; received {width}x{height}"
-        )
     return loaded.byte_count
 
 

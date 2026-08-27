@@ -1,6 +1,7 @@
 import base64
 import io
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -54,6 +55,71 @@ def assert_no_transaction_files(test_case, directory):
 
 
 class SharedParentIdentityTests(unittest.TestCase):
+    def test_workspace_target_rejects_escape_before_file_creation(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "workspace"
+            root.mkdir()
+            with self.assertRaisesRegex(image_output.ImageOutputError, "workspace"):
+                image_output.prepare_workspace_target("../escape.jpg", root)
+            self.assertFalse((Path(temp_dir) / "escape.jpg").exists())
+
+    def test_workspace_target_rejects_ancestor_symlink_outside_root(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            root = temp / "workspace"
+            root.mkdir()
+            outside = temp / "outside"
+            outside.mkdir()
+            (root / "nested").symlink_to(outside, target_is_directory=True)
+
+            with self.assertRaisesRegex(image_output.ImageOutputError, "workspace"):
+                image_output.prepare_workspace_target("nested/slide.jpg", root)
+            self.assertFalse((outside / "slide.jpg").exists())
+
+    def test_workspace_target_rejects_final_symlink(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "workspace"
+            root.mkdir()
+            target = root / "slide.jpg"
+            target.symlink_to(root / "elsewhere.jpg")
+
+            with self.assertRaisesRegex(
+                image_output.ImageOutputError, "not a regular file"
+            ):
+                image_output.preflight_output(
+                    image_output.prepare_workspace_target("slide.jpg", root),
+                    overwrite=True,
+                )
+
+    def test_workspace_target_uses_captured_root_after_cwd_changes(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "workspace"
+            root.mkdir()
+            original_cwd = Path.cwd()
+            try:
+                prepared = image_output.prepare_workspace_target("out/slide.jpg", root)
+                os.chdir(tempfile.gettempdir())
+                image_output.preflight_output(prepared)
+            finally:
+                os.chdir(original_cwd)
+            self.assertEqual(prepared.path, (root / "out/slide.jpg").resolve())
+
+    def test_workspace_target_parent_replacement_is_rejected_before_publication(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "workspace"
+            root.mkdir()
+            prepared = image_output.prepare_workspace_target("out/slide.jpg", root)
+            original = root / "out-original"
+            (root / "out").rename(original)
+            (root / "out").mkdir()
+
+            with self.assertRaisesRegex(
+                image_output.ImageOutputError, "parent directory identity changed"
+            ):
+                image_output.publish_bytes(image_bytes(), prepared)
+            self.assertFalse((root / "out" / "slide.jpg").exists())
+            self.assertFalse((original / "slide.jpg").exists())
+
     def test_preflight_rejects_a_symlink_parent(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

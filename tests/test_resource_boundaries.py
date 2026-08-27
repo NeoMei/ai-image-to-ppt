@@ -128,6 +128,40 @@ class EndlessTinyResponse:
 
 
 class SharedImageLimitTests(unittest.TestCase):
+    def test_validate_image_bytes_requires_real_suffix_and_strict_16_by_9(self):
+        buffer = io.BytesIO()
+        Image.new("RGB", (160, 90), "navy").save(buffer, format="JPEG")
+        jpeg = buffer.getvalue()
+
+        loaded = image_output.validate_image_bytes(jpeg, "slide.jpg")
+        self.assertEqual(
+            (loaded.width, loaded.height, loaded.image_format),
+            (160, 90, "JPEG"),
+        )
+        with self.assertRaisesRegex(image_output.ImageOutputError, "does not match"):
+            image_output.validate_image_bytes(jpeg, "slide.png")
+
+        wrong_ratio = io.BytesIO()
+        Image.new("RGB", (160, 100), "navy").save(wrong_ratio, format="JPEG")
+        with self.assertRaisesRegex(image_output.ImageOutputError, "exactly 16:9"):
+            image_output.validate_image_bytes(wrong_ratio.getvalue(), "slide.jpg")
+
+    def test_temp_validation_uses_a_bounded_read(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            target = image_output.preflight_output(root / "slide.jpg")
+            source = root / "source.jpg"
+            data = io.BytesIO()
+            Image.new("RGB", (160, 90), "navy").save(data, format="JPEG")
+            source.write_bytes(data.getvalue())
+
+            with mock.patch.object(
+                Path,
+                "read_bytes",
+                side_effect=AssertionError("unbounded path read"),
+            ):
+                self.assertGreater(image_output._validate_temp(str(source), target), 0)
+
     def test_shared_limits_are_50_mib_and_64_megapixels(self):
         self.assertEqual(
             getattr(image_output, "MAX_IMAGE_BYTES", None),
