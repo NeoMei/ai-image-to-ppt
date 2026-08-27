@@ -139,7 +139,11 @@ export, and accepts at most 128 slides or 512 MiB aggregate source bytes.
 Generation and host import require POSIX secure publication primitives
 (directory-descriptor/no-follow checks, hard links, and same-directory rename);
 unsupported platforms fail closed as `local_failure` instead of weakening
-output ownership checks.
+output ownership checks. Forced replacement first moves the current pathname
+into a private same-directory recovery area and verifies the inode actually
+moved before installing without clobbering; this is not a single-syscall atomic
+replacement. Concurrent unknown files and failed recovery cleanup are retained
+under `.image-output-recovery-*/entry` and reported with a bounded warning.
 Clearly over-limit manifests are rejected during path preflight, before image
 decoding. If source files change after preflight, actual loaded bytes are
 accumulated after each image load and rejected before PDF/PPTX serialization.

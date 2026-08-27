@@ -1,4 +1,4 @@
-"""Shared validation and atomic publication for generated slide images."""
+"""Shared validation and ownership-preserving publication for slide images."""
 
 import base64
 import binascii
@@ -16,6 +16,8 @@ from pathlib import Path
 from typing import NamedTuple, Optional, Tuple, Union
 
 from PIL import Image, UnidentifiedImageError
+
+from generation_result import safe_message
 
 OUTPUT_FORMATS = {
     ".jpg": "jpeg",
@@ -50,7 +52,15 @@ _SECURE_PUBLICATION_SUPPORTED = (
     os.name == "posix"
     and all(
         function in getattr(os, "supports_dir_fd", set())
-        for function in (os.open, os.stat, os.unlink, os.rename, os.link)
+        for function in (
+            os.open,
+            os.stat,
+            os.unlink,
+            os.rename,
+            os.link,
+            os.mkdir,
+            os.rmdir,
+        )
     )
     and os.stat in getattr(os, "supports_follow_symlinks", set())
     and os.link in getattr(os, "supports_follow_symlinks", set())
@@ -136,6 +146,23 @@ class TemporaryOutput:
 
     def __str__(self) -> str:
         return os.fspath(self)
+
+
+@dataclass(frozen=True)
+class _QuarantinedOutput:
+    """One pathname atomically displaced into a private same-directory area."""
+
+    parent_fd: int
+    directory_fd: int
+    directory_name: str
+    original_name: str
+    identity: Optional[Tuple[int, int]]
+    is_regular: bool
+    parent: ParentIdentity
+
+    @property
+    def retained_path(self) -> Path:
+        return self.parent.path / self.directory_name / "entry"
 
 
 @dataclass(frozen=True)
@@ -960,54 +987,215 @@ def _temporary_path(target: TargetValue) -> TemporaryOutput:
         raise ImageOutputError(f"failed to create output temporary file: {error}") from error
 
 
+def _close_quarantine(quarantine: _QuarantinedOutput) -> None:
+    try:
+        os.close(quarantine.directory_fd)
+    except OSError:
+        pass
+
+
+def _remove_empty_quarantine(quarantine: _QuarantinedOutput) -> None:
+    _close_quarantine(quarantine)
+    try:
+        os.rmdir(quarantine.directory_name, dir_fd=quarantine.parent_fd)
+    except (FileNotFoundError, OSError, TypeError, NotImplementedError):
+        pass
+
+
+def _new_quarantine(
+    parent_fd: int,
+    parent: ParentIdentity,
+) -> _QuarantinedOutput:
+    """Allocate an unguessable mode-0700 directory for one displacement."""
+    directory_name = None
+    directory_fd = None
+    try:
+        for _attempt in range(100):
+            candidate = f".image-output-recovery-{secrets.token_hex(16)}"
+            try:
+                os.mkdir(candidate, 0o700, dir_fd=parent_fd)
+                directory_name = candidate
+                break
+            except FileExistsError:
+                continue
+        if directory_name is None:
+            raise ImageOutputError("failed to allocate output recovery directory")
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        directory_fd = os.open(directory_name, flags, dir_fd=parent_fd)
+        current = os.fstat(directory_fd)
+        if not stat.S_ISDIR(current.st_mode):
+            raise ImageOutputError("output recovery path is not a directory")
+        return _QuarantinedOutput(
+            parent_fd,
+            directory_fd,
+            directory_name,
+            "",
+            None,
+            False,
+            parent,
+        )
+    except (ImageOutputError, OSError, TypeError, NotImplementedError) as error:
+        if directory_fd is not None:
+            try:
+                os.close(directory_fd)
+            except OSError:
+                pass
+        if directory_name is not None:
+            try:
+                os.rmdir(directory_name, dir_fd=parent_fd)
+            except (OSError, TypeError, NotImplementedError):
+                pass
+        if isinstance(error, ImageOutputError):
+            raise
+        raise ImageOutputError(
+            f"failed to allocate output recovery directory: {error}"
+        ) from error
+
+
+def _displace_to_quarantine(
+    parent_fd: int,
+    parent: ParentIdentity,
+    name: str,
+) -> Optional[_QuarantinedOutput]:
+    """Move the current name first, then identify the inode actually moved.
+
+    The rename destination is an entry in a freshly created private directory,
+    so the syscall cannot overwrite an existing recovery entry.  A concurrent
+    replacement of ``name`` is therefore moved intact and can be restored or
+    retained instead of being destroyed.
+    """
+    quarantine = _new_quarantine(parent_fd, parent)
+    try:
+        os.rename(
+            name,
+            "entry",
+            src_dir_fd=parent_fd,
+            dst_dir_fd=quarantine.directory_fd,
+        )
+    except FileNotFoundError:
+        _remove_empty_quarantine(quarantine)
+        return None
+    except (OSError, TypeError, NotImplementedError) as error:
+        _remove_empty_quarantine(quarantine)
+        raise ImageOutputError(
+            f"failed to isolate output before changing it: {error}"
+        ) from error
+
+    try:
+        current = os.stat(
+            "entry",
+            dir_fd=quarantine.directory_fd,
+            follow_symlinks=False,
+        )
+    except (OSError, TypeError, NotImplementedError) as error:
+        retained_path = quarantine.retained_path
+        _close_quarantine(quarantine)
+        raise ImageOutputError(
+            "isolated output could not be identified; file retained at "
+            f"{retained_path}"
+        ) from error
+    return replace(
+        quarantine,
+        original_name=name,
+        identity=(current.st_dev, current.st_ino),
+        is_regular=stat.S_ISREG(current.st_mode),
+    )
+
+
+def _retain_quarantine(
+    quarantine: _QuarantinedOutput,
+    context: str,
+    error: Optional[Exception] = None,
+) -> str:
+    retained_path = str(quarantine.retained_path)
+    _close_quarantine(quarantine)
+    _warn_retained_temp(
+        context,
+        retained_path,
+        error or ImageOutputError("manual recovery may be required"),
+    )
+    return retained_path
+
+
+def _restore_or_retain_quarantine(
+    quarantine: _QuarantinedOutput,
+    context: str,
+) -> str:
+    """Restore a displaced entry without clobbering, retaining a recovery copy."""
+    restore_error = None
+    try:
+        os.link(
+            "entry",
+            quarantine.original_name,
+            src_dir_fd=quarantine.directory_fd,
+            dst_dir_fd=quarantine.parent_fd,
+            follow_symlinks=False,
+        )
+    except (OSError, TypeError, NotImplementedError) as error:
+        restore_error = error
+    return _retain_quarantine(quarantine, context, restore_error)
+
+
+def _discard_quarantine(
+    quarantine: _QuarantinedOutput,
+    context: str,
+) -> bool:
+    """Best-effort cleanup inside the private recovery namespace.
+
+    POSIX has no conditional unlink-by-inode.  The public pathname has already
+    been displaced and checked; cleanup is restricted to the random mode-0700
+    recovery directory.  Any syscall failure retains the entry and is reported.
+    """
+    try:
+        os.unlink("entry", dir_fd=quarantine.directory_fd)
+    except (OSError, TypeError, NotImplementedError) as error:
+        _retain_quarantine(quarantine, context, error)
+        return False
+    _remove_empty_quarantine(quarantine)
+    return True
+
+
 def _remove_temp(path: Union[str, TemporaryOutput]) -> None:
     if isinstance(path, TemporaryOutput):
-        last_error = None
-        for _attempt in range(2):
-            try:
-                _verify_temporary_identity(path)
-                try:
-                    current = os.stat(
-                        path.name,
-                        dir_fd=path.parent_fd,
-                        follow_symlinks=False,
-                    )
-                except FileNotFoundError:
-                    return
-                if (
-                    current.st_dev != path.device
-                    or current.st_ino != path.inode
-                    or not stat.S_ISREG(current.st_mode)
-                ):
-                    raise ImageOutputError("output temporary file identity changed")
-                os.unlink(path.name, dir_fd=path.parent_fd)
-                return
-            except ImageOutputError:
-                raise
-            except (OSError, TypeError, NotImplementedError) as error:
-                last_error = error
-        raise ImageOutputError(
-            f"failed to remove output temporary file {path}: {last_error}"
-        ) from last_error
+        _verify_temporary_identity(path)
+        quarantined = _displace_to_quarantine(
+            path.parent_fd,
+            path.parent,
+            path.name,
+        )
+        if quarantined is None:
+            return
+        expected = (path.device, path.inode)
+        if not quarantined.is_regular or quarantined.identity != expected:
+            retained_path = _restore_or_retain_quarantine(
+                quarantined,
+                "external temporary replacement was preserved",
+            )
+            raise ImageOutputError(
+                "output temporary file identity changed; displaced file retained at "
+                f"{retained_path}"
+            )
+        if not _discard_quarantine(
+            quarantined,
+            "temporary cleanup was incomplete",
+        ):
+            raise ImageOutputError(
+                "failed to remove output temporary file; recovery entry retained"
+            )
+        return
 
-    last_error = None
-    for _attempt in range(2):
-        try:
-            os.unlink(path)
-            return
-        except FileNotFoundError:
-            return
-        except (OSError, TypeError, NotImplementedError) as error:
-            last_error = error
     raise ImageOutputError(
-        f"failed to remove output temporary file {path}: {last_error}"
-    ) from last_error
+        "output temporary file is not identity-bound; cleanup skipped"
+    )
 
 
 def _warn_retained_temp(context: str, path: str, error: Exception) -> None:
     try:
         print(
-            f"  WARN: {context}; temporary file remains at {path}: {error}",
+            safe_message(
+                f"WARN: {context}; file remains at {path}: {error}"
+            ),
             file=sys.stderr,
         )
     except Exception:
@@ -1072,27 +1260,87 @@ def _validate_expected_existing_identity(identity: object) -> tuple:
     return identity
 
 
+def remove_output_with_identity(
+    target: TargetValue,
+    expected_existing_identity: tuple,
+) -> None:
+    """Remove only the inode displaced from ``target`` at the rename boundary."""
+    require_secure_publication_primitives()
+    prepared = _as_prepared_target(target)
+    expected = _validate_expected_existing_identity(expected_existing_identity)
+    parent_fd = None
+    quarantined = None
+    try:
+        parent_fd = _open_verified_parent(prepared)
+        quarantined = _displace_to_quarantine(
+            parent_fd,
+            prepared.parent,
+            prepared.name,
+        )
+        if quarantined is None:
+            raise ImageOutputError("owned output disappeared before removal")
+        if not quarantined.is_regular or quarantined.identity != expected:
+            retained_path = _restore_or_retain_quarantine(
+                quarantined,
+                "external output replacement was preserved during removal",
+            )
+            quarantined = None
+            raise ImageOutputError(
+                "output identity changed during removal; displaced file retained at "
+                f"{retained_path}"
+            )
+        try:
+            verify_parent_identity(prepared.parent)
+        except ImageOutputError:
+            _restore_or_retain_quarantine(
+                quarantined,
+                "owned output was restored after parent verification failure",
+            )
+            quarantined = None
+            raise
+        _discard_quarantine(
+            quarantined,
+            "owned-output cleanup was incomplete",
+        )
+        quarantined = None
+    finally:
+        if quarantined is not None:
+            _restore_or_retain_quarantine(
+                quarantined,
+                "owned output retained after incomplete removal",
+            )
+        if parent_fd is not None:
+            try:
+                os.close(parent_fd)
+            except OSError:
+                pass
+
+
 def _remove_published_target(
     temporary: TemporaryOutput,
     name: str,
 ) -> bool:
     try:
-        current = os.stat(
+        quarantined = _displace_to_quarantine(
+            temporary.parent_fd,
+            temporary.parent,
             name,
-            dir_fd=temporary.parent_fd,
-            follow_symlinks=False,
         )
-        if (
-            current.st_dev != temporary.device
-            or current.st_ino != temporary.inode
-            or not stat.S_ISREG(current.st_mode)
-        ):
+        if quarantined is None:
             return False
-        os.unlink(name, dir_fd=temporary.parent_fd)
+        expected = (temporary.device, temporary.inode)
+        if not quarantined.is_regular or quarantined.identity != expected:
+            _restore_or_retain_quarantine(
+                quarantined,
+                "external published-output replacement was preserved",
+            )
+            return False
+        _discard_quarantine(
+            quarantined,
+            "published-output cleanup was incomplete",
+        )
         return True
-    except FileNotFoundError:
-        return False
-    except (OSError, TypeError, NotImplementedError):
+    except ImageOutputError:
         return False
 
 
@@ -1107,6 +1355,7 @@ def _publish_temp(
     if not isinstance(temp_path, TemporaryOutput):
         raise ImageOutputError("output temporary file is not identity-bound")
     installed_identity = None
+    displaced = None
     try:
         verify_parent_identity(prepared.parent)
         _verify_temporary_identity(temp_path)
@@ -1116,27 +1365,36 @@ def _publish_temp(
             expected_existing_identity = prepared.expected_identity
         if not expectation_captured:
             raise ImageOutputError("output publication expectation was not captured")
-        current_identity = _identity_at_parent_fd(
-            temp_path.parent_fd,
+        if expected_existing_identity is not None:
+            if not overwrite:
+                raise ImageOutputError("existing output replacement was not authorized")
+            displaced = _displace_to_quarantine(
+                temp_path.parent_fd,
+                prepared.parent,
+                prepared.name,
+            )
+            if displaced is None:
+                raise ImageOutputError("output identity changed before publication")
+            if (
+                not displaced.is_regular
+                or displaced.identity != expected_existing_identity
+            ):
+                retained_path = _restore_or_retain_quarantine(
+                    displaced,
+                    "external output replacement was preserved",
+                )
+                displaced = None
+                raise ImageOutputError(
+                    "output identity changed before publication; displaced file "
+                    f"retained at {retained_path}"
+                )
+        os.link(
+            temp_path.name,
             prepared.name,
+            src_dir_fd=temp_path.parent_fd,
+            dst_dir_fd=temp_path.parent_fd,
+            follow_symlinks=False,
         )
-        if current_identity != expected_existing_identity:
-            raise ImageOutputError("output identity changed before publication")
-        if overwrite and expected_existing_identity is not None:
-            os.rename(
-                temp_path.name,
-                prepared.name,
-                src_dir_fd=temp_path.parent_fd,
-                dst_dir_fd=temp_path.parent_fd,
-            )
-        else:
-            os.link(
-                temp_path.name,
-                prepared.name,
-                src_dir_fd=temp_path.parent_fd,
-                dst_dir_fd=temp_path.parent_fd,
-                follow_symlinks=False,
-            )
         installed_identity = (temp_path.device, temp_path.inode)
         published = os.stat(
             prepared.name,
@@ -1153,13 +1411,32 @@ def _publish_temp(
             verify_parent_identity(prepared.parent)
         except ImageOutputError as error:
             if _remove_published_target(temp_path, prepared.name):
+                if displaced is not None:
+                    _restore_or_retain_quarantine(
+                        displaced,
+                        "previous output was restored after publication failure",
+                    )
+                    displaced = None
                 raise RemovedPublishedOutputError(
                     str(error),
                     *installed_identity,
                 ) from error
             installed_identity = None
             raise
+        if displaced is not None:
+            _discard_quarantine(
+                displaced,
+                "previous output cleanup was incomplete",
+            )
+            displaced = None
     except FileExistsError as error:
+        if displaced is not None:
+            _retain_quarantine(
+                displaced,
+                "previous output retained after concurrent target creation",
+                error,
+            )
+            displaced = None
         raise ImageOutputError(
             f"output already exists; refusing to overwrite: {prepared.path}"
         ) from error
@@ -1173,12 +1450,26 @@ def _publish_temp(
             ) from error
         raise
     except (OSError, TypeError, NotImplementedError) as error:
+        if displaced is not None:
+            _restore_or_retain_quarantine(
+                displaced,
+                "previous output retained after publication failure",
+            )
+            displaced = None
         if installed_identity is not None:
             raise PublishedOutputError(
                 "published output could not be verified",
                 *installed_identity,
             ) from error
-        raise ImageOutputError(f"failed to publish image atomically: {error}") from error
+        raise ImageOutputError(
+            f"failed to publish image without clobbering: {error}"
+        ) from error
+    finally:
+        if displaced is not None:
+            _retain_quarantine(
+                displaced,
+                "previous output retained after incomplete publication",
+            )
 
     try:
         _remove_temp(temp_path)

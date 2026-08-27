@@ -6,7 +6,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -64,6 +64,119 @@ class BytesResponse:
 
 
 class ConditionalPublicationTests(unittest.TestCase):
+    def test_api_force_preserves_external_replacement_in_actual_rename_boundary(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = Path(temp_dir) / "slide.jpg"
+            target.write_bytes(image_bytes())
+            external = b"external-at-api-rename-boundary"
+            external_identity = None
+            raced = False
+            real_rename = image_output.os.rename
+
+            def race_inside_rename(source, destination, *args, **kwargs):
+                nonlocal external_identity, raced
+                if not raced:
+                    raced = True
+                    target.unlink()
+                    target.write_bytes(external)
+                    current = target.stat()
+                    external_identity = (current.st_dev, current.st_ino)
+                return real_rename(source, destination, *args, **kwargs)
+
+            generated = image_bytes()
+            response = JsonResponse({
+                "data": [{
+                    "b64_json": base64.b64encode(generated).decode("ascii")
+                }]
+            })
+            with mock.patch.object(
+                gen_slide_openai, "_load_api_key", return_value="test-key"
+            ), mock.patch.object(
+                gen_slide_openai.urllib.request,
+                "urlopen",
+                return_value=response,
+            ), mock.patch.object(
+                image_output.os,
+                "rename",
+                side_effect=race_inside_rename,
+            ):
+                result = gen_slide_openai.generate_result(
+                    "prompt", str(target), retries=0, overwrite=True
+                )
+
+            self.assertTrue(raced)
+            self.assertEqual(result.status, GenerationStatus.LOCAL_FAILURE)
+            self.assertEqual(target.read_bytes(), external)
+            self.assertEqual(
+                (target.stat().st_dev, target.stat().st_ino), external_identity
+            )
+
+    def test_host_force_preserves_master_replacement_inside_actual_rename_and_compensates_raw(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            master = root / "out" / "slide.png"
+            raw = root / "out" / "raw" / "slide.png"
+            raw.parent.mkdir(parents=True)
+            original_master = image_bytes("PNG")
+            original_raw = image_bytes("PNG")
+            master.write_bytes(original_master)
+            raw.write_bytes(original_raw)
+            external = b"external-at-host-master-rename-boundary"
+            external_identity = None
+            raced = False
+            raw_published = False
+            real_rename = image_output.os.rename
+            master_parent = master.parent.stat()
+
+            def record_checkpoint(phase, _snapshot):
+                nonlocal raw_published
+                if phase == "raw":
+                    raw_published = True
+
+            def race_master_rename(source, destination, *args, **kwargs):
+                nonlocal external_identity, raced
+                source_parent = os.fstat(kwargs["src_dir_fd"])
+                if (
+                    raw_published
+                    and not raced
+                    and source_parent.st_dev == master_parent.st_dev
+                    and source_parent.st_ino == master_parent.st_ino
+                    and (source == master.name or destination == master.name)
+                ):
+                    raced = True
+                    master.unlink()
+                    master.write_bytes(external)
+                    current = master.stat()
+                    external_identity = (current.st_dev, current.st_ino)
+                return real_rename(source, destination, *args, **kwargs)
+
+            with mock.patch.object(
+                image_output.os,
+                "rename",
+                side_effect=race_master_rename,
+            ), mock.patch.object(
+                import_host_image,
+                "_transaction_checkpoint",
+                side_effect=record_checkpoint,
+            ):
+                result = import_host_image.import_host_artifact(
+                    import_host_image.HostArtifact.inline_bytes(
+                        image_bytes("PNG"), "image/png"
+                    ),
+                    "out/slide.png",
+                    root,
+                    provider="openai",
+                    overwrite=True,
+                )
+
+            self.assertTrue(raced)
+            self.assertEqual(result.status, GenerationStatus.LOCAL_FAILURE)
+            self.assertEqual(master.read_bytes(), external)
+            self.assertEqual(
+                (master.stat().st_dev, master.stat().st_ino), external_identity
+            )
+            self.assertEqual(raw.read_bytes(), original_raw)
+
     def test_host_force_preserves_external_raw_replacement_before_first_member(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -315,6 +428,219 @@ class UnsupportedPublicationPlatformTests(unittest.TestCase):
             self.assertIsNone(result.output_path)
 
 
+class DestructiveBoundaryTests(unittest.TestCase):
+    def test_transaction_owned_removal_preserves_replacement_at_rename_boundary(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = Path(temp_dir) / "slide.png"
+            target.write_bytes(image_bytes("PNG"))
+            prepared = image_output.preflight_output(target, overwrite=True)
+            expected = (target.stat().st_dev, target.stat().st_ino)
+            external = b"external-at-owned-remove-unlink"
+            external_identity = None
+            real_rename = image_output.os.rename
+            raced = False
+
+            def race_rename(source, destination, *args, **kwargs):
+                nonlocal external_identity, raced
+                if not raced and source == target.name:
+                    raced = True
+                    os.unlink(source, dir_fd=kwargs["src_dir_fd"])
+                    descriptor = os.open(
+                        source,
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                        0o600,
+                        dir_fd=kwargs["src_dir_fd"],
+                    )
+                    with os.fdopen(descriptor, "wb") as stream:
+                        stream.write(external)
+                    current = target.stat()
+                    external_identity = (current.st_dev, current.st_ino)
+                return real_rename(source, destination, *args, **kwargs)
+
+            with mock.patch.object(
+                image_output.os,
+                "rename",
+                side_effect=race_rename,
+            ), self.assertRaises(image_output.ImageOutputError):
+                import_host_image._remove_owned_output(prepared, expected)
+
+            self.assertTrue(raced)
+            self.assertEqual(target.read_bytes(), external)
+            self.assertEqual(
+                (target.stat().st_dev, target.stat().st_ino), external_identity
+            )
+
+    def test_opaque_restore_preserves_replacement_inside_actual_rename(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = Path(temp_dir) / "slide.png"
+            target.write_bytes(b"owned-current")
+            prepared = image_output.preflight_output(target, overwrite=True)
+            expected = (target.stat().st_dev, target.stat().st_ino)
+            external = b"external-at-restore-rename"
+            real_rename = image_output.os.rename
+            raced = False
+
+            def race_rename(source, destination, *args, **kwargs):
+                nonlocal raced
+                if not raced:
+                    raced = True
+                    target.unlink()
+                    target.write_bytes(external)
+                return real_rename(source, destination, *args, **kwargs)
+
+            with mock.patch.object(
+                image_output.os,
+                "rename",
+                side_effect=race_rename,
+            ), self.assertRaises(image_output.ImageOutputError):
+                image_output.publish_opaque_bytes_with_identity(
+                    b"snapshot",
+                    prepared,
+                    expected_existing_identity=expected,
+                )
+
+            self.assertTrue(raced)
+            self.assertEqual(target.read_bytes(), external)
+
+    def test_temp_cleanup_preserves_replacement_at_rename_boundary(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            prepared = image_output.preflight_output(Path(temp_dir) / "slide.jpg")
+            temporary = image_output._temporary_path(prepared)
+            external = b"external-temp-replacement"
+            external_identity = None
+            real_rename = image_output.os.rename
+            raced = False
+
+            def race_rename(source, destination, *args, **kwargs):
+                nonlocal external_identity, raced
+                if not raced and source == temporary.name:
+                    raced = True
+                    os.unlink(source, dir_fd=kwargs["src_dir_fd"])
+                    descriptor = os.open(
+                        source,
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                        0o600,
+                        dir_fd=kwargs["src_dir_fd"],
+                    )
+                    with os.fdopen(descriptor, "wb") as stream:
+                        stream.write(external)
+                    current = (Path(temp_dir) / temporary.name).stat()
+                    external_identity = (current.st_dev, current.st_ino)
+                return real_rename(source, destination, *args, **kwargs)
+
+            try:
+                with mock.patch.object(
+                    image_output.os,
+                    "rename",
+                    side_effect=race_rename,
+                ), self.assertRaises(image_output.ImageOutputError):
+                    image_output._remove_temp(temporary)
+                self.assertTrue(raced)
+                self.assertEqual(
+                    (Path(temp_dir) / temporary.name).read_bytes(), external
+                )
+                current = (Path(temp_dir) / temporary.name).stat()
+                self.assertEqual(
+                    (current.st_dev, current.st_ino), external_identity
+                )
+            finally:
+                os.close(temporary.descriptor)
+                os.close(temporary.parent_fd)
+
+    def test_published_cleanup_preserves_replacement_at_rename_boundary(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            prepared = image_output.preflight_output(Path(temp_dir) / "slide.jpg")
+            temporary = image_output._temporary_path(prepared)
+            os.link(
+                temporary.name,
+                prepared.name,
+                src_dir_fd=temporary.parent_fd,
+                dst_dir_fd=temporary.parent_fd,
+                follow_symlinks=False,
+            )
+            external = b"external-published-replacement"
+            external_identity = None
+            real_rename = image_output.os.rename
+            raced = False
+
+            def race_rename(source, destination, *args, **kwargs):
+                nonlocal external_identity, raced
+                if not raced and source == prepared.name:
+                    raced = True
+                    os.unlink(source, dir_fd=kwargs["src_dir_fd"])
+                    descriptor = os.open(
+                        source,
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                        0o600,
+                        dir_fd=kwargs["src_dir_fd"],
+                    )
+                    with os.fdopen(descriptor, "wb") as stream:
+                        stream.write(external)
+                    current = prepared.path.stat()
+                    external_identity = (current.st_dev, current.st_ino)
+                return real_rename(source, destination, *args, **kwargs)
+
+            try:
+                with mock.patch.object(
+                    image_output.os,
+                    "rename",
+                    side_effect=race_rename,
+                ):
+                    removed = image_output._remove_published_target(
+                        temporary, prepared.name
+                    )
+                self.assertTrue(raced)
+                self.assertFalse(removed)
+                self.assertEqual(prepared.path.read_bytes(), external)
+                current = prepared.path.stat()
+                self.assertEqual(
+                    (current.st_dev, current.st_ino), external_identity
+                )
+            finally:
+                if prepared.path.exists():
+                    prepared.path.unlink()
+                temp_path = Path(temp_dir) / temporary.name
+                if temp_path.exists():
+                    temp_path.unlink()
+                os.close(temporary.descriptor)
+                os.close(temporary.parent_fd)
+
+    def test_private_unlink_failure_retains_owned_cleanup_entry(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            prepared = image_output.preflight_output(Path(temp_dir) / "slide.jpg")
+            temporary = image_output._temporary_path(prepared)
+            real_unlink = image_output.os.unlink
+            attempted = False
+
+            def fail_private_unlink(name, *args, **kwargs):
+                nonlocal attempted
+                if name == "entry" and kwargs.get("dir_fd") is not None:
+                    attempted = True
+                    raise PermissionError("injected private cleanup failure")
+                return real_unlink(name, *args, **kwargs)
+
+            stderr = io.StringIO()
+            try:
+                with mock.patch.object(
+                    image_output.os,
+                    "unlink",
+                    side_effect=fail_private_unlink,
+                ), redirect_stderr(stderr), self.assertRaises(
+                    image_output.ImageOutputError
+                ):
+                    image_output._remove_temp(temporary)
+                retained = list(Path(temp_dir).glob(
+                    ".image-output-recovery-*/entry"
+                ))
+                self.assertTrue(attempted)
+                self.assertEqual(len(retained), 1)
+                self.assertEqual(retained[0].stat().st_ino, temporary.inode)
+                self.assertEqual(len(stderr.getvalue().splitlines()), 1)
+            finally:
+                os.close(temporary.descriptor)
+                os.close(temporary.parent_fd)
+
+
 class SafeDiagnosticTests(unittest.TestCase):
     ADVERSARIAL = "useful\r\n\x1b[31mRED\x1b[0m\x00\x85\ud800 tail"
 
@@ -385,6 +711,27 @@ class SafeDiagnosticTests(unittest.TestCase):
         self.assertEqual(len(output.splitlines()), 1)
         output.encode("ascii")
         self.assertEqual(json.loads(output)["safe_message"], result.safe_message)
+
+    def test_host_import_human_success_path_is_one_safe_line(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "source.png"
+            source.write_bytes(image_bytes("PNG"))
+            unsafe_output = "out/slide\n\x1b[31m.png"
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                exit_code = import_host_image.main([
+                    str(source),
+                    unsafe_output,
+                    "--workspace-root",
+                    str(root),
+                    "--provider",
+                    "openai",
+                ])
+            output = stdout.getvalue()
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(len(output.splitlines()), 1)
+            self.assertNotIn("\x1b", output)
 
 
 class DocumentationCorrectionTests(unittest.TestCase):

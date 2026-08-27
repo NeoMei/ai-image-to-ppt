@@ -172,7 +172,7 @@ class ProviderOutputContractTests(unittest.TestCase):
                 self.assertEqual(target.read_bytes(), b"existing")
                 self.assertEqual(list(target.parent.glob(f".{target.name}.*.tmp")), [])
 
-    def test_openai_atomic_replace_failure_preserves_existing_target_and_cleans_temp(self):
+    def test_openai_displacement_failure_preserves_target_and_retains_uncertain_temp(self):
         target_image = image_bytes("JPEG")
         response = JsonResponse({
             "data": [{"b64_json": base64.b64encode(target_image).decode("ascii")}]
@@ -192,7 +192,10 @@ class ProviderOutputContractTests(unittest.TestCase):
                     )
                 )
             self.assertEqual(target.read_bytes(), b"existing")
-            self.assertEqual(list(target.parent.glob(f".{target.name}.*.tmp")), [])
+            self.assertEqual(
+                len(list(target.parent.glob(f".{target.name}.*.tmp"))),
+                1,
+            )
 
 
 class GeminiContractTests(unittest.TestCase):

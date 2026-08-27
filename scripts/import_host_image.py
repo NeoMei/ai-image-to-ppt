@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Optional, Sequence, Tuple, Union
 
 import image_output
-from generation_result import GenerationResult, GenerationStatus
+from generation_result import GenerationResult, GenerationStatus, safe_message
 from image_output import (
     ImageOutputError,
     PreparedTarget,
@@ -281,35 +281,10 @@ def _snapshot_output(target: PreparedTarget) -> _OutputSnapshot:
 
 
 def _remove_owned_output(target: PreparedTarget, expected: Tuple[int, int]) -> None:
-    verify_parent_identity(target.parent)
-    descriptor = None
     try:
-        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-        flags |= getattr(os, "O_NOFOLLOW", 0)
-        descriptor = os.open(str(target.parent.path), flags)
-        parent = os.fstat(descriptor)
-        if (
-            not stat.S_ISDIR(parent.st_mode)
-            or (parent.st_dev, parent.st_ino)
-            != (target.parent.device, target.parent.inode)
-        ):
-            raise ImageOutputError("transaction parent identity changed during rollback")
-        current = os.stat(target.name, dir_fd=descriptor, follow_symlinks=False)
-        if (
-            not stat.S_ISREG(current.st_mode)
-            or (current.st_dev, current.st_ino) != expected
-        ):
-            raise ImageOutputError("transaction output identity changed during rollback")
-        os.unlink(target.name, dir_fd=descriptor)
-    except (OSError, TypeError, NotImplementedError) as error:
+        image_output.remove_output_with_identity(target, expected)
+    except ImageOutputError as error:
         raise ImageOutputError("could not remove transaction output") from error
-    finally:
-        if descriptor is not None:
-            try:
-                os.close(descriptor)
-            except OSError:
-                pass
-    verify_parent_identity(target.parent)
 
 
 def _restore_snapshot(
@@ -432,7 +407,7 @@ def import_host_artifact(
     provider: str,
     overwrite: bool = False,
 ) -> GenerationResult:
-    """Validate and atomically publish a host artifact inside a workspace."""
+    """Validate and safely publish a compensated host pair inside a workspace."""
     provider = _validate_provider(provider)
     if not isinstance(overwrite, bool):
         return _failure(
@@ -543,9 +518,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.json:
         print(result.to_json())
     elif result.ok:
-        print(f"OK: imported host image to {result.output_path}")
+        print(safe_message(f"OK: imported host image to {result.output_path}"))
     else:
-        print(f"ERR: {result.safe_message}")
+        print(safe_message(f"ERR: {result.safe_message}"))
     return 0 if result.ok else 1
 
 

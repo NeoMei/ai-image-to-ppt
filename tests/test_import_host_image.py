@@ -410,20 +410,28 @@ class HostImageImportTests(unittest.TestCase):
             previous_raw = patterned_image_bytes()
             master.write_bytes(previous_master)
             raw.write_bytes(previous_raw)
-            real_rename = image_output.os.rename
+            real_link = image_output.os.link
             real_stat = image_output.os.stat
-            rename_count = 0
+            master_parent = master.parent.stat()
+            master_installed = False
             stat_failed = False
 
-            def count_rename(*args, **kwargs):
-                nonlocal rename_count
-                rename_count += 1
-                return real_rename(*args, **kwargs)
+            def record_master_install(source, destination, *args, **kwargs):
+                nonlocal master_installed
+                result = real_link(source, destination, *args, **kwargs)
+                destination_parent = os.fstat(kwargs["dst_dir_fd"])
+                if (
+                    destination == master.name
+                    and destination_parent.st_dev == master_parent.st_dev
+                    and destination_parent.st_ino == master_parent.st_ino
+                ):
+                    master_installed = True
+                return result
 
-            def fail_second_target_stat(name, *args, **kwargs):
+            def fail_post_install_target_stat(name, *args, **kwargs):
                 nonlocal stat_failed
                 if (
-                    rename_count == 2
+                    master_installed
                     and not stat_failed
                     and name == "slide.png"
                     and kwargs.get("dir_fd") is not None
@@ -433,9 +441,9 @@ class HostImageImportTests(unittest.TestCase):
                 return real_stat(name, *args, **kwargs)
 
             with mock.patch.object(
-                image_output.os, "rename", side_effect=count_rename
+                image_output.os, "link", side_effect=record_master_install
             ), mock.patch.object(
-                image_output.os, "stat", side_effect=fail_second_target_stat
+                image_output.os, "stat", side_effect=fail_post_install_target_stat
             ):
                 failed = import_host_image.import_host_artifact(
                     import_host_image.HostArtifact.inline_bytes(

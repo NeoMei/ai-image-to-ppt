@@ -234,8 +234,7 @@ class SharedImageLimitTests(unittest.TestCase):
 
             def deny_temp(path, *args, **kwargs):
                 nonlocal attempts
-                candidate = Path(path)
-                if candidate.name.endswith(".tmp"):
+                if path == "entry" and kwargs.get("dir_fd") is not None:
                     attempts += 1
                     raise PermissionError("forced temp cleanup denial")
                 return real_unlink(path, *args, **kwargs)
@@ -249,9 +248,9 @@ class SharedImageLimitTests(unittest.TestCase):
             self.assertGreater(byte_count, 0)
             with Image.open(target) as image:
                 self.assertEqual(image.size, (160, 90))
-            stale = list(root.glob(".slide.jpg.*.tmp"))
+            stale = list(root.glob(".image-output-recovery-*/entry"))
             self.assertEqual(len(stale), 1)
-            self.assertLessEqual(attempts, 2)
+            self.assertEqual(attempts, 1)
             self.assertIn("WARN:", stderr.getvalue())
             self.assertIn(str(stale[0]), stderr.getvalue())
 
@@ -268,8 +267,7 @@ class SharedImageLimitTests(unittest.TestCase):
 
             def deny_temp(path, *args, **kwargs):
                 nonlocal attempts
-                candidate = Path(path)
-                if candidate.name.endswith(".tmp"):
+                if path == "entry" and kwargs.get("dir_fd") is not None:
                     attempts += 1
                     raise PermissionError("forced temp cleanup denial")
                 return real_unlink(path, *args, **kwargs)
@@ -283,9 +281,9 @@ class SharedImageLimitTests(unittest.TestCase):
             self.assertGreater(byte_count, 0)
             with Image.open(target) as image:
                 self.assertEqual(image.size, (160, 90))
-            stale = list(root.glob(".slide.jpg.*.tmp"))
+            stale = list(root.glob(".image-output-recovery-*/entry"))
             self.assertEqual(len(stale), 1)
-            self.assertLessEqual(attempts, 2)
+            self.assertEqual(attempts, 1)
             self.assertIn("WARN:", stderr.getvalue())
             self.assertIn(str(stale[0]), stderr.getvalue())
 
@@ -298,8 +296,7 @@ class SharedImageLimitTests(unittest.TestCase):
 
             def deny_temp(path, *args, **kwargs):
                 nonlocal attempts
-                candidate = Path(path)
-                if candidate.name.endswith(".tmp"):
+                if path == "entry" and kwargs.get("dir_fd") is not None:
                     attempts += 1
                     raise PermissionError("cleanup-denied")
                 return real_unlink(path, *args, **kwargs)
@@ -312,8 +309,8 @@ class SharedImageLimitTests(unittest.TestCase):
             ):
                 image_output.publish_bytes(b"not-an-image", target)
 
-            stale = list(root.glob(".slide.png.*.tmp"))
-            self.assertEqual(attempts, 2)
+            stale = list(root.glob(".image-output-recovery-*/entry"))
+            self.assertEqual(attempts, 1)
             self.assertEqual(len(stale), 1)
             self.assertIn("WARN:", stderr.getvalue())
             self.assertIn(str(stale[0]), stderr.getvalue())
@@ -333,8 +330,7 @@ class SharedImageLimitTests(unittest.TestCase):
 
             def deny_temp(path, *args, **kwargs):
                 nonlocal attempts
-                candidate = Path(path)
-                if candidate.name.endswith(".tmp"):
+                if path == "entry" and kwargs.get("dir_fd") is not None:
                     attempts += 1
                     raise PermissionError("cleanup-denied")
                 return real_unlink(path, *args, **kwargs)
@@ -347,8 +343,8 @@ class SharedImageLimitTests(unittest.TestCase):
             ):
                 image_output.publish_stream(FailingResponse(), target)
 
-            stale = list(root.glob(".slide.png.*.tmp"))
-            self.assertEqual(attempts, 2)
+            stale = list(root.glob(".image-output-recovery-*/entry"))
+            self.assertEqual(attempts, 1)
             self.assertEqual(len(stale), 1)
             self.assertIn("WARN:", stderr.getvalue())
             self.assertIn(str(stale[0]), stderr.getvalue())
@@ -364,8 +360,7 @@ class SharedImageLimitTests(unittest.TestCase):
 
             def deny_temp(path, *args, **kwargs):
                 nonlocal attempts
-                candidate = Path(path)
-                if candidate.name.endswith(".tmp"):
+                if path == "entry" and kwargs.get("dir_fd") is not None:
                     attempts += 1
                     raise PermissionError("cleanup-denied")
                 return real_unlink(path, *args, **kwargs)
@@ -380,8 +375,8 @@ class SharedImageLimitTests(unittest.TestCase):
             ):
                 image_output.publish_bytes(buffer.getvalue(), target)
 
-            stale = list(root.glob(".slide.jpg.*.tmp"))
-            self.assertEqual(attempts, 2)
+            stale = list(root.glob(".image-output-recovery-*/entry"))
+            self.assertEqual(attempts, 1)
             self.assertEqual(len(stale), 1)
             self.assertIn("WARN:", stderr.getvalue())
             self.assertIn(str(stale[0]), stderr.getvalue())

@@ -67,8 +67,13 @@ near-16:9 image within a 0.5% integer cross-product tolerance, center-crop it
 (never stretch it) to the largest strict 16:9 master, and strictly revalidate
 the encoded master. API adapters never receive that tolerance or crop. Existing
 outputs are protected unless `--force` is explicit. API single-image outputs
-use conditional atomic replacement: publication proceeds only while the target
-still matches the inode (or missing state) captured during locked preflight.
+use conditional, ownership-preserving publication: an existing target is first
+atomically displaced into a private same-directory recovery area and the inode
+actually moved must match locked preflight before the new image is installed
+without clobbering. This is not a single-syscall atomic replacement; the target
+name can be briefly absent. An unexpected concurrent file is restored without
+clobbering when possible, otherwise it is retained at the reported recovery
+path. Recovery cleanup failures likewise retain the isolated file and warn.
 The paired host raw/master publication uses process-time compensating rollback
 while both output locks are held; it is not a crash-atomic two-file commit.
 Only deck export has an export journal for recovery after interruption. These

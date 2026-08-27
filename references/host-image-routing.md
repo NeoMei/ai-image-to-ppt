@@ -63,10 +63,15 @@ Host artifacts alone may be within a 0.5% relative 16:9 error, evaluated with
 integer cross-products. Exact 16:9 host bytes retain the existing master
 publication behavior. A qualifying near-ratio artifact is center-cropped; do
 not stretch it. Crop to the largest contained `16*k × 9*k` master, then strict 16:9
-validation is applied to the newly encoded PNG/JPEG before atomic publication.
+validation is applied to the newly encoded PNG/JPEG before safe publication.
 For example, a 1672×941 PNG becomes a 1664×936 PNG master. MIME and actual
 format must still match the requested suffix. The OpenAI, Gemini, and Doubao
 API adapters remain strict 16:9: they do not receive this tolerance or crop.
+Forced generation/import publication is ownership-preserving rather than a
+single-syscall atomic replacement: it atomically isolates the current pathname,
+verifies the inode actually moved, and then installs without clobbering. An
+unexpected file or failed cleanup is retained under
+`.image-output-recovery-*/entry` and reported instead of being deleted.
 
 A materialization authorization failure is `auth_unavailable`; an exhausted
 timeout, 429, network error, or 5xx is `retryable_exhausted`; an explicit
