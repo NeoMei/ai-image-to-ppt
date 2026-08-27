@@ -796,6 +796,7 @@ def _temporary_path(target: TargetValue) -> TemporaryOutput:
     prepared = _as_prepared_target(target)
     descriptor = None
     parent_fd = None
+    temporary = None
     try:
         parent_fd = _open_verified_parent(prepared)
         flags = os.O_RDWR | os.O_CREAT | os.O_EXCL
@@ -812,8 +813,7 @@ def _temporary_path(target: TargetValue) -> TemporaryOutput:
         temp_stat = os.fstat(descriptor)
         if not stat.S_ISREG(temp_stat.st_mode):
             raise ImageOutputError("output temporary file is not regular")
-        verify_parent_identity(prepared.parent)
-        return TemporaryOutput(
+        temporary = TemporaryOutput(
             descriptor,
             parent_fd,
             name,
@@ -821,18 +821,24 @@ def _temporary_path(target: TargetValue) -> TemporaryOutput:
             temp_stat.st_ino,
             prepared.parent,
         )
+        verify_parent_identity(prepared.parent)
+        return temporary
     except (ImageOutputError, OSError) as error:
-        if descriptor is not None:
+        if temporary is not None:
+            try:
+                _remove_temp(temporary)
+            except ImageOutputError:
+                pass
+            try:
+                os.close(temporary.descriptor)
+            except OSError:
+                pass
+        elif descriptor is not None:
             try:
                 os.close(descriptor)
             except OSError:
                 pass
         if parent_fd is not None:
-            try:
-                if 'name' in locals():
-                    os.unlink(name, dir_fd=parent_fd)
-            except OSError:
-                pass
             try:
                 os.close(parent_fd)
             except OSError:

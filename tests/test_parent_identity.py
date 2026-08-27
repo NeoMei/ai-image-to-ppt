@@ -55,6 +55,61 @@ def assert_no_transaction_files(test_case, directory):
 
 
 class SharedParentIdentityTests(unittest.TestCase):
+    def test_temp_name_collisions_do_not_delete_external_candidate(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            target = root / "slide.jpg"
+            prepared = image_output.preflight_output(target)
+            candidate = root / ".slide.jpg.collision.tmp"
+            candidate.write_bytes(b"external collision")
+
+            with mock.patch.object(
+                image_output.secrets,
+                "token_hex",
+                return_value="collision",
+            ), self.assertRaisesRegex(
+                image_output.ImageOutputError,
+                "allocate unique",
+            ):
+                image_output._temporary_path(prepared)
+
+            self.assertEqual(candidate.read_bytes(), b"external collision")
+
+    def test_temp_replacement_before_return_preserves_external_name(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            target = root / "slide.jpg"
+            prepared = image_output.preflight_output(target)
+            candidate = root / ".slide.jpg.owned.tmp"
+            real_verify = image_output.verify_parent_identity
+            verify_count = 0
+
+            def replace_then_fail(parent):
+                nonlocal verify_count
+                real_verify(parent)
+                verify_count += 1
+                if verify_count == 2:
+                    candidate.unlink()
+                    candidate.write_bytes(b"external replacement")
+                    raise image_output.ImageOutputError("forced return failure")
+
+            with mock.patch.object(
+                image_output.secrets,
+                "token_hex",
+                return_value="owned",
+            ), mock.patch.object(
+                image_output,
+                "verify_parent_identity",
+                side_effect=replace_then_fail,
+            ), self.assertRaisesRegex(
+                image_output.ImageOutputError,
+                "forced return failure",
+            ):
+                image_output._temporary_path(prepared)
+
+            self.assertEqual(candidate.read_bytes(), b"external replacement")
+            self.assertEqual(list(root.glob(".slide.jpg.*.tmp")), [candidate])
+
     def test_temp_path_replacement_after_validation_is_not_published(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
