@@ -1,0 +1,95 @@
+# Host-first image routing
+
+Read this reference before generating any slide image. The Skill performs host
+capability discovery and calls; `scripts/host_routing_policy.py` is the
+executable policy for the resulting classified attempts.
+
+## Candidate policy
+
+The fixed candidate order is `host-openai`, `api-openai`, `host-gemini`,
+`api-gemini`, `host-doubao`, then `api-doubao`. The only fallback statuses are
+`unavailable`, `auth_unavailable`, and `retryable_exhausted`. Stop immediately
+for `policy_refused`, `invalid_input`, `invalid_output`, or `local_failure`.
+
+Only a tool or connector that is currently registered and callable by this
+host counts as a host capability. A login in a browser, provider documentation,
+or guessed account state does not. A missing or disconnected host tool is
+`unavailable`; do not attempt browser automation, cookies, extracted tokens, or
+a hidden web fallback. The host OpenAI capability is the first candidate and
+does not require `OPENAI_API_KEY`.
+
+Offer each API key only when useful, and let the user skip it. In noninteractive
+work, a missing key is `auth_unavailable` and routing continues. Never print,
+persist, or put a key in a prompt or report.
+
+## Host artifact handoff
+
+Call an available host tool directly. Accept one explicitly marked primary or
+result image, or the sole image when exactly one is returned. Multiple unmarked
+images are `invalid_output`.
+
+Accept only a readable absolute local path, MIME-labelled inline bytes/Base64 or
+`data:` URL, or a resource handle for which this host exposes an explicit export
+or download call. Materialize the accepted artifact into the workspace through
+the importer and its same local validation/publish contract. Reject bare
+HTTP(S) URLs, UI-only previews, ambiguous text, unavailable handles, and any
+unmaterializable resource as `invalid_output`; do not fetch URLs yourself.
+
+For a captured absolute host-local path, use:
+
+```bash
+python3 scripts/import_host_image.py \
+  "/absolute/host/generated/image.png" \
+  "out/slide_01.png" \
+  --workspace-root "/absolute/workspace" \
+  --provider openai \
+  --json
+```
+
+The importer validates, copies, and atomically publishes the master under the
+workspace. A materialization authorization failure is `auth_unavailable`; an
+exhausted timeout, 429, network error, or 5xx is `retryable_exhausted`; an
+explicit safety refusal is `policy_refused`; missing or undecodable content is
+`invalid_output`; and workspace write or publication failure is `local_failure`.
+
+## API/CLI-only adapter
+
+`scripts/gen_slide.py` is an **API/CLI-only** adapter. It cannot discover or
+call host tools, and explicit CLI selection calls only that one API provider.
+Use it only for the API candidate selected by this policy:
+
+```bash
+python3 scripts/gen_slide.py \
+  "${slide_output}" \
+  "${slide_prompt}" \
+  --engine "${provider}" \
+  --json
+```
+
+## Serial sticky batches and report
+
+Generate pages serially. The first actual generation success becomes sticky.
+For later pages start at that candidate; on a fallback status, try only later
+candidates and make the first success sticky. Never move backward, never
+regenerate a successful page, and stop the batch on a fatal result. Existing
+validated cached pages are reported as cached but never establish or change
+routing state. `SerialStickyRouter` records each switch page, old/new candidate,
+and a safe reason; it also returns an ordered redacted all-candidates-exhausted
+summary.
+
+Report each page's selected provider/channel, cached/success/fatal outcome,
+and every switch page. On exhaustion, show the ordered redacted candidate/status
+summary only—never raw provider responses or credentials.
+
+## Editable handoff
+
+Keep the validated high-resolution master. Only when using
+`image-to-editable-pptx`, create a separate, real exact `1280×720 PNG`:
+
+```bash
+python3 scripts/prepare_editable_input.py \
+  out/slide_01.jpg \
+  out/editable/slide_01.png
+```
+
+Do not overwrite the master or silently crop a non-16:9 artifact.

@@ -1,112 +1,104 @@
 ---
 name: ai-image-to-ppt
-description: Use when generating 16:9 presentation slide images from a topic using AI image generation models, then packaging them into PDF/PPTX. Triggers include "用 AI 生成 PPT", "OpenAI GPT Image 2 生成 PPT", "gpt-image-2 slide generation", "nano banana 生成幻灯片", "方舟 doubao-seedream 生成图", "把主题/大纲变成图文 PPT", "批量生成教科书风插图", "图片打包成 PDF PPTX", "16:9 slide generation". Especially useful for converting book outlines, course materials, or technical documentation into visual decks.
+description: Generate 16:9 slide images through the host's OpenAI image capability first, with optional API fallbacks, then package them as PDF/PPTX. Use for topic-to-deck, course, and illustrated presentation requests.
 ---
 
 # AI Image to PPT
 
-Generate 16:9 educational textbook-style slide images from any topic using OpenAI **GPT Image 2** as the primary engine, with Gemini **nano banana** and Volcano **doubao-seedream** as explicit fallback engines, then package them into PDF + PPTX.
+Create educational 16:9 slide-image decks. Use the host-first route for image
+generation, then use the local scripts for deterministic validation, editable
+input preparation, visual checking, and export.
 
-## When to Use
+## Image generation routing
 
-- Convert book outlines / course notes / technical docs into visual slide decks
-- Batch generate slide illustrations with Chinese + English mixed typography
-- Need consistent 16:9 visual style across many slides
+Before generating any slide image, read
+[references/host-image-routing.md](references/host-image-routing.md) and follow
+its candidate order, failure boundaries, artifact-import contract, and serial
+sticky batch rules. That reference uses
+[`scripts/host_routing_policy.py`](scripts/host_routing_policy.py) for the
+deterministic batch state; the Skill retains host discovery and host-tool calls.
 
-## When NOT to Use
+- Prefer the host's callable OpenAI image tool; it does not require an
+  `OPENAI_API_KEY`.
+- Then try the matching OpenAI API adapter only when configured or when the
+  user chooses to configure it. Configuration may be skipped.
+- Apply the same host-then-key rule to Gemini and Doubao.
+- Do not use browser automation, cookies, or extracted host tokens.
+- Generate page images serially. Cached pages do not change routing; a fallback
+  moves only forward, and a successful page is never regenerated.
+- Keep generated masters. Create exact `1280×720 PNG` files only for the
+  editable-converter handoff.
 
-- Need precise text layout editing → use PowerPoint/Keynote directly
-- Need real-time interactive slides
-- Single one-off image → call API directly
+## Optional API/CLI-only credentials
 
-## Prerequisites
-
-Python 3.9 or newer and one OpenAI key are sufficient for default generation:
+The recommended host route needs no API key. `scripts/gen_slide.py` is an
+**API/CLI-only** adapter for a selected provider; it cannot call host tools.
+Each supported key may be skipped. Use Python 3.9+ and install dependencies:
 
 ```bash
-# Preferred
-export OPENAI_API_KEY="YOUR_OPENAI_KEY"
-
-# Or the project's secret-file convention
 mkdir -p ~/.secrets
 printf '%s\n' "YOUR_OPENAI_KEY" > ~/.secrets/openai_api_key
 chmod 600 ~/.secrets/openai_api_key
-
-# Gemini fallback and visual self-check (only if used)
 printf '%s\n' "YOUR_GEMINI_KEY" > ~/.secrets/gemini_api_key
 chmod 600 ~/.secrets/gemini_api_key
-
-# Doubao fallback (only if used)
 printf '%s\n' "YOUR_DOUBAO_KEY" > ~/.secrets/doubao_api_key
 chmod 600 ~/.secrets/doubao_api_key
-
 python3 -m pip install -r requirements.txt
 ```
 
-Add a Gemini credential only for Gemini image generation or the visual self-check. Add a Doubao credential only when explicitly selecting Doubao. The exact secret-file paths above are what the legacy scripts read. Provider selection is explicit; generation does not automatically fall back.
+Never commit or print credentials. Keys must be one-line printable ASCII with
+no whitespace or control characters. Gemini also needs a key for the optional
+vision self-check.
 
-Provider API keys must be non-empty printable ASCII on one line, with no whitespace or control characters. Invalid credentials fail before any provider request and are never printed in errors.
+For an intentional low-level API call, retain explicit provider selection:
 
-## Scripts
-
-All in `scripts/` directory. Copy to project or add to `PYTHONPATH`.
-
-| Script | Role / Engine | API / Output |
-|---|---|---|
-| `gen_slide.py` | Default provider router | OpenAI by default; Gemini and Doubao are explicit choices |
-| `gen_slide_openai.py` | OpenAI GPT Image 2 | `gpt-image-2`; 2048×1152, medium by default |
-| `gen_slide_gemini.py` | Gemini nano banana | `gemini-3.1-flash-image`; 16:9, 2K; PNG by default or JPEG by suffix |
-| `gen_slide_doubao.py` | 方舟 doubao-seedream-5-0 | OpenAI-compatible API |
-| `prepare_editable_input.py` | Editable-converter handoff | Exact 1280x720 PNG |
-| `vision_check_gemini.py` | Gemini visual self-check | `gemini-3.6-flash` |
-| `export_images.py` | Local export | PDF + PPTX |
-| `cleanup_output_locks.py` | Explicit offline maintenance | Removes old stable hashed lock files |
-
-## Workflow
-
-### Step 1: Generate single slide
-
-```python
-import sys
-sys.path.insert(0, "<skill_path>/scripts")
-from gen_slide import gen
-
-gen("<detailed prompt>", "out/slide_01.jpg")
-
-# Explicit fallbacks when requested
-gen("<detailed prompt>", "out/slide_01.png", engine="gemini")
-gen("<detailed prompt>", "out/slide_01.jpg", engine="doubao")
+```bash
+python3 scripts/gen_slide.py out/slide_01.jpg "<prompt>"
+python3 scripts/gen_slide.py out/slide_01.png "<prompt>" --engine gemini
+python3 scripts/gen_slide.py out/slide_01.jpg "<prompt>" --engine doubao
 ```
 
-### Step 2: Batch generate with concurrency
+Gemini accepts `.png`, `.jpg`, and `.jpeg` and uses PNG by default. For a
+low-level Python API call, keep the same explicit selection:
 
 ```python
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from gen_slide import gen
 
-PROMPTS = {
-    "slide_01": "<prompt 1>",
-    "slide_02": "<prompt 2>",
-    # ...
-}
-
-def gen_one(name, prompt):
-    path = f"out/{name}.jpg"
-    if __import__('os').path.exists(path):
-        return name, "cached"
-    ok = gen(prompt, path)
-    return name, "done" if ok else "failed"
-
-with ThreadPoolExecutor(max_workers=2) as ex:
-    futures = {ex.submit(gen_one, n, p): n for n, p in PROMPTS.items()}
-    for f in as_completed(futures):
-        name, status = f.result()
-        print(name, status)
+gen("<prompt>", "out/slide_01.png", engine="gemini")
 ```
 
-### Step 3: Optionally prepare one editable-converter input
+## Prompt style
 
-The downstream `image-to-editable-pptx` converter currently processes one slide at a time. Preserve the generated high-resolution master and create a separate standardized artifact:
+Append this style block to visual prompts unless the user asks for another
+art direction:
+
+```
+Style: 16:9 educational textbook infographic slide.
+Background: soft warm cream off-white (#f8f5f0), subtle paper-like texture.
+Typography: clean modern Chinese sans-serif (Noto Sans / Inter), dark navy-charcoal.
+Accent: terracotta orange (#e67e22); friendly hand-drawn icons and rounded cards.
+Layout: generous whitespace; no dark edge banners, photos, neon, gradients, or 3D.
+```
+
+For counted objects, make the count, grid, and exclusions explicit:
+
+```
+CRITICAL: Render EXACTLY 8 quote cards, no more, no less.
+Layout: strict 2 columns × 4 rows = EXACTLY 8 cells.
+Do NOT add a 9th card. Do NOT add a summary/conclusion card.
+Final check before output: total cards MUST be 8.
+```
+
+## Validate, convert, and export
+
+Run a visual self-check for quantity-sensitive pages:
+
+```bash
+python3 scripts/vision_check_gemini.py out/slide_01.jpg "精确数一下卡片数量是否正确?"
+```
+
+For `image-to-editable-pptx`, preserve the strict-16:9 master and create a
+separate exact `1280×720 PNG`; this command does not create an editable PPTX:
 
 ```bash
 python3 scripts/prepare_editable_input.py \
@@ -114,170 +106,41 @@ python3 scripts/prepare_editable_input.py \
   out/editable/slide_01.png
 ```
 
-Before invoking the converter, verify that the new output is an exact 1280x720 PNG. The standardizer rejects non-16:9 input and existing output paths; it does not create an editable PPTX. Its PNG is only the converter's input artifact.
-
-### Step 4: Vision self-check (recommended for quantity-sensitive prompts)
-
-```bash
-python3 scripts/vision_check_gemini.py out/slide_01.jpg "精确数一下卡片数量是否正确?"
-```
-
-### Step 5: Export to PDF + PPTX
-
-Use one explicit manifest as the source of truth. This supports mixed suffixes,
-keeps page order deterministic, and rejects duplicate slide IDs before export.
-Update the paths to match the artifacts actually generated; do not use a
-single-suffix glob.
+Use an explicit, ordered manifest for export. It supports mixed suffixes and
+prevents duplicate slide IDs:
 
 ```python
 from pathlib import Path
 import subprocess
 import sys
 
-SLIDES = [
-    "out/slide_01.jpg",
-    "out/slide_02.png",
-    "out/slide_03.webp",
-]
+SLIDES = ["out/slide_01.jpg", "out/slide_02.png", "out/slide_03.webp"]
 if len(SLIDES) != len(set(SLIDES)):
     raise SystemExit("duplicate slide paths in SLIDES")
 SLIDE_IDS = [Path(path).stem for path in SLIDES]
 if len(SLIDE_IDS) != len(set(SLIDE_IDS)):
     raise SystemExit("duplicate slide IDs across output suffixes")
-missing = [path for path in SLIDES if not Path(path).is_file()]
-if missing:
-    raise SystemExit(f"missing slide files: {missing}")
-
-# Keep True for the CLI route; set False to use the Python API instead.
-USE_CLI = True
-if USE_CLI:
-    subprocess.run(
-        [sys.executable, "scripts/export_images.py", "deck_name", *SLIDES],
-        check=True,
-    )
-else:
-    sys.path.insert(0, "scripts")
-    from export_images import export_deck
-
-    if not export_deck(SLIDES, "deck_name"):
-        raise SystemExit("deck export failed")
+subprocess.run([sys.executable, "scripts/export_images.py", "deck_name", *SLIDES], check=True)
 ```
 
-The CLI validates all source images before publishing, creates missing output
-directories, and uses a same-directory recovery journal so interrupted PDF/PPTX
-publication can be repaired on the next export. On POSIX, file and directory
-fsync cover process crashes and power-loss metadata recovery. On Windows,
-recovery covers process crashes only and does not promise power-loss durability.
-Existing outputs are preserved unless `--force` is supplied. Transparent pixels
-are composited onto the style's cream `#f8f5f0` background rather than black. A
-deck is limited to 128 slides and 512 MiB of aggregate source bytes. Clearly
-over-limit manifests are rejected during path preflight, before image decoding.
-If source files change after preflight, actual loaded bytes are accumulated
-after each image load and rejected before PDF/PPTX serialization.
+Generation refuses existing outputs unless `--force` is explicit. Inputs and
+generated images are capped at 50 MiB and 64 MP; vision inputs have a separate
+14 MiB cap. Export validates input, writes PDF/PPTX with recovery on the next
+export, and accepts at most 128 slides or 512 MiB aggregate source bytes.
+Clearly over-limit manifests are rejected during path preflight, before image
+decoding. If source files change after preflight, actual loaded bytes are
+accumulated after each image load and rejected before PDF/PPTX serialization.
 
-Stable hashed lock files intentionally persist because automatically unlinking a
-lock file can split ownership between processes. Optional cleanup never runs
-automatically. Run it ONLY while no generation or export process is running:
+Stable output lock files intentionally persist. Run cleanup only while no
+generation or export process is active:
 
 ```bash
 python3 scripts/cleanup_output_locks.py --older-than-days 30
 ```
 
-Because cleanup uses pathname age checks and removal, the offline precondition
-is the safety boundary for pathname races. Filesystem failures stop cleanup,
-return exit 1 without a traceback, and do not roll back earlier removals.
+## Historical reference
 
-## Style Template (Educational Textbook)
-
-Always append this `STYLE` block to visual prompts to keep slides consistent:
-
-```
-Style: 16:9 educational textbook infographic slide.
-Background: soft warm cream off-white (#f8f5f0), subtle paper-like texture.
-Typography: clean modern Chinese sans-serif (Noto Sans / Inter),
-  dark navy-charcoal (#2c3e50) main text, gray (#6b7280) secondary.
-Accent color: terracotta orange (#e67e22) for highlights, arrows, key icons.
-Icons: hand-drawn cartoon style, friendly, muted palette.
-Cards: rounded rectangles, thin light gray borders, very subtle shadow.
-Layout: generous whitespace, NO top/bottom dark banners, NO strips at edges.
-Mood: warm, professional, calm, educational.
-No photos, no neon, no glow effects, no gradients, no 3D renders.
-```
-
-## Quantity-Sensitive Prompts (CRITICAL)
-
-Image models miscount items (8 cards → 9). Always over-constrain:
-
-```
-CRITICAL: Render EXACTLY 8 quote cards, no more, no less.
-Layout: strict 2 columns × 4 rows = EXACTLY 8 cells.
-Do NOT add a 9th card. Do NOT add summary/conclusion card.
-[list all 8 items explicitly]
-Final check before output: total cards MUST be 8.
-```
-
-## Chapter Metadata Pattern
-
-For multi-chapter decks (e.g. book summaries), define metadata once and templatize:
-
-```python
-META = [
-    {
-        "num": "01", "slug": "ch01_intro",
-        "zh": "提示链", "en": "Prompt Chaining",
-        "one_liner": "拆线性流水线",
-        "problem": "...", "solution": "...",
-        "key_points": ["...", "..."],
-        "frameworks": [("LangChain", "LCEL", "pipe"), ...],
-        "scenarios": ["..."], "pitfalls": ["..."],
-        "quote": "...",
-    },
-    # ... more chapters
-]
-
-# 8 standard pages per chapter:
-# 01_cover, 02_glance, 03_what, 04_why,
-# 05_mechanism, 06_frameworks, 07_rule, 08_summary
-```
-
-See `examples/chapters_meta.py` for a filled-in example.
-
-## Critical Pitfalls
-
-| Symptom | Fix |
-|---|---|
-| OpenAI key missing | Set `OPENAI_API_KEY` or create `~/.secrets/openai_api_key` |
-| OpenAI HTTP 403 / organization verification required | Complete the required OpenAI organization verification, then retry |
-| OpenAI HTTP 429 / rate limit | Wait for capacity or quota, then retry; select another engine explicitly if desired |
-| Unsupported OpenAI output extension | Use `.jpg`, `.jpeg`, `.png`, or `.webp` |
-| Gemini HTTP 429 (配额超) | Wait for quota or explicitly use `engine="doubao"` |
-| Items miscounted (8→9) | Add `CRITICAL: EXACTLY N` constraint, list items explicitly |
-| PDF 页大小不一致 | `export_images.py` auto-normalizes to 1920×1080 |
-| Chinese 错字/糊字 | Run `vision_check_gemini.py` on samples, regenerate failures |
-| 风格不统一 | Always append the same `STYLE` block to every prompt |
-| Output not工整 (misaligned) | Don't embed raw images of varying dimensions; always go through normalize |
-| Gemini vision model unavailable | Use the current default `gemini-3.6-flash` or set `GEMINI_VISION_MODEL` to an enabled compatible model |
-| doubao chat 404 | Vision models need separate endpoint activation; image gen works |
-
-## Historical Real-World Reference
-
-This is a historical case only from 2026-07-25, during the nano banana / Doubao
-provider period: the `agentic-design-patterns` project generated 28 chapters × 8
-pages = 224 slides in **276 seconds** (8 concurrent), plus 17 overview slides in
-44s. All were exported to 58 individual PDF + PPTX files, and about 12 sample
-slides passed Gemini visual self-check. This does not represent current GPT Image
-2 performance.
-
-## Tips
-
-- **Concurrency**: Start with low concurrency (for example, 1-2 workers), then
-  increase gradually based on the current provider, model, account quota, and
-  observed 429 responses. Do not treat the historical numbers above as a
-  universal limit or performance target.
-- **OpenAI defaults and overrides**: Confirmed defaults are `gpt-image-2`, `2048x1152`, and `medium`. Override them with `OPENAI_IMAGE_MODEL`, `OPENAI_IMAGE_SIZE`, and `OPENAI_IMAGE_QUALITY` when needed.
-- **Retry behavior**: Providers retry some transient failures internally; surface final failures for manual handling. There is no automatic provider fallback.
-- **Output extensions**: OpenAI and Doubao accept `.jpg`, `.jpeg`, `.png`, and `.webp`. Gemini accepts `.png`, `.jpg`, and `.jpeg`: PNG by default, while a JPEG suffix requests `IMAGE_JPEG`. Unsupported Gemini suffixes fail before credential lookup or network access. Only Gemini validates the provider-declared response MIME type. All providers validate the actual image encoding and strict 16:9 dimensions before publication.
-- **Safe reruns**: Generation refuses existing outputs without contacting a provider. Treat that as cached in batch jobs; pass `overwrite=True` or `--force` only for intentional regeneration.
-- **Safety boundaries**: Same-output work fails fast before provider access. Generation outputs and inputs to ordinary export or editable preparation are capped at 50 MiB and 64 megapixels. Vision-check inputs have a separate 14 MiB limit. Directory replacement fails closed; transient HTTP retries honor bounded `Retry-After` guidance.
-- **First-page validation**: Generate 1 sample, visually confirm style, then batch.
-- **Pricing**: Provider pricing can change. Check the [OpenAI API pricing documentation](https://developers.openai.com/api/docs/pricing) instead of assuming a fixed per-image cost.
+The 2026-07-25 nano banana / Doubao provider period generated 224 slides in
+276 seconds with concurrent API work. It is historical only and does not
+represent current host-first GPT Image 2 performance; never reuse that
+concurrency pattern for a sticky routed batch.
