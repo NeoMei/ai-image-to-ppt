@@ -792,6 +792,26 @@ def _verify_temporary_name(temporary: TemporaryOutput) -> None:
         ) from error
 
 
+def _cleanup_unrecorded_temporary(
+    descriptor: int,
+    parent_fd: int,
+    name: str,
+) -> None:
+    """Remove a setup-time temp only when its still-open fd proves ownership."""
+    try:
+        owned = os.fstat(descriptor)
+        current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if (
+            stat.S_ISREG(owned.st_mode)
+            and stat.S_ISREG(current.st_mode)
+            and owned.st_dev == current.st_dev
+            and owned.st_ino == current.st_ino
+        ):
+            os.unlink(name, dir_fd=parent_fd)
+    except OSError:
+        pass
+
+
 def _temporary_path(target: TargetValue) -> TemporaryOutput:
     prepared = _as_prepared_target(target)
     descriptor = None
@@ -834,6 +854,10 @@ def _temporary_path(target: TargetValue) -> TemporaryOutput:
             except OSError:
                 pass
         elif descriptor is not None:
+            try:
+                _cleanup_unrecorded_temporary(descriptor, parent_fd, name)
+            except OSError:
+                pass
             try:
                 os.close(descriptor)
             except OSError:

@@ -55,6 +55,60 @@ def assert_no_transaction_files(test_case, directory):
 
 
 class SharedParentIdentityTests(unittest.TestCase):
+    def test_temp_fstat_failure_cleans_owned_name_and_closes_fd(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            prepared = image_output.preflight_output(root / "slide.jpg")
+            candidate = root / ".slide.jpg.fstat-failure.tmp"
+            real_open = image_output.os.open
+            real_fstat = image_output.os.fstat
+            real_close = image_output.os.close
+            opened = []
+            closed = []
+            fstat_calls = 0
+
+            def record_open(*args, **kwargs):
+                descriptor = real_open(*args, **kwargs)
+                opened.append(descriptor)
+                return descriptor
+
+            def fail_first_temp_fstat(descriptor):
+                nonlocal fstat_calls
+                fstat_calls += 1
+                if fstat_calls == 2:
+                    raise OSError("injected temporary fstat failure")
+                return real_fstat(descriptor)
+
+            def record_close(descriptor):
+                closed.append(descriptor)
+                return real_close(descriptor)
+
+            with mock.patch.object(
+                image_output.secrets,
+                "token_hex",
+                return_value="fstat-failure",
+            ), mock.patch.object(
+                image_output.os,
+                "open",
+                side_effect=record_open,
+            ), mock.patch.object(
+                image_output.os,
+                "fstat",
+                side_effect=fail_first_temp_fstat,
+            ), mock.patch.object(
+                image_output.os,
+                "close",
+                side_effect=record_close,
+            ), self.assertRaisesRegex(
+                image_output.ImageOutputError,
+                "failed to create output temporary file",
+            ):
+                image_output._temporary_path(prepared)
+
+            self.assertGreaterEqual(len(opened), 2)
+            self.assertIn(opened[-1], closed)
+            self.assertFalse(candidate.exists())
+
     def test_temp_name_collisions_do_not_delete_external_candidate(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
