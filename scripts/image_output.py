@@ -792,112 +792,6 @@ def _verify_temporary_name(temporary: TemporaryOutput) -> None:
         ) from error
 
 
-def _cleanup_unrecorded_temporary(
-    descriptor: int,
-    parent_fd: int,
-    name: str,
-) -> None:
-    """Isolate a setup-time name before deleting only the opened inode.
-
-    POSIX has no conditional unlink-by-inode operation.  Moving the name into a
-    fresh mode-0700 directory gives cleanup a private namespace in which the
-    descriptor identity can be checked without a public stat/unlink window.  If
-    the public name was replaced before the move, restore that entry with a
-    no-overwrite hard link; retain it in quarantine if restoration is unsafe.
-    """
-    quarantine_name = None
-    quarantine_fd = None
-    isolated_name = "entry"
-    try:
-        owned = os.fstat(descriptor)
-        current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-        if not stat.S_ISREG(owned.st_mode):
-            return
-        if (
-            not stat.S_ISREG(current.st_mode)
-            or owned.st_dev != current.st_dev
-            or owned.st_ino != current.st_ino
-        ):
-            return
-
-        for _attempt in range(100):
-            candidate = f".image-output-cleanup-{secrets.token_hex(16)}"
-            try:
-                os.mkdir(candidate, 0o700, dir_fd=parent_fd)
-                quarantine_name = candidate
-                break
-            except FileExistsError:
-                continue
-        if quarantine_name is None:
-            return
-
-        directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-        directory_flags |= getattr(os, "O_NOFOLLOW", 0)
-        quarantine_fd = os.open(
-            quarantine_name,
-            directory_flags,
-            dir_fd=parent_fd,
-        )
-        quarantine_stat = os.fstat(quarantine_fd)
-        if not stat.S_ISDIR(quarantine_stat.st_mode):
-            return
-
-        os.rename(
-            name,
-            isolated_name,
-            src_dir_fd=parent_fd,
-            dst_dir_fd=quarantine_fd,
-        )
-        isolated = os.stat(
-            isolated_name,
-            dir_fd=quarantine_fd,
-            follow_symlinks=False,
-        )
-        if (
-            stat.S_ISREG(isolated.st_mode)
-            and isolated.st_dev == owned.st_dev
-            and isolated.st_ino == owned.st_ino
-        ):
-            os.unlink(isolated_name, dir_fd=quarantine_fd)
-            return
-
-        try:
-            os.link(
-                isolated_name,
-                name,
-                src_dir_fd=quarantine_fd,
-                dst_dir_fd=parent_fd,
-                follow_symlinks=False,
-            )
-            os.unlink(isolated_name, dir_fd=quarantine_fd)
-        except OSError as error:
-            _warn_retained_temp(
-                "external replacement could not be restored safely",
-                f"{quarantine_name}/{isolated_name}",
-                error,
-            )
-    except FileNotFoundError:
-        return
-    except OSError as error:
-        if quarantine_name is not None:
-            _warn_retained_temp(
-                "temporary cleanup could not be completed safely",
-                quarantine_name,
-                error,
-            )
-    finally:
-        if quarantine_fd is not None:
-            try:
-                os.close(quarantine_fd)
-            except OSError:
-                pass
-        if quarantine_name is not None:
-            try:
-                os.rmdir(quarantine_name, dir_fd=parent_fd)
-            except OSError:
-                pass
-
-
 def _temporary_path(target: TargetValue) -> TemporaryOutput:
     prepared = _as_prepared_target(target)
     descriptor = None
@@ -916,7 +810,24 @@ def _temporary_path(target: TargetValue) -> TemporaryOutput:
                 continue
         else:
             raise ImageOutputError("failed to allocate unique output temporary file")
-        temp_stat = os.fstat(descriptor)
+        temp_stat = None
+        metadata_error = None
+        for _attempt in range(2):
+            try:
+                temp_stat = os.fstat(descriptor)
+                break
+            except OSError as error:
+                metadata_error = error
+        if temp_stat is None:
+            retained_path = str(prepared.parent.path / name)
+            _warn_retained_temp(
+                "temporary ownership could not be established; cleanup skipped",
+                retained_path,
+                metadata_error,
+            )
+            raise ImageOutputError(
+                f"cannot identify output temporary file: {metadata_error}"
+            ) from metadata_error
         if not stat.S_ISREG(temp_stat.st_mode):
             raise ImageOutputError("output temporary file is not regular")
         temporary = TemporaryOutput(
@@ -940,10 +851,6 @@ def _temporary_path(target: TargetValue) -> TemporaryOutput:
             except OSError:
                 pass
         elif descriptor is not None:
-            try:
-                _cleanup_unrecorded_temporary(descriptor, parent_fd, name)
-            except OSError:
-                pass
             try:
                 os.close(descriptor)
             except OSError:

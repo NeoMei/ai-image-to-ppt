@@ -52,23 +52,21 @@ def swap_parent(parent, redirected):
 def assert_no_transaction_files(test_case, directory):
     test_case.assertEqual(list(directory.glob(".*.tmp*")), [])
     test_case.assertEqual(list(directory.glob(".*.backup")), [])
+    test_case.assertEqual(list(directory.glob(".image-output-cleanup-*")), [])
 
 
 class SharedParentIdentityTests(unittest.TestCase):
-    def test_temp_fstat_failure_does_not_unlink_replacement_after_name_stat(self):
+    def test_transient_temp_fstat_failure_retries_and_returns_owned_temp(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             prepared = image_output.preflight_output(root / "slide.jpg")
-            candidate = root / ".slide.jpg.fstat-race.tmp"
+            candidate = root / ".slide.jpg.fstat-retry.tmp"
             real_open = image_output.os.open
             real_fstat = image_output.os.fstat
-            real_stat = image_output.os.stat
             real_close = image_output.os.close
-            real_unlink = image_output.os.unlink
             opened = []
             closed = []
             fstat_calls = 0
-            replaced = False
 
             def record_open(*args, **kwargs):
                 descriptor = real_open(*args, **kwargs)
@@ -82,27 +80,15 @@ class SharedParentIdentityTests(unittest.TestCase):
                     raise OSError("injected temporary fstat failure")
                 return real_fstat(descriptor)
 
-            def replace_after_name_stat(path, *args, **kwargs):
-                nonlocal replaced
-                result = real_stat(path, *args, **kwargs)
-                if (
-                    not replaced
-                    and path == candidate.name
-                    and kwargs.get("dir_fd") is not None
-                ):
-                    replaced = True
-                    real_unlink(path, dir_fd=kwargs["dir_fd"])
-                    candidate.write_bytes(b"external replacement")
-                return result
-
             def record_close(descriptor):
                 closed.append(descriptor)
                 return real_close(descriptor)
 
+            temporary = None
             with mock.patch.object(
                 image_output.secrets,
                 "token_hex",
-                return_value="fstat-race",
+                return_value="fstat-retry",
             ), mock.patch.object(
                 image_output.os,
                 "open",
@@ -113,148 +99,132 @@ class SharedParentIdentityTests(unittest.TestCase):
                 side_effect=fail_first_temp_fstat,
             ), mock.patch.object(
                 image_output.os,
-                "stat",
-                side_effect=replace_after_name_stat,
-            ), mock.patch.object(
-                image_output.os,
                 "close",
                 side_effect=record_close,
-            ), self.assertRaisesRegex(
-                image_output.ImageOutputError,
-                "failed to create output temporary file",
             ):
-                image_output._temporary_path(prepared)
+                try:
+                    temporary = image_output._temporary_path(prepared)
+                    self.assertIsInstance(temporary, image_output.TemporaryOutput)
+                    owned = real_fstat(temporary.descriptor)
+                    self.assertEqual(
+                        (temporary.device, temporary.inode),
+                        (owned.st_dev, owned.st_ino),
+                    )
+                    image_output._remove_temp(temporary)
+                finally:
+                    if temporary is not None:
+                        image_output.os.close(temporary.descriptor)
+                        image_output.os.close(temporary.parent_fd)
 
-            self.assertTrue(replaced)
+            self.assertGreaterEqual(fstat_calls, 3)
             self.assertGreaterEqual(len(opened), 2)
             self.assertTrue(set(opened).issubset(set(closed)))
-            self.assertEqual(candidate.read_bytes(), b"external replacement")
+            self.assertFalse(candidate.exists())
+            self.assertEqual(list(root.glob(".image-output-cleanup-*")), [])
 
-    def test_temp_fstat_failure_retains_replacement_when_restore_name_is_taken(self):
+    def test_persistent_temp_fstat_failure_warns_and_never_deletes_by_name(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             prepared = image_output.preflight_output(root / "slide.jpg")
-            candidate = root / ".slide.jpg.fstat-restore-race.tmp"
+            candidate = root / ".slide.jpg.fstat-persistent.tmp"
+            real_open = image_output.os.open
             real_fstat = image_output.os.fstat
             real_stat = image_output.os.stat
+            real_close = image_output.os.close
             real_unlink = image_output.os.unlink
-            real_link = image_output.os.link
+            opened = []
+            closed = []
             fstat_calls = 0
-            replaced = False
+            unsafe_name_operations = []
 
-            def fail_first_temp_fstat(descriptor):
+            def record_open(*args, **kwargs):
+                descriptor = real_open(*args, **kwargs)
+                opened.append(descriptor)
+                return descriptor
+
+            def fail_all_temp_fstats(descriptor):
                 nonlocal fstat_calls
                 fstat_calls += 1
+                if fstat_calls == 1:
+                    return real_fstat(descriptor)
                 if fstat_calls == 2:
-                    raise OSError("injected temporary fstat failure")
-                return real_fstat(descriptor)
-
-            def replace_after_name_stat(path, *args, **kwargs):
-                nonlocal replaced
-                result = real_stat(path, *args, **kwargs)
-                if (
-                    not replaced
-                    and path == candidate.name
-                    and kwargs.get("dir_fd") is not None
-                ):
-                    replaced = True
-                    real_unlink(path, dir_fd=kwargs["dir_fd"])
+                    real_unlink(candidate)
                     candidate.write_bytes(b"first external replacement")
-                return result
+                raise OSError("persistent temporary fstat failure")
 
-            def occupy_name_before_restore(*args, **kwargs):
-                candidate.write_bytes(b"second external replacement")
-                return real_link(*args, **kwargs)
+            def record_stat(path, *args, **kwargs):
+                if path == candidate.name and kwargs.get("dir_fd") is not None:
+                    unsafe_name_operations.append(("stat", path))
+                return real_stat(path, *args, **kwargs)
+
+            def reject_unlink(path, *args, **kwargs):
+                unsafe_name_operations.append(("unlink", path))
+                raise AssertionError("temporary setup failure must not unlink by name")
+
+            def reject_quarantine(*args, **kwargs):
+                unsafe_name_operations.append(("quarantine", args))
+                raise AssertionError("temporary setup failure must not use quarantine")
+
+            def record_close(descriptor):
+                closed.append(descriptor)
+                return real_close(descriptor)
 
             stderr = io.StringIO()
             with mock.patch.object(
                 image_output.secrets,
                 "token_hex",
-                return_value="fstat-restore-race",
+                return_value="fstat-persistent",
+            ), mock.patch.object(
+                image_output.os,
+                "open",
+                side_effect=record_open,
             ), mock.patch.object(
                 image_output.os,
                 "fstat",
-                side_effect=fail_first_temp_fstat,
+                side_effect=fail_all_temp_fstats,
             ), mock.patch.object(
                 image_output.os,
                 "stat",
-                side_effect=replace_after_name_stat,
+                side_effect=record_stat,
+            ), mock.patch.object(
+                image_output.os,
+                "unlink",
+                side_effect=reject_unlink,
+            ), mock.patch.object(
+                image_output.os,
+                "mkdir",
+                side_effect=reject_quarantine,
+            ), mock.patch.object(
+                image_output.os,
+                "rename",
+                side_effect=reject_quarantine,
             ), mock.patch.object(
                 image_output.os,
                 "link",
-                side_effect=occupy_name_before_restore,
+                side_effect=reject_quarantine,
+            ), mock.patch.object(
+                image_output.os,
+                "rmdir",
+                side_effect=reject_quarantine,
+            ), mock.patch.object(
+                image_output.os,
+                "close",
+                side_effect=record_close,
             ), redirect_stderr(stderr), self.assertRaisesRegex(
                 image_output.ImageOutputError,
                 "failed to create output temporary file",
             ):
                 image_output._temporary_path(prepared)
 
-            quarantines = list(root.glob(".image-output-cleanup-*"))
-            self.assertTrue(replaced)
-            self.assertEqual(
-                candidate.read_bytes(),
-                b"second external replacement",
-            )
-            self.assertEqual(len(quarantines), 1)
-            self.assertEqual(
-                (quarantines[0] / "entry").read_bytes(),
-                b"first external replacement",
-            )
-            self.assertIn("could not be restored safely", stderr.getvalue())
-
-    def test_temp_fstat_failure_cleans_owned_name_and_closes_fd(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            prepared = image_output.preflight_output(root / "slide.jpg")
-            candidate = root / ".slide.jpg.fstat-failure.tmp"
-            real_open = image_output.os.open
-            real_fstat = image_output.os.fstat
-            real_close = image_output.os.close
-            opened = []
-            closed = []
-            fstat_calls = 0
-
-            def record_open(*args, **kwargs):
-                descriptor = real_open(*args, **kwargs)
-                opened.append(descriptor)
-                return descriptor
-
-            def fail_first_temp_fstat(descriptor):
-                nonlocal fstat_calls
-                fstat_calls += 1
-                if fstat_calls == 2:
-                    raise OSError("injected temporary fstat failure")
-                return real_fstat(descriptor)
-
-            def record_close(descriptor):
-                closed.append(descriptor)
-                return real_close(descriptor)
-
-            with mock.patch.object(
-                image_output.secrets,
-                "token_hex",
-                return_value="fstat-failure",
-            ), mock.patch.object(
-                image_output.os,
-                "open",
-                side_effect=record_open,
-            ), mock.patch.object(
-                image_output.os,
-                "fstat",
-                side_effect=fail_first_temp_fstat,
-            ), mock.patch.object(
-                image_output.os,
-                "close",
-                side_effect=record_close,
-            ), self.assertRaisesRegex(
-                image_output.ImageOutputError,
-                "failed to create output temporary file",
-            ):
-                image_output._temporary_path(prepared)
-
+            self.assertGreaterEqual(fstat_calls, 3)
             self.assertGreaterEqual(len(opened), 2)
             self.assertTrue(set(opened).issubset(set(closed)))
-            self.assertFalse(candidate.exists())
+            self.assertEqual(unsafe_name_operations, [])
+            self.assertEqual(candidate.read_bytes(), b"first external replacement")
+            self.assertEqual(list(root.glob(".image-output-cleanup-*")), [])
+            self.assertIn("WARN:", stderr.getvalue())
+            self.assertIn("ownership could not be established", stderr.getvalue())
+            self.assertIn(str(candidate), stderr.getvalue())
 
     def test_temp_name_collisions_do_not_delete_external_candidate(self):
         with tempfile.TemporaryDirectory() as temp_dir:
