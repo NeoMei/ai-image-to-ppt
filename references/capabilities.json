@@ -1,0 +1,30 @@
+{
+  "schemaVersion": 1,
+  "skill": "ai-image-to-ppt",
+  "contracts": {
+    "generationResult": 1,
+    "serialStickyRouterReport": 1,
+    "hostImageImport": 1,
+    "editableInput": 1
+  },
+  "routingOrder": [
+    { "provider": "openai", "channel": "host", "modelSelection": "host-owned" },
+    { "provider": "openai", "channel": "api", "defaultModel": "gpt-image-2" },
+    { "provider": "gemini", "channel": "host", "modelSelection": "host-owned" },
+    { "provider": "gemini", "channel": "api", "defaultModel": "gemini-3.1-flash-image" },
+    { "provider": "doubao", "channel": "host", "modelSelection": "host-owned" },
+    { "provider": "doubao", "channel": "api", "defaultModel": "doubao-seedream-5-0-260128" }
+  ],
+  "outputs": {
+    "normalizedSlide": { "format": "image", "width": 1920, "height": 1080 },
+    "editableInput": { "format": "png", "width": 1280, "height": 720 }
+  },
+  "scripts": {
+    "generationResult": "scripts/generation_result.py",
+    "hostRoutingPolicy": "scripts/host_routing_policy.py",
+    "importHostImage": "scripts/import_host_image.py",
+    "prepareEditableInput": "scripts/prepare_editable_input.py",
+    "apiGenerator": "scripts/gen_slide.py",
+    "normalizedExport": "scripts/export_images.py"
+  }
+}
