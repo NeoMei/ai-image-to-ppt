@@ -2,6 +2,7 @@
 
 import json
 import stat
+import unicodedata
 from pathlib import Path
 from typing import Dict, Iterable, Tuple
 
@@ -40,6 +41,17 @@ class CapabilityManifestError(ValueError):
     """A controlled, user-safe manifest validation failure."""
 
 
+def _reject_duplicate_members(pairs: Iterable[Tuple[str, object]]) -> Dict[str, object]:
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise CapabilityManifestError(
+                "capability manifest contains a duplicate JSON member"
+            )
+        result[key] = value
+    return result
+
+
 def load_capability_manifest(skill_root: Path) -> dict:
     """Read and decode the capability manifest below ``skill_root``."""
 
@@ -49,7 +61,7 @@ def load_capability_manifest(skill_root: Path) -> dict:
     except (OSError, UnicodeError) as error:
         raise CapabilityManifestError("capability manifest is missing or unreadable") from error
     try:
-        manifest = json.loads(content)
+        manifest = json.loads(content, object_pairs_hook=_reject_duplicate_members)
     except (json.JSONDecodeError, RecursionError) as error:
         raise CapabilityManifestError("capability manifest is not valid JSON") from error
     if not isinstance(manifest, dict):
@@ -148,7 +160,7 @@ def _validate_script_path(skill_root: Path, declared_path: object) -> None:
         or relative_path.startswith("/")
         or "\\" in relative_path
         or any(part in {"", ".", ".."} for part in path_parts)
-        or any(ord(character) < 32 or ord(character) == 127 for character in relative_path)
+        or any(unicodedata.category(character) == "Cc" for character in relative_path)
     ):
         raise CapabilityManifestError("script path must be a safe relative script path")
 

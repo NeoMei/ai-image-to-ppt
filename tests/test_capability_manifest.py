@@ -327,6 +327,46 @@ class CapabilityManifestTests(unittest.TestCase):
                     self.assertFalse(valid, message)
                     self.assertIn("safe relative script", message)
 
+    def test_c1_unicode_control_character_path_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            write_skill_fixture(root)
+            c1_path = "scripts/\u0085generation_result.py"
+            (root / c1_path).write_text("# unsafe name\n", encoding="utf-8")
+            manifest = copy.deepcopy(EXPECTED_MANIFEST)
+            manifest["scripts"]["generationResult"] = c1_path
+            write_manifest(root, manifest)
+
+            valid, message = validate_capability_manifest(root)
+
+            self.assertFalse(valid, message)
+            self.assertIn("safe relative script", message)
+
+    def test_duplicate_json_members_are_rejected_at_top_and_nested_levels(self):
+        valid_json = json.dumps(EXPECTED_MANIFEST)
+        duplicates = {
+            "top level": valid_json.replace(
+                '"schemaVersion": 1',
+                '"schemaVersion": 99, "schemaVersion": 1',
+                1,
+            ),
+            "nested contract": valid_json.replace(
+                '"generationResult": 1',
+                '"generationResult": 2, "generationResult": 1',
+                1,
+            ),
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            write_skill_fixture(root)
+            manifest_path = root / "references" / "capabilities.json"
+            for label, manifest_text in duplicates.items():
+                with self.subTest(label=label):
+                    manifest_path.write_text(manifest_text, encoding="utf-8")
+                    valid, message = validate_capability_manifest(root)
+                    self.assertFalse(valid, message)
+                    self.assertIn("duplicate JSON member", message)
+
     def test_missing_non_regular_and_symlink_scripts_are_rejected(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
