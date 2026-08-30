@@ -65,6 +65,35 @@ class ValidateSkillTests(unittest.TestCase):
         self.assertFalse(valid)
         self.assertTrue(message.startswith("Capability manifest invalid: "), message)
 
+    def test_escaped_unicode_surrogate_manifest_is_rejected_without_exception(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "references").mkdir()
+            (root / "scripts").mkdir()
+            (root / "SKILL.md").write_text(
+                "---\nname: valid-name\ndescription: valid\n---\nBody\n",
+                encoding="utf-8",
+            )
+            manifest = json.loads((ROOT / "references" / "capabilities.json").read_text())
+            for script_path in manifest["scripts"].values():
+                script = root / script_path
+                script.parent.mkdir(parents=True, exist_ok=True)
+                script.write_text("# fixture\n", encoding="utf-8")
+            manifest_text = json.dumps(manifest).replace(
+                "scripts/generation_result.py",
+                r"scripts/\ud800bad.py",
+                1,
+            )
+            (root / "references" / "capabilities.json").write_text(
+                manifest_text, encoding="utf-8"
+            )
+
+            valid, message = validate_skill.validate_skill(temp_dir)
+
+        self.assertFalse(valid)
+        self.assertTrue(message.startswith("Capability manifest invalid: "), message)
+        self.assertIn("safe relative script", message)
+
 
 if __name__ == "__main__":
     unittest.main()

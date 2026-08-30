@@ -6,12 +6,17 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPOSITORY_ROOT / "scripts"))
 
-from capability_manifest import load_capability_manifest, validate_capability_manifest
+from capability_manifest import (
+    CapabilityManifestError,
+    load_capability_manifest,
+    validate_capability_manifest,
+)
 
 
 EXPECTED_MANIFEST = {
@@ -366,6 +371,37 @@ class CapabilityManifestTests(unittest.TestCase):
                     valid, message = validate_capability_manifest(root)
                     self.assertFalse(valid, message)
                     self.assertIn("duplicate JSON member", message)
+
+    def test_json_parser_value_error_is_mapped_to_capability_manifest_error(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            write_skill_fixture(root)
+            with mock.patch(
+                "capability_manifest.json.loads",
+                side_effect=ValueError("integer string conversion limit exceeded"),
+            ):
+                with self.assertRaisesRegex(
+                    CapabilityManifestError, "not valid JSON"
+                ):
+                    load_capability_manifest(root)
+
+    def test_escaped_unicode_surrogate_path_is_rejected_before_filesystem_access(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            write_skill_fixture(root)
+            manifest_text = json.dumps(EXPECTED_MANIFEST).replace(
+                "scripts/generation_result.py",
+                r"scripts/\ud800bad.py",
+                1,
+            )
+            (root / "references" / "capabilities.json").write_text(
+                manifest_text, encoding="utf-8"
+            )
+
+            valid, message = validate_capability_manifest(root)
+
+            self.assertFalse(valid, message)
+            self.assertIn("safe relative script", message)
 
     def test_missing_non_regular_and_symlink_scripts_are_rejected(self):
         with tempfile.TemporaryDirectory() as temp_dir:

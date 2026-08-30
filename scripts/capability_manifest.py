@@ -62,7 +62,9 @@ def load_capability_manifest(skill_root: Path) -> dict:
         raise CapabilityManifestError("capability manifest is missing or unreadable") from error
     try:
         manifest = json.loads(content, object_pairs_hook=_reject_duplicate_members)
-    except (json.JSONDecodeError, RecursionError) as error:
+    except CapabilityManifestError:
+        raise
+    except (ValueError, RecursionError) as error:
         raise CapabilityManifestError("capability manifest is not valid JSON") from error
     if not isinstance(manifest, dict):
         raise CapabilityManifestError("capability manifest has wrong type")
@@ -160,7 +162,10 @@ def _validate_script_path(skill_root: Path, declared_path: object) -> None:
         or relative_path.startswith("/")
         or "\\" in relative_path
         or any(part in {"", ".", ".."} for part in path_parts)
-        or any(unicodedata.category(character) == "Cc" for character in relative_path)
+        or any(
+            unicodedata.category(character) in {"Cc", "Cs"}
+            for character in relative_path
+        )
     ):
         raise CapabilityManifestError("script path must be a safe relative script path")
 
