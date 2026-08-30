@@ -17,6 +17,12 @@ sticky route, advances only for unavailable/auth/retryable outcomes, stops on
 safety or validation failures, and reports page-level switches. Cached pages do
 not establish or change that route.
 
+The static machine-readable capability contract is
+[`references/capabilities.json`](references/capabilities.json). It is
+authoritative for the packaged schema and sub-contract versions, routing order,
+script paths, and output dimensions. Manifest validation checks the shipped
+contract only; it does not prove credentials or real-time host/API availability.
+
 See [host routing details](references/host-image-routing.md) for artifact
 acceptance, import, status handling, and the final redacted report contract.
 

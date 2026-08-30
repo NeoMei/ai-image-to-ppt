@@ -3,6 +3,7 @@ import http.client
 import io
 import json
 import os
+import re
 import struct
 import sys
 import tempfile
@@ -601,6 +602,21 @@ class LocalResourceBoundaryTests(unittest.TestCase):
             self.assertFalse(prefix.with_suffix(".pptx").exists())
             self.assertFalse(prepared.exists())
             self.assertEqual(list(root.glob(".*.tmp*")), [])
+
+
+class PackageResourceBoundaryTests(unittest.TestCase):
+    def test_capability_manifest_is_an_allowed_linked_package_resource(self):
+        local_link = re.compile(r"\[[^\]]+\]\((?![a-z]+:|#)([^)]+)\)")
+
+        for entrypoint in (ROOT / "SKILL.md", ROOT / "README.md"):
+            resources = {
+                match.group(1)
+                for match in local_link.finditer(entrypoint.read_text(encoding="utf-8"))
+            }
+            self.assertIn("references/capabilities.json", resources)
+            manifest = ROOT / "references/capabilities.json"
+            self.assertTrue(manifest.is_file())
+            self.assertTrue(manifest.resolve().is_relative_to(ROOT.resolve()))
 
 
 if __name__ == "__main__":
