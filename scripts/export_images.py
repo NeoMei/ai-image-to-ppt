@@ -178,7 +178,9 @@ def _temporary_path(
 
 
 def _sync_file(path: str) -> None:
-    with open(path, "rb") as stream:
+    # Windows' CRT rejects fsync/_commit on a read-only descriptor (notably on
+    # Python 3.14), so reopen our freshly written temporary with write access.
+    with open(path, "rb+") as stream:
         os.fsync(stream.fileno())
 
 

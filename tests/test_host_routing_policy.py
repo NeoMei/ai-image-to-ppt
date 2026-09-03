@@ -4,6 +4,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
+SUCCESS_OUTPUT = str((ROOT / "test-output" / "slide.png").resolve())
 
 from generation_result import GenerationResult, GenerationStatus
 from host_routing_policy import (
@@ -20,7 +21,7 @@ def result(candidate, status, message="safe reason"):
         GenerationStatus(status),
         provider,
         channel,
-        "/workspace/out/slide.png" if status == "success" else None,
+        SUCCESS_OUTPUT if status == "success" else None,
         message,
     )
 
@@ -64,7 +65,7 @@ class HostRoutingPolicyTests(unittest.TestCase):
                 GenerationStatus.SUCCESS,
                 "gemini",
                 "host",
-                "/workspace/out/slide.png",
+                SUCCESS_OUTPUT,
             ),
         )
         for execute in invalid_executors:

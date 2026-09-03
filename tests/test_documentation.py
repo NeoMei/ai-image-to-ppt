@@ -1,3 +1,4 @@
+import json
 import unittest
 from pathlib import Path
 
@@ -5,6 +6,38 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class DocumentationTests(unittest.TestCase):
+    def test_capability_manifest_matches_the_superppt_v3_contract(self):
+        manifest = json.loads((ROOT / "references" / "capabilities.json").read_text(encoding="utf-8"))
+        self.assertIn("references/capabilities.json", (ROOT / "README.md").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["schemaVersion"], 1)
+        self.assertEqual(manifest["skill"], "ai-image-to-ppt")
+        self.assertEqual(
+            manifest["contracts"],
+            {
+                "generationResult": 1,
+                "serialStickyRouterReport": 1,
+                "hostImageImport": 1,
+                "editableInput": 1,
+            },
+        )
+        self.assertEqual(
+            set(manifest["scripts"].values()),
+            {
+                "scripts/generation_result.py",
+                "scripts/host_routing_policy.py",
+                "scripts/import_host_image.py",
+                "scripts/prepare_editable_input.py",
+                "scripts/gen_slide.py",
+                "scripts/export_images.py",
+            },
+        )
+        for relative_path in manifest["scripts"].values():
+            self.assertTrue((ROOT / relative_path).is_file(), relative_path)
+
+    def test_windows_test_gate_is_documented_and_present(self):
+        self.assertIn("scripts/run_windows_tests.py", self.readme)
+        self.assertTrue((ROOT / "scripts" / "run_windows_tests.py").is_file())
+
     @classmethod
     def setUpClass(cls):
         cls.readme = (ROOT / "README.md").read_text(encoding="utf-8")

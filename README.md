@@ -19,6 +19,8 @@ not establish or change that route.
 
 See [host routing details](references/host-image-routing.md) for artifact
 acceptance, import, status handling, and the final redacted report contract.
+The machine-readable SuperPPT integration surface is declared in
+[`references/capabilities.json`](references/capabilities.json).
 
 ## Optional API/CLI-only credentials
 
@@ -140,6 +142,15 @@ return exit 1 without a traceback, and do not roll back earlier removals.
 python3 -m pip install -r requirements-dev.txt
 python3 scripts/validate_skill.py .
 python3 -m unittest discover -s tests -v
+```
+
+On Windows, generation and host-image import intentionally fail closed because
+the required POSIX publication primitives are unavailable. Run the supported
+Windows surface (including export, editable-input preparation, routing,
+recovery, validation, and vision checks) with:
+
+```powershell
+python scripts/run_windows_tests.py
 ```
 
 ## License

@@ -5,6 +5,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
+
+def generated_output(name):
+    return str((ROOT / "test-output" / f"{name}.png").resolve())
+
 from generation_result import GenerationResult, GenerationStatus
 from host_routing_policy import CANDIDATE_KEYS, FATAL_STATUSES, SerialStickyRouter
 
@@ -25,7 +29,7 @@ class TranscriptExecutor:
             status,
             candidate.provider,
             candidate.channel,
-            f"/workspace/generated/{candidate.key}.png"
+            generated_output(candidate.key)
             if status is GenerationStatus.SUCCESS
             else None,
             self.message,
@@ -78,7 +82,7 @@ class HostRoutingEndToEndTests(unittest.TestCase):
                 self.assertEqual(successful_result.channel, expected_channel)
                 self.assertEqual(
                     successful_result.output_path,
-                    f"/workspace/generated/{expected_calls[-1][0]}.png",
+                    generated_output(expected_calls[-1][0]),
                 )
                 self.assertFalse(router.stopped)
 
@@ -260,7 +264,7 @@ class HostRoutingEndToEndTests(unittest.TestCase):
                 GenerationStatus.SUCCESS,
                 candidate.provider,
                 "api" if candidate.channel == "host" else "host",
-                "/workspace/generated/mismatched.png",
+                generated_output("mismatched"),
             )
 
         with self.assertRaises(RuntimeError):

@@ -5,6 +5,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
+SUCCESS_OUTPUT = str((ROOT / "test-output" / "slide.png").resolve())
 
 from generation_result import (
     FATAL_STATUSES,
@@ -27,7 +28,7 @@ class GenerationResultTests(unittest.TestCase):
             GenerationStatus.SUCCESS,
             "openai",
             "host",
-            "/workspace/out/slide.png",
+            SUCCESS_OUTPUT,
             "generated",
         )
         self.assertTrue(result.ok)
@@ -38,14 +39,14 @@ class GenerationResultTests(unittest.TestCase):
                 "status": "success",
                 "provider": "openai",
                 "channel": "host",
-                "output_path": "/workspace/out/slide.png",
+                "output_path": SUCCESS_OUTPUT,
                 "safe_message": "generated",
             },
         )
 
     def test_only_fallback_statuses_allow_fallback(self):
         for status in GenerationStatus:
-            output_path = "/workspace/out/slide.png" if status is GenerationStatus.SUCCESS else None
+            output_path = SUCCESS_OUTPUT if status is GenerationStatus.SUCCESS else None
             result = GenerationResult(status, "gemini", "api", output_path)
             self.assertEqual(result.can_fallback, status in FALLBACK_STATUSES)
 
@@ -84,9 +85,9 @@ class GenerationResultTests(unittest.TestCase):
 
     def test_result_rejects_invalid_contract_values(self):
         cases = (
-            (GenerationStatus.SUCCESS, "other", "host", "/workspace/out/slide.png"),
-            (GenerationStatus.SUCCESS, "openai", "other", "/workspace/out/slide.png"),
-            (GenerationStatus.INVALID_INPUT, "openai", "host", "/workspace/out/slide.png"),
+            (GenerationStatus.SUCCESS, "other", "host", SUCCESS_OUTPUT),
+            (GenerationStatus.SUCCESS, "openai", "other", SUCCESS_OUTPUT),
+            (GenerationStatus.INVALID_INPUT, "openai", "host", SUCCESS_OUTPUT),
             (GenerationStatus.SUCCESS, "openai", "host", None),
             (GenerationStatus.SUCCESS, "openai", "host", "relative/slide.png"),
         )

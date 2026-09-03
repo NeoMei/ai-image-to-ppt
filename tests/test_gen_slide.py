@@ -9,6 +9,8 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
+ABS_JPEG_OUTPUT = str((ROOT / "test-output" / "slide.jpg").resolve())
+ABS_PNG_OUTPUT = str((ROOT / "test-output" / "slide.png").resolve())
 
 import gen_slide
 from generation_result import GenerationResult, GenerationStatus
@@ -48,7 +50,7 @@ class RouterTests(unittest.TestCase):
                     GenerationStatus.SUCCESS,
                     engine,
                     "api",
-                    output_path="/workspace/slide.jpg",
+                    output_path=ABS_JPEG_OUTPUT,
                 )
                 generate_result = mock.Mock(return_value=provider_result)
                 with mock.patch.object(
@@ -76,7 +78,7 @@ class RouterTests(unittest.TestCase):
             GenerationStatus.SUCCESS,
             "openai",
             "api",
-            output_path="/workspace/slide.jpg",
+            output_path=ABS_JPEG_OUTPUT,
             safe_message="done",
         )
         stdout = io.StringIO()
@@ -216,7 +218,7 @@ class RouterTests(unittest.TestCase):
             GenerationStatus.SUCCESS,
             "openai",
             "api",
-            output_path="/workspace/slide.png",
+            output_path=ABS_PNG_OUTPUT,
         )
         with mock.patch.object(gen_slide, "generate_result", return_value=result) as generate:
             exit_code = gen_slide.main(["slide.png", "prompt", "--force"])
@@ -292,7 +294,7 @@ class RouterTests(unittest.TestCase):
                 GenerationStatus.SUCCESS,
                 "gemini",
                 "api",
-                output_path="/workspace/slide.jpg",
+                output_path=ABS_JPEG_OUTPUT,
             ),
             GenerationResult(
                 GenerationStatus.AUTH_UNAVAILABLE,
@@ -324,7 +326,7 @@ class RouterTests(unittest.TestCase):
             GenerationStatus.SUCCESS,
             "doubao",
             "api",
-            output_path="/workspace/slide.jpg",
+            output_path=ABS_JPEG_OUTPUT,
             safe_message="done",
         )
         stdout = io.StringIO()
@@ -333,7 +335,7 @@ class RouterTests(unittest.TestCase):
             exit_code = gen_slide.main(["slide.jpg", "prompt", "--json"])
         payload = json.loads(stdout.getvalue())
         self.assertEqual(exit_code, 0)
-        self.assertEqual(payload["output_path"], "/workspace/slide.jpg")
+        self.assertEqual(payload["output_path"], ABS_JPEG_OUTPUT)
 
     def test_cli_human_summaries_normalize_untrusted_control_characters(self):
         unsafe_message = "first\nsecond\r\x1b[31mred\x1b[0m\tthird\x85"
@@ -342,7 +344,7 @@ class RouterTests(unittest.TestCase):
                 GenerationStatus.SUCCESS,
                 "openai",
                 "api",
-                output_path="/workspace/slide.jpg",
+                output_path=ABS_JPEG_OUTPUT,
                 safe_message=unsafe_message,
             ),
             GenerationResult(
