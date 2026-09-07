@@ -9,6 +9,12 @@ Create educational 16:9 slide-image decks. Use the host-first route for image
 generation, then use the local scripts for deterministic validation, editable
 input preparation, visual checking, and export.
 
+The static machine-readable capability contract is
+[`references/capabilities.json`](references/capabilities.json). It is
+authoritative for the shipped schema and sub-contract versions, routing order,
+script paths, and output dimensions. A valid manifest describes the packaged
+capability; it does not prove credentials or real-time host/API availability.
+
 ## Image generation routing
 
 Before generating any slide image, read

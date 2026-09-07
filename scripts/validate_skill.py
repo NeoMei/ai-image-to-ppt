@@ -8,6 +8,8 @@ from typing import Tuple
 
 import yaml
 
+from capability_manifest import validate_capability_manifest
+
 MAX_SKILL_NAME_LENGTH = 64
 ALLOWED_PROPERTIES = {
     "name",
@@ -80,6 +82,9 @@ def validate_skill(skill_path: str) -> Tuple[bool, str]:
             r"[ ]{0,3}\[TODO:[^\n]*\][ \t]*", line
         ):
             return False, "Skill instructions contain an unfinished TODO placeholder"
+    manifest_valid, manifest_message = validate_capability_manifest(Path(skill_path))
+    if not manifest_valid:
+        return False, f"Capability manifest invalid: {manifest_message}"
     return True, "Skill is valid!"
 
 

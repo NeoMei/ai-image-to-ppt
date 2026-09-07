@@ -5,3 +5,7 @@ out/
 *_api_key
 .DS_Store
 .worktrees/
+
+# Local Python environment and CodeGraph index
+.venv/
+.codegraph/

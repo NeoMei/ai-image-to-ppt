@@ -11,6 +11,7 @@ TESTS = ROOT / "tests"
 sys.path.insert(0, str(TESTS))
 
 MODULES = (
+    "test_capability_manifest",
     "test_cleanup_output_locks",
     "test_documentation",
     "test_export_directory_sync",

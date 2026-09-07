@@ -48,6 +48,15 @@ class DocumentationTests(unittest.TestCase):
         self.assertIn("references/host-image-routing.md", self.skill)
         self.assertIn("Before generating any slide image, read", self.skill)
 
+    def test_manifest_is_documented_as_static_authority_not_live_availability(self):
+        for document in (self.readme, self.skill):
+            normalized = " ".join(document.split()).lower()
+            self.assertIn("references/capabilities.json", document)
+            self.assertIn("static machine-readable capability contract", normalized)
+            self.assertIn("authoritative", normalized)
+            self.assertIn("credentials", normalized)
+            self.assertIn("real-time host/api availability", normalized)
+
     def test_host_openai_is_the_default_without_a_key_requirement(self):
         skill = " ".join(self.skill.split())
         readme = " ".join(self.readme.split())

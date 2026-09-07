@@ -27,7 +27,10 @@ if ($LASTEXITCODE -ne 0) { throw 'Windows tests failed' }
 ```
 
 The Windows runner must execute the native Windows publication tests. A run
-on macOS that skips those tests is not Windows acceptance. Provider tests
+on macOS that skips those tests is not Windows acceptance. The runner also
+validates the static capability manifest. Its FIFO test is POSIX-only; symbolic-link
+fixtures explicitly skip when Windows denies link-creation privileges. Record
+these skips separately from successful rejection checks. Provider tests
 using fixture HTTP responses prove the adapter/write path, not live access
 to an image-generation service.
 
