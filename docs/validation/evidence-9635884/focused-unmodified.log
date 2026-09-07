@@ -1,0 +1,22 @@
+test_local_file_is_validated_and_published_inside_workspace (test_import_host_image.HostImageImportTests.test_local_file_is_validated_and_published_inside_workspace) ... ERROR
+test_host_pair_rolls_back_after_master_checkpoint_failure (test_windows_image_output.WindowsNativePublicationTests.test_host_pair_rolls_back_after_master_checkpoint_failure) ... ok
+
+======================================================================
+ERROR: test_local_file_is_validated_and_published_inside_workspace (test_import_host_image.HostImageImportTests.test_local_file_is_validated_and_published_inside_workspace)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\MyDocuments\codexprojects\ai-image-to-ppt\.worktrees\windows-9635884\tests\test_import_host_image.py", line 672, in test_local_file_is_validated_and_published_inside_workspace
+    self.assertEqual((root / "out/slide.jpg").read_bytes(), source.read_bytes())
+                     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^
+  File "C:\Python314\Lib\pathlib\__init__.py", line 777, in read_bytes
+    with self.open(mode='rb', buffering=0) as f:
+         ~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Python314\Lib\pathlib\__init__.py", line 771, in open
+    return io.open(self, mode, buffering, encoding, errors, newline)
+           ~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+FileNotFoundError: [Errno 2] No such file or directory: 'C:\\Users\\1\\AppData\\Local\\Temp\\tmpxa38kakh\\out\\slide.jpg'
+
+----------------------------------------------------------------------
+Ran 2 tests in 0.164s
+
+FAILED (errors=1)

@@ -1,0 +1,46 @@
+test_open_directory_closes_handle_when_metadata_query_fails (test_windows_image_output.NativeHandleCleanupTests.test_open_directory_closes_handle_when_metadata_query_fails) ... ok
+test_open_directory_closes_invalid_object_once (test_windows_image_output.NativeHandleCleanupTests.test_open_directory_closes_invalid_object_once) ... ok
+test_open_existing_closes_handle_when_metadata_query_fails (test_windows_image_output.NativeHandleCleanupTests.test_open_existing_closes_handle_when_metadata_query_fails) ... ok
+test_open_existing_closes_invalid_object_once (test_windows_image_output.NativeHandleCleanupTests.test_open_existing_closes_invalid_object_once) ... ok
+test_byte_publication_dispatches_validation_and_identity_contract (test_windows_image_output.WindowsDispatchTests.test_byte_publication_dispatches_validation_and_identity_contract) ... ok
+test_host_snapshot_and_identity_dispatch_to_windows_backend (test_windows_image_output.WindowsDispatchTests.test_host_snapshot_and_identity_dispatch_to_windows_backend) ... ok
+test_preflight_selects_windows_backend_without_posix_primitives (test_windows_image_output.WindowsDispatchTests.test_preflight_selects_windows_backend_without_posix_primitives) ... ok
+test_stream_uses_windows_publication_after_bounded_read (test_windows_image_output.WindowsDispatchTests.test_stream_uses_windows_publication_after_bounded_read) ... ok
+test_all_provider_fixture_responses_publish_through_native_backend (test_windows_image_output.WindowsNativePublicationTests.test_all_provider_fixture_responses_publish_through_native_backend) ... ok
+test_competing_reader_without_delete_share_blocks_then_releases_overwrite (test_windows_image_output.WindowsNativePublicationTests.test_competing_reader_without_delete_share_blocks_then_releases_overwrite) ... ok
+test_concurrent_target_creation_preserves_external_and_old_recovery (test_windows_image_output.WindowsNativePublicationTests.test_concurrent_target_creation_preserves_external_and_old_recovery) ... WARN: recovery=.image-output-recovery-0647384ff8797723d0aeffe1bb090dd5.entry relative-to-target-parent; previous output retained after concurrent target creation; file remains at C:\Users\1\AppData\Local\Temp\tmpu8zyk_i8\.image-output-recovery-0647384ff8797723d0aeffe1bb090dd5.entry: [WinError 183] 当文件已存在时，无法创建该文件。
+ok
+test_controlled_write_failure_preserves_existing_output (test_windows_image_output.WindowsNativePublicationTests.test_controlled_write_failure_preserves_existing_output) ... ok
+test_create_refuse_overwrite_and_explicit_overwrite_unicode (test_windows_image_output.WindowsNativePublicationTests.test_create_refuse_overwrite_and_explicit_overwrite_unicode) ... ok
+test_host_pair_rolls_back_after_master_checkpoint_failure (test_windows_image_output.WindowsNativePublicationTests.test_host_pair_rolls_back_after_master_checkpoint_failure) ... ERROR
+test_identity_removal_refuses_mismatch_then_removes_owned_file (test_windows_image_output.WindowsNativePublicationTests.test_identity_removal_refuses_mismatch_then_removes_owned_file) ... ok
+test_reparse_parent_is_rejected (test_windows_image_output.WindowsNativePublicationTests.test_reparse_parent_is_rejected) ... ok
+test_ambiguous_windows_names_fail_before_native_access (test_windows_image_output.WindowsTransactionStateTests.test_ambiguous_windows_names_fail_before_native_access) ... ok
+test_concurrent_target_creation_preserves_both_external_and_recovery (test_windows_image_output.WindowsTransactionStateTests.test_concurrent_target_creation_preserves_both_external_and_recovery) ... WARN: recovery=.image-output-recovery-738a05f9ad26806ddf415e461364b10d.entry relative-to-target-parent; previous output retained after concurrent target creation; file remains at C:\Users\1\AppData\Local\Temp\tmp9jsuv7ct\.image-output-recovery-738a05f9ad26806ddf415e461364b10d.entry: C:\Users\1\AppData\Local\Temp\tmp9jsuv7ct\slide.png
+ok
+test_overwrite_removes_recovery_after_displaced_handle_closes (test_windows_image_output.WindowsTransactionStateTests.test_overwrite_removes_recovery_after_displaced_handle_closes) ... ok
+test_post_install_failure_removes_owned_output_and_restores_old (test_windows_image_output.WindowsTransactionStateTests.test_post_install_failure_removes_owned_output_and_restores_old) ... ok
+test_preflight_refusal_never_deletes_existing_output (test_windows_image_output.WindowsTransactionStateTests.test_preflight_refusal_never_deletes_existing_output) ... ok
+test_recovery_name_collision_preserves_unowned_file (test_windows_image_output.WindowsTransactionStateTests.test_recovery_name_collision_preserves_unowned_file) ... ok
+test_recovery_never_creates_or_opens_a_recovery_directory (test_windows_image_output.WindowsTransactionStateTests.test_recovery_never_creates_or_opens_a_recovery_directory) ... ok
+test_refusing_overwrite_preserves_existing_output (test_windows_image_output.WindowsTransactionStateTests.test_refusing_overwrite_preserves_existing_output) ... ok
+
+======================================================================
+ERROR: test_host_pair_rolls_back_after_master_checkpoint_failure (test_windows_image_output.WindowsNativePublicationTests.test_host_pair_rolls_back_after_master_checkpoint_failure)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\MyDocuments\codexprojects\ai-image-to-ppt\.worktrees\windows-9635884\tests\test_windows_image_output.py", line 427, in test_host_pair_rolls_back_after_master_checkpoint_failure
+    self.assertEqual(target.read_bytes(), old_master)
+                     ~~~~~~~~~~~~~~~~~^^
+  File "C:\Python314\Lib\pathlib\__init__.py", line 777, in read_bytes
+    with self.open(mode='rb', buffering=0) as f:
+         ~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Python314\Lib\pathlib\__init__.py", line 771, in open
+    return io.open(self, mode, buffering, encoding, errors, newline)
+           ~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+FileNotFoundError: [Errno 2] No such file or directory: 'C:\\Users\\1\\AppData\\Local\\Temp\\tmptwnbsvx6\\out\\slide.png'
+
+----------------------------------------------------------------------
+Ran 24 tests in 0.316s
+
+FAILED (errors=1)
