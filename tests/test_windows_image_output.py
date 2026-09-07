@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 import contextlib
+import ctypes
 from pathlib import Path
 from unittest import mock
 
@@ -332,6 +333,54 @@ class WindowsNativePublicationTests(unittest.TestCase):
         output = io.BytesIO()
         Image.new("RGB", (160, 90), color).save(output, format="PNG")
         return output.getvalue()
+
+    def test_rename_passes_nul_terminated_utf16_path_to_win32(self):
+        native = windows_image_output._api()
+        destinations = (
+            Path("C:/output/a.png"),
+            Path("C:/中文 空格/幻灯片-α.png"),
+            Path("C:/output/slide-🚀-longer-name.png"),
+        )
+        for destination in destinations:
+            with self.subTest(destination=destination):
+                encoded = str(destination).encode("utf-16-le")
+
+                def inspect_buffer(_handle, info_class, buffer, buffer_size):
+                    self.assertEqual(info_class, windows_image_output._FILE_RENAME_INFO_CLASS)
+                    self.assertEqual(buffer_size, len(buffer))
+                    header = native._RenameHeader.from_buffer_copy(buffer)
+                    self.assertFalse(header.replace)
+                    self.assertIsNone(header.root)
+                    self.assertEqual(header.name_length, len(encoded))
+                    offset = native._RenameHeader.name_length.offset + ctypes.sizeof(
+                        native._wintypes.DWORD
+                    )
+                    filename = bytes(buffer)[offset:]
+                    self.assertEqual(filename[:len(encoded)], encoded)
+                    self.assertEqual(filename[len(encoded):len(encoded) + 2], b"\0\0")
+                    return True
+
+                with mock.patch.object(native, "_set_info", side_effect=inspect_buffer):
+                    native.rename(None, destination)
+
+    def test_host_import_keeps_exact_filenames_across_unicode_path_lengths(self):
+        data = self.png_bytes()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            for padding in (0, 1, 2, 7, 15, 31):
+                with self.subTest(padding=padding):
+                    output = root / ("中文 空格-α-🚀" + "x" * padding)
+                    target = output / "slide.png"
+                    result = import_host_image.import_host_artifact(
+                        import_host_image.HostArtifact.inline_bytes(data, "image/png"),
+                        target, root, "openai",
+                    )
+                    self.assertTrue(result.ok, result.to_json())
+                    self.assertEqual(result.output_path, str(target))
+                    self.assertEqual({path.name for path in output.iterdir()}, {"raw", "slide.png"})
+                    self.assertEqual({path.name for path in (output / "raw").iterdir()}, {"slide.png"})
+                    self.assertEqual(target.read_bytes(), data)
+                    self.assertEqual((output / "raw" / "slide.png").read_bytes(), data)
 
     def test_create_refuse_overwrite_and_explicit_overwrite_unicode(self):
         data = self.png_bytes()

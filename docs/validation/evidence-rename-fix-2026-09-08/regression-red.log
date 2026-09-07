@@ -1,0 +1,101 @@
+test_rename_passes_nul_terminated_utf16_path_to_win32 (test_windows_image_output.WindowsNativePublicationTests.test_rename_passes_nul_terminated_utf16_path_to_win32) ...
+  test_rename_passes_nul_terminated_utf16_path_to_win32 (test_windows_image_output.WindowsNativePublicationTests.test_rename_passes_nul_terminated_utf16_path_to_win32) (destination=WindowsPath('C:/output/a.png')) ... FAIL
+  test_rename_passes_nul_terminated_utf16_path_to_win32 (test_windows_image_output.WindowsNativePublicationTests.test_rename_passes_nul_terminated_utf16_path_to_win32) (destination=WindowsPath('C:/中文 空格/幻灯片-α.png')) ... FAIL
+  test_rename_passes_nul_terminated_utf16_path_to_win32 (test_windows_image_output.WindowsNativePublicationTests.test_rename_passes_nul_terminated_utf16_path_to_win32) (destination=WindowsPath('C:/output/slide-🚀-longer-name.png')) ... FAIL
+test_host_import_keeps_exact_filenames_across_unicode_path_lengths (test_windows_image_output.WindowsNativePublicationTests.test_host_import_keeps_exact_filenames_across_unicode_path_lengths) ...
+  test_host_import_keeps_exact_filenames_across_unicode_path_lengths (test_windows_image_output.WindowsNativePublicationTests.test_host_import_keeps_exact_filenames_across_unicode_path_lengths) (padding=0) ... FAIL
+
+======================================================================
+FAIL: test_rename_passes_nul_terminated_utf16_path_to_win32 (test_windows_image_output.WindowsNativePublicationTests.test_rename_passes_nul_terminated_utf16_path_to_win32) (destination=WindowsPath('C:/output/a.png'))
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\MyDocuments\codexprojects\ai-image-to-ppt\tests\test_windows_image_output.py", line 364, in test_rename_passes_nul_terminated_utf16_path_to_win32
+    native.rename(None, destination)
+    ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^
+  File "D:\MyDocuments\codexprojects\ai-image-to-ppt\scripts\windows_image_output.py", line 310, in rename
+    if not self._set_info(
+           ~~~~~~~~~~~~~~^
+        handle, _FILE_RENAME_INFO_CLASS, buffer, len(buffer)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    ):
+    ^
+  File "C:\Python314\Lib\unittest\mock.py", line 1175, in __call__
+    return self._mock_call(*args, **kwargs)
+           ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "C:\Python314\Lib\unittest\mock.py", line 1179, in _mock_call
+    return self._execute_mock_call(*args, **kwargs)
+           ~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "C:\Python314\Lib\unittest\mock.py", line 1240, in _execute_mock_call
+    result = effect(*args, **kwargs)
+  File "D:\MyDocuments\codexprojects\ai-image-to-ppt\tests\test_windows_image_output.py", line 360, in inspect_buffer
+    self.assertEqual(filename[len(encoded):len(encoded) + 2], b"\0\0")
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: b'' != b'\x00\x00'
+
+======================================================================
+FAIL: test_rename_passes_nul_terminated_utf16_path_to_win32 (test_windows_image_output.WindowsNativePublicationTests.test_rename_passes_nul_terminated_utf16_path_to_win32) (destination=WindowsPath('C:/中文 空格/幻灯片-α.png'))
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\MyDocuments\codexprojects\ai-image-to-ppt\tests\test_windows_image_output.py", line 364, in test_rename_passes_nul_terminated_utf16_path_to_win32
+    native.rename(None, destination)
+    ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^
+  File "D:\MyDocuments\codexprojects\ai-image-to-ppt\scripts\windows_image_output.py", line 310, in rename
+    if not self._set_info(
+           ~~~~~~~~~~~~~~^
+        handle, _FILE_RENAME_INFO_CLASS, buffer, len(buffer)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    ):
+    ^
+  File "C:\Python314\Lib\unittest\mock.py", line 1175, in __call__
+    return self._mock_call(*args, **kwargs)
+           ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "C:\Python314\Lib\unittest\mock.py", line 1179, in _mock_call
+    return self._execute_mock_call(*args, **kwargs)
+           ~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "C:\Python314\Lib\unittest\mock.py", line 1240, in _execute_mock_call
+    result = effect(*args, **kwargs)
+  File "D:\MyDocuments\codexprojects\ai-image-to-ppt\tests\test_windows_image_output.py", line 360, in inspect_buffer
+    self.assertEqual(filename[len(encoded):len(encoded) + 2], b"\0\0")
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: b'' != b'\x00\x00'
+
+======================================================================
+FAIL: test_rename_passes_nul_terminated_utf16_path_to_win32 (test_windows_image_output.WindowsNativePublicationTests.test_rename_passes_nul_terminated_utf16_path_to_win32) (destination=WindowsPath('C:/output/slide-🚀-longer-name.png'))
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\MyDocuments\codexprojects\ai-image-to-ppt\tests\test_windows_image_output.py", line 364, in test_rename_passes_nul_terminated_utf16_path_to_win32
+    native.rename(None, destination)
+    ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^
+  File "D:\MyDocuments\codexprojects\ai-image-to-ppt\scripts\windows_image_output.py", line 310, in rename
+    if not self._set_info(
+           ~~~~~~~~~~~~~~^
+        handle, _FILE_RENAME_INFO_CLASS, buffer, len(buffer)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    ):
+    ^
+  File "C:\Python314\Lib\unittest\mock.py", line 1175, in __call__
+    return self._mock_call(*args, **kwargs)
+           ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "C:\Python314\Lib\unittest\mock.py", line 1179, in _mock_call
+    return self._execute_mock_call(*args, **kwargs)
+           ~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "C:\Python314\Lib\unittest\mock.py", line 1240, in _execute_mock_call
+    result = effect(*args, **kwargs)
+  File "D:\MyDocuments\codexprojects\ai-image-to-ppt\tests\test_windows_image_output.py", line 360, in inspect_buffer
+    self.assertEqual(filename[len(encoded):len(encoded) + 2], b"\0\0")
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: b'' != b'\x00\x00'
+
+======================================================================
+FAIL: test_host_import_keeps_exact_filenames_across_unicode_path_lengths (test_windows_image_output.WindowsNativePublicationTests.test_host_import_keeps_exact_filenames_across_unicode_path_lengths) (padding=0)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\MyDocuments\codexprojects\ai-image-to-ppt\tests\test_windows_image_output.py", line 378, in test_host_import_keeps_exact_filenames_across_unicode_path_lengths
+    self.assertTrue(result.ok, result.to_json())
+    ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: False is not true : {"channel": "host", "output_path": null, "provider": "openai", "safe_message": "host artifact could not be published", "status": "local_failure"}
+
+----------------------------------------------------------------------
+Ran 2 tests in 0.251s
+
+FAILED (failures=4)

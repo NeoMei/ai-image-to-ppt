@@ -301,7 +301,12 @@ class _NativeApi:
         offset = self._RenameHeader.name_length.offset + ctypes.sizeof(
             self._wintypes.DWORD
         )
-        buffer = ctypes.create_string_buffer(offset + len(encoded))
+        # Win32 can inspect FileName as a NUL-terminated wide string even
+        # though FileNameLength excludes the terminator. Keep one zero WCHAR
+        # after the encoded path so adjacent memory cannot become its suffix.
+        buffer = ctypes.create_string_buffer(
+            offset + len(encoded) + ctypes.sizeof(self._wintypes.WCHAR)
+        )
         header = self._RenameHeader.from_buffer(buffer)
         header.replace = False
         header.root = None
