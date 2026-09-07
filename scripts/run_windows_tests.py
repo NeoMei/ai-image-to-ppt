@@ -19,6 +19,7 @@ MODULES = (
     "test_generation_result",
     "test_host_routing_e2e",
     "test_host_routing_policy",
+    "test_import_host_image.HostImageImportTests.test_local_file_is_validated_and_published_inside_workspace",
     "test_output_lock_registry",
     "test_prepare_editable_input",
     "test_round10_commit_marker_priority",
@@ -28,6 +29,7 @@ MODULES = (
     "test_round9_recovery_ownership",
     "test_validate_skill",
     "test_vision_check_gemini",
+    "test_windows_image_output",
 )
 
 

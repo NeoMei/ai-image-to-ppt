@@ -136,22 +136,28 @@ Generation refuses existing outputs unless `--force` is explicit. Inputs and
 generated images are capped at 50 MiB and 64 MP; vision inputs have a separate
 14 MiB cap. Export validates input, writes PDF/PPTX with recovery on the next
 export, and accepts at most 128 slides or 512 MiB aggregate source bytes.
-Generation and host import require POSIX secure publication primitives
-(directory-descriptor/no-follow checks, hard links, and same-directory rename);
-unsupported platforms fail closed as `local_failure` instead of weakening
-output ownership checks. Forced replacement first moves the current pathname
-into a private same-directory recovery area and verifies the inode actually
-moved before installing without clobbering; this is not a single-syscall atomic
-replacement. Concurrent unknown files and failed recovery cleanup are retained
-under `.image-output-recovery-*/entry` and reported with a bounded warning.
+Generation and host import use platform-specific secure publication primitives:
+POSIX directory-descriptor/no-follow operations, or Windows native file handles
+with pinned directories and handle-bound rename/deletion. Unsupported native
+operations, unsafe paths, and incompatible open-file sharing fail closed as
+`local_failure` instead of weakening output ownership checks. Windows setup
+and acceptance commands are in [docs/windows-validation.md](docs/windows-validation.md).
+Forced replacement on POSIX moves the current pathname into a private recovery
+area and verifies the inode actually moved; Windows verifies and moves through
+a file handle that denies conflicting writes/deletes, retaining the old file
+at a unique sibling recovery name. Both paths install
+without clobbering; this is not a single-syscall atomic replacement. Concurrent unknown files and failed recovery cleanup are retained
+under `.image-output-recovery-*/entry` on POSIX or a sibling
+`.image-output-recovery-*.entry` file on Windows, with a bounded warning.
 Cooperating processes may race public output names. A same-UID actor that
 deliberately discovers and mutates the private recovery namespace (random and
 mode 0700) between syscalls is outside the portable guarantee because POSIX has
 no unlink-if-inode primitive; treat reported retained paths as sensitive and
 recover them manually.
 Recovery warnings begin with a complete ASCII locator such as
-`recovery=.image-output-recovery-<random>/entry relative-to-target-parent`.
-Resolve it against the known target parent. The locator is never truncated;
+`recovery=.image-output-recovery-<random>/entry relative-to-target-parent`
+on POSIX, or `recovery=.image-output-recovery-<random>.entry relative-to-target-parent`
+on Windows. Resolve it against the known target parent. The locator is never truncated;
 only the following diagnostic detail may be shortened.
 Clearly over-limit manifests are rejected during path preflight, before image
 decoding. If source files change after preflight, actual loaded bytes are

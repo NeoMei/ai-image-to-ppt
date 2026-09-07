@@ -53,11 +53,13 @@ successful import; it is never resized by the master-normalization step.
 
 The host raw/master pair has compensating rollback only for ordinary failures
 while the importer process and both locks remain alive; it is not a crash-atomic
-two-file transaction. Import and API publication require POSIX secure output
-primitives (directory-descriptor/no-follow checks, hard links, and
-same-directory rename). If those ownership-preserving primitives are missing,
-the candidate fails closed as `local_failure`; do not substitute a pathname-only
-write.
+two-file transaction. Import and API publication use platform-specific secure
+output primitives: POSIX directory-descriptor/no-follow checks, hard links and
+same-directory rename, or Windows native file handles with directory pinning
+and handle-bound rename/deletion. Unsupported operations, unsafe paths and
+incompatible file-sharing permissions fail closed as `local_failure`; do not
+substitute a pathname-only write. See [Windows validation](../docs/windows-validation.md)
+for setup and native acceptance commands.
 
 Host artifacts alone may be within a 0.5% relative 16:9 error, evaluated with
 integer cross-products. Exact 16:9 host bytes retain the existing master
@@ -68,18 +70,22 @@ For example, a 1672×941 PNG becomes a 1664×936 PNG master. MIME and actual
 format must still match the requested suffix. The OpenAI, Gemini, and Doubao
 API adapters remain strict 16:9: they do not receive this tolerance or crop.
 Forced generation/import publication is ownership-preserving rather than a
-single-syscall atomic replacement: it atomically isolates the current pathname,
-verifies the inode actually moved, and then installs without clobbering. An
+single-syscall atomic replacement. POSIX isolates the current pathname and
+verifies the inode actually moved; Windows opens and verifies the existing
+file while denying conflicting writes/deletes, then moves it through that
+handle to a unique sibling recovery file. Both paths install the new image without clobbering another file. An
 unexpected file or failed cleanup is retained under
-`.image-output-recovery-*/entry` and reported instead of being deleted.
-Cooperating processes may race public target names. A same-UID actor that
+`.image-output-recovery-*/entry` on POSIX or the sibling file
+`.image-output-recovery-*.entry` on Windows, and reported instead of being deleted.
+Cooperating processes may race public target names. On POSIX, a same-UID actor that
 deliberately discovers and mutates the private recovery namespace (random and
 mode 0700) between syscalls is outside the portable ownership guarantee because
 POSIX has no unlink-if-inode primitive. Treat a reported retained path as
 sensitive and recover it manually.
 Recovery warnings begin with a complete ASCII locator such as
-`recovery=.image-output-recovery-<random>/entry relative-to-target-parent`.
-Resolve it against the known raw or master target parent. It is never truncated;
+`recovery=.image-output-recovery-<random>/entry relative-to-target-parent`
+on POSIX, or `recovery=.image-output-recovery-<random>.entry relative-to-target-parent`
+on Windows. Resolve it against the known raw or master target parent. It is never truncated;
 only the following absolute-path diagnostic may be shortened.
 
 A materialization authorization failure is `auth_unavailable`; an exhausted

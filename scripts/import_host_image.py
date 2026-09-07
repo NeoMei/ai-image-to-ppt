@@ -225,7 +225,10 @@ def _normalize_host_image(data: bytes, target: PreparedTarget) -> bytes:
         raise ImageOutputError("host image could not be encoded after normalization") from error
 
 
-def _identity(path: Path) -> Optional[Tuple[int, int]]:
+def _identity(target: PreparedTarget) -> Optional[Tuple[int, int]]:
+    if image_output._WINDOWS_PUBLICATION_SUPPORTED:
+        return image_output.capture_output_identity(target)
+    path = target.path
     try:
         current = path.lstat()
     except FileNotFoundError:
@@ -240,26 +243,31 @@ def _identity(path: Path) -> Optional[Tuple[int, int]]:
 def _snapshot_output(target: PreparedTarget) -> _OutputSnapshot:
     """Capture an existing bounded output before a two-file host publication."""
     verify_parent_identity(target.parent)
-    identity = _identity(target.path)
+    identity = _identity(target)
     if target.expectation_captured and identity != target.expected_identity:
         raise ImageOutputError("transaction output identity changed after preflight")
     if identity is None:
         return _OutputSnapshot(target, None, None)
     descriptor = None
     try:
-        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-        descriptor = os.open(str(target.path), flags)
-        opened = os.fstat(descriptor)
-        if (
-            not stat.S_ISREG(opened.st_mode)
-            or (opened.st_dev, opened.st_ino) != identity
-        ):
-            raise ImageOutputError("transaction output identity changed before reading")
-        with os.fdopen(os.dup(descriptor), "rb") as stream:
-            data = read_bounded_image_stream(stream)
-        after = os.fstat(descriptor)
-        if (after.st_dev, after.st_ino) != identity:
-            raise ImageOutputError("transaction output identity changed during reading")
+        if image_output._WINDOWS_PUBLICATION_SUPPORTED:
+            data, opened_identity = image_output.snapshot_output_bytes(target)
+            if opened_identity != identity or data is None:
+                raise ImageOutputError("transaction output identity changed while reading")
+        else:
+            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(str(target.path), flags)
+            opened = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or (opened.st_dev, opened.st_ino) != identity
+            ):
+                raise ImageOutputError("transaction output identity changed before reading")
+            with os.fdopen(os.dup(descriptor), "rb") as stream:
+                data = read_bounded_image_stream(stream)
+            after = os.fstat(descriptor)
+            if (after.st_dev, after.st_ino) != identity:
+                raise ImageOutputError("transaction output identity changed during reading")
     except (
         ImageOutputError,
         OSError,
@@ -275,7 +283,7 @@ def _snapshot_output(target: PreparedTarget) -> _OutputSnapshot:
             except OSError:
                 pass
     verify_parent_identity(target.parent)
-    if _identity(target.path) != identity:
+    if _identity(target) != identity:
         raise ImageOutputError("transaction output identity changed before publication")
     return _OutputSnapshot(target, data, identity)
 
@@ -291,7 +299,7 @@ def _restore_snapshot(
     snapshot: _OutputSnapshot,
 ) -> None:
     """Compensate a failed two-file publication while both target locks hold."""
-    current_identity = _identity(snapshot.target.path)
+    current_identity = _identity(snapshot.target)
     if current_identity == snapshot.original_identity:
         return
     if snapshot.published_was_removed:
@@ -316,7 +324,7 @@ def _restore_snapshot(
         _remove_owned_output(snapshot.target, expected_identity)
         return
 
-    if _identity(snapshot.target.path) != expected_identity:
+    if _identity(snapshot.target) != expected_identity:
         raise ImageOutputError("transaction output identity changed during rollback")
     image_output.publish_opaque_bytes_with_identity(
         snapshot.original_bytes,

@@ -68,6 +68,18 @@ _SECURE_PUBLICATION_SUPPORTED = (
     and os.stat in getattr(os, "supports_follow_symlinks", set())
     and os.link in getattr(os, "supports_follow_symlinks", set())
 )
+_WINDOWS_PUBLICATION_SUPPORTED = os.name == "nt"
+
+
+def _windows_backend():
+    """Load the Win32 implementation only on the platform that can use it."""
+    try:
+        import windows_image_output
+    except (ImportError, OSError) as error:
+        raise ImageOutputError(
+            f"secure Windows output publication is unavailable: {error}"
+        ) from error
+    return windows_image_output
 
 
 class ImageOutputError(ValueError):
@@ -192,7 +204,7 @@ def require_secure_publication_primitives() -> None:
     no-follow metadata checks, hard links, and same-directory rename. A weaker
     pathname-only fallback would lose the documented ownership guarantees.
     """
-    if not _SECURE_PUBLICATION_SUPPORTED:
+    if not (_SECURE_PUBLICATION_SUPPORTED or _WINDOWS_PUBLICATION_SUPPORTED):
         raise ImageOutputError(
             "secure output publication primitives are unavailable on this platform"
         )
@@ -781,6 +793,8 @@ def preflight_output(
 ) -> PreparedTarget:
     if not isinstance(overwrite, bool):
         raise ImageOutputError("overwrite must be a boolean")
+    if _WINDOWS_PUBLICATION_SUPPORTED:
+        return _windows_backend().preflight_output(_as_prepared_target(out_path), overwrite)
 
     probe_path = None
     try:
@@ -880,6 +894,56 @@ def _capture_target_identity(prepared: PreparedTarget) -> Optional[Tuple[int, in
                 pass
     verify_parent_identity(prepared.parent)
     return identity
+
+
+def capture_output_identity(target: TargetValue) -> Optional[Tuple[int, int]]:
+    """Capture a no-follow regular-file identity using the active backend."""
+    prepared = _as_prepared_target(target)
+    if _WINDOWS_PUBLICATION_SUPPORTED:
+        return _windows_backend().capture_identity(prepared)
+    return _capture_target_identity(prepared)
+
+
+def snapshot_output_bytes(
+    target: TargetValue,
+) -> Tuple[Optional[bytes], Optional[Tuple[int, int]]]:
+    """Read an existing output while preserving its backend identity contract."""
+    prepared = _as_prepared_target(target)
+    if _WINDOWS_PUBLICATION_SUPPORTED:
+        return _windows_backend().snapshot_output(prepared)
+    identity = _capture_target_identity(prepared)
+    if identity is None:
+        return None, None
+    descriptor = None
+    try:
+        descriptor = os.open(
+            str(prepared.path), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        )
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or (opened.st_dev, opened.st_ino) != identity
+        ):
+            raise ImageOutputError("output identity changed before reading")
+        with os.fdopen(os.dup(descriptor), "rb") as stream:
+            data = read_bounded_image_stream(stream)
+        after = os.fstat(descriptor)
+        if (after.st_dev, after.st_ino) != identity:
+            raise ImageOutputError("output identity changed during reading")
+        verify_parent_identity(prepared.parent)
+        if _capture_target_identity(prepared) != identity:
+            raise ImageOutputError("output identity changed before publication")
+        return data, identity
+    except ImageOutputError:
+        raise
+    except (OSError, ValueError, TypeError, NotImplementedError) as error:
+        raise ImageOutputError("could not snapshot transaction output") from error
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
 
 
 def _verify_temporary_identity(temporary: TemporaryOutput) -> None:
@@ -1474,9 +1538,12 @@ def remove_output_with_identity(
     expected_existing_identity: tuple,
 ) -> None:
     """Remove only the inode displaced from ``target`` at the rename boundary."""
-    require_secure_publication_primitives()
     prepared = _as_prepared_target(target)
     expected = _validate_expected_existing_identity(expected_existing_identity)
+    if _WINDOWS_PUBLICATION_SUPPORTED:
+        _windows_backend().remove_output_with_identity(prepared, expected)
+        return
+    require_secure_publication_primitives()
     parent_fd = None
     quarantined = None
     try:
@@ -1723,6 +1790,8 @@ def _publish_image_bytes(
         )
     elif not prepared.expectation_captured:
         prepared = preflight_output(prepared, overwrite=overwrite)
+    if _WINDOWS_PUBLICATION_SUPPORTED:
+        return _windows_backend().publish_bytes(data, prepared, overwrite, validator)
     temporary = _temporary_path(prepared)
     published = False
     try:
@@ -1875,6 +1944,25 @@ def publish_stream(
     prepared = _as_prepared_target(target)
     if not prepared.expectation_captured:
         prepared = preflight_output(prepared, overwrite=overwrite)
+    if _WINDOWS_PUBLICATION_SUPPORTED:
+        data = bytearray()
+        while True:
+            try:
+                chunk = response.read(64 * 1024)
+            except (OSError, http.client.HTTPException) as error:
+                raise ImageStreamError(f"image download failed: {error}") from error
+            if not chunk:
+                break
+            if not isinstance(chunk, bytes):
+                raise ImageOutputError("download returned non-byte image data")
+            data.extend(chunk)
+            if len(data) > max_bytes:
+                raise ImageOutputError(
+                    f"download exceeds maximum image size of {max_bytes} bytes"
+                )
+        return _publish_image_bytes(
+            bytes(data), prepared, overwrite, validate_image_bytes
+        ).byte_count
     temporary = _temporary_path(prepared)
     published = False
     try:

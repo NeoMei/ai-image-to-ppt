@@ -69,30 +69,39 @@ near-16:9 image within a 0.5% integer cross-product tolerance, center-crop it
 (never stretch it) to the largest strict 16:9 master, and strictly revalidate
 the encoded master. API adapters never receive that tolerance or crop. Existing
 outputs are protected unless `--force` is explicit. API single-image outputs
-use conditional, ownership-preserving publication: an existing target is first
-atomically displaced into a private same-directory recovery area and the inode
-actually moved must match locked preflight before the new image is installed
-without clobbering. This is not a single-syscall atomic replacement; the target
+use conditional, ownership-preserving publication. On POSIX, an existing target
+is first atomically displaced into a private same-directory recovery area and
+the inode actually moved must match locked preflight. On Windows, the existing
+file is opened with conflicting writes/deletes denied, its identity is checked,
+and it is moved through that handle to a unique sibling recovery file. Both paths install the new
+image without clobbering another file. This is not a single-syscall atomic replacement; the target
 name can be briefly absent. An unexpected concurrent file is restored without
 clobbering when possible, otherwise it is retained at the reported recovery
 path. Recovery cleanup failures likewise retain the isolated file and warn.
 The paired host raw/master publication uses process-time compensating rollback
 while both output locks are held; it is not a crash-atomic two-file commit.
 Only deck export has an export journal for recovery after interruption. These
-generation/import paths require POSIX secure publication primitives:
-directory-descriptor and no-follow checks, hard links, and same-directory
-rename. Platforms without those primitives fail closed with `local_failure`;
-no weaker pathname-only publication is attempted. Image inputs and generation
+generation/import paths select platform-specific secure publication primitives.
+POSIX uses directory-descriptor and no-follow checks, hard links, and
+same-directory rename. Windows uses native file handles, pinned directories,
+and handle-bound non-replacing rename/deletion. Unsupported native operations,
+unsafe paths, or incompatible open-file sharing fail closed with `local_failure`;
+no weaker pathname-only publication is attempted. The Windows backend accepts
+absolute drive-letter paths; UNC paths, unresolved reparse points and ambiguous
+Windows names (including alternate data streams and reserved device names)
+are rejected. Image inputs and generation
 outputs are capped at 50 MiB and 64 MP. Vision-check inputs have a separate
 14 MiB limit. Transient provider retries honor bounded `Retry-After` guidance.
 Parent-directory replacement is detected before publication and fails closed.
-Cooperating processes may race public target names, but a same-UID actor that
+Cooperating processes may race public target names. On POSIX, a same-UID actor that
 deliberately discovers and mutates the private recovery namespace (random and
 mode 0700) between syscalls is outside the portable ownership guarantee; POSIX
 has no unlink-if-inode primitive. Treat every reported retained recovery path
 as sensitive and recover it manually before removing that directory.
-Recovery warnings begin with a complete ASCII locator such as
-`recovery=.image-output-recovery-<random>/entry relative-to-target-parent`.
+Recovery warnings begin with a complete ASCII locator. POSIX uses
+`recovery=.image-output-recovery-<random>/entry relative-to-target-parent`;
+Windows uses a sibling file named
+`recovery=.image-output-recovery-<random>.entry relative-to-target-parent`.
 Resolve it against the known target parent; this locator is never truncated,
 even when the following absolute-path diagnostic is shortened.
 
@@ -144,14 +153,19 @@ python3 scripts/validate_skill.py .
 python3 -m unittest discover -s tests -v
 ```
 
-On Windows, generation and host-image import intentionally fail closed because
-the required POSIX publication primitives are unavailable. Run the supported
-Windows surface (including export, editable-input preparation, routing,
-recovery, validation, and vision checks) with:
+On Windows, generation and host-image import use a separate native publication
+backend. Existing files opened by another program with incompatible sharing
+permissions are not forcibly replaced. Run the Windows surface, including
+native publication and provider/import integration tests, with:
 
 ```powershell
 python scripts/run_windows_tests.py
 ```
+
+See [Windows validation](docs/windows-validation.md) for PowerShell setup,
+a reproducible local artifact flow, failure/recovery checks, and evidence to
+record. Native Windows tests are skipped on other platforms; a passing macOS
+run is not Windows acceptance.
 
 ## License
 
