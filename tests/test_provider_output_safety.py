@@ -223,8 +223,8 @@ class GeminiContractTests(unittest.TestCase):
         self.assertEqual(
             body["generationConfig"]["responseFormat"]["image"],
             {
-                "aspectRatio": "16:9",
-                "imageSize": "2K",
+                "aspectRatio": "ASPECT_RATIO_SIXTEEN_BY_NINE",
+                "imageSize": "IMAGE_SIZE_TWO_K",
                 "mimeType": "IMAGE_JPEG",
             },
         )

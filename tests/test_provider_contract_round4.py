@@ -262,7 +262,10 @@ class GeminiOutputContractTests(unittest.TestCase):
         ]["image"]
         self.assertEqual(
             image_config,
-            {"aspectRatio": "16:9", "imageSize": "2K"},
+            {
+                "aspectRatio": "ASPECT_RATIO_SIXTEEN_BY_NINE",
+                "imageSize": "IMAGE_SIZE_TWO_K",
+            },
         )
 
     def test_jpeg_target_requests_official_jpeg_mime_and_publishes_jpeg(self):

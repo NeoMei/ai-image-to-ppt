@@ -69,7 +69,11 @@ def _load_api_key() -> str:
 
 def _output_config(out_path: str):
     extension = Path(out_path).suffix.lower()
-    image_config = {"aspectRatio": "16:9", "imageSize": "2K"}
+    # responseFormat.image uses enums, unlike imageConfig's short string values.
+    image_config = {
+        "aspectRatio": "ASPECT_RATIO_SIXTEEN_BY_NINE",
+        "imageSize": "IMAGE_SIZE_TWO_K",
+    }
     if extension == ".png":
         return "image/png", image_config
     if extension in {".jpg", ".jpeg"}:
