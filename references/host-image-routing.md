@@ -137,3 +137,14 @@ python3 scripts/prepare_editable_input.py \
 Do not overwrite the master or raw artifact. The host importer is the only
 place that can center-crop a qualifying near-16:9 host artifact; this handoff
 accepts the resulting strict 16:9 master and never stretches it.
+
+### Required visual references
+
+Before a generation attempt, check the actual host tool or API manifest for
+reference-image support. A candidate that cannot carry the required images is
+`unavailable` without a model request; retain the same images for the next
+candidate. The current API adapter supports Doubao via repeatable
+`gen_slide.py --reference-image <local-file>`. OpenAI/Gemini API adapters do not
+yet support references and must never silently run text-only instead. If no
+candidate supports the reference contract, stop. This does not alter refusal,
+invalid-input, retry budget, or serial-sticky rules.

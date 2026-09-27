@@ -81,6 +81,37 @@ from gen_slide import gen
 gen("<prompt>", "out/slide_01.png", engine="gemini")
 ```
 
+## Doubao model and text fidelity
+
+The API defaults to `doubao-seedream-5-0-pro-260628`, with PNG or JPEG output. Explicit
+`DOUBAO_IMAGE_MODEL` overrides remain supported; never silently switch to Lite
+when Pro is unavailable. Pro and Flash do not accept group-generation options.
+A successful API result only proves a valid image file, not correct text.
+Inspect Chinese text against the approved copy, including repetition, omitted
+phrases and title/body association. Keep the caller's exact approved prompt;
+do not silently summarize it in the adapter. If a revised prompt is needed,
+prepare it upstream, retain every visible phrase, and disclose it before its
+normal generation approval. Prefer concise design directions and explicit
+text groupings over repeated prohibitions. Do not promise zero text errors.
+
+## Reference images
+
+When a caller locks a visual reference, keep it attached through fallback.
+Check `references/capabilities.json` before spending a call. The shipped API
+reference adapter currently supports Doubao; unsupported API adapters return
+`unavailable` with zero generation requests. Host reference support depends on
+its actual callable tool. Continue the normal candidate order, never silently
+remove references. If no candidate can preserve them, stop and report it.
+
+Use `gen_slide.py --engine doubao --retries 0 --json` with repeatable
+`--reference-image /absolute/path/to/verified.png`. The adapter validates local
+PNG/JPEG/WebP inputs and sends their bytes as data URLs in Ark's `image` field.
+The caller owns URL download/integrity checks and discloses reference use.
+Keep style references distinct from content references in the prompt: transfer
+materials, lighting, typography and palette; do not copy unrelated wording,
+object counts or layout. Preserve the caller's exact prompt and default-style
+opt-out. Never print image Base64 data in diagnostics.
+
 ## Prompt style
 
 Append this style block to visual prompts unless the user asks for another

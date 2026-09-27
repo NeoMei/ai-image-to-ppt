@@ -22,10 +22,11 @@ from image_output import (
 from output_lock import OutputLockError, output_lock
 from provider_credentials import APIKeyError, load_api_key, validate_api_key
 from retry_delay import retry_delay
+from reference_images import encode_reference_images
 
 SECRET_PATH = Path("~/.secrets/doubao_api_key").expanduser()
 URL = "https://ark.cn-beijing.volces.com/api/v3/images/generations"
-MODEL = "doubao-seedream-5-0-260128"
+MODEL = "doubao-seedream-5-0-pro-260628"
 SIZE = "2560x1440"
 DOWNLOAD_TIMEOUT = 120
 DOUBAO_POLICY_CODES = frozenset({"content_filter", "content_policy_violation", "input_text_risk", "output_image_risk"})
@@ -159,7 +160,7 @@ def _download_image_result(image_url: str, target: PreparedTarget, retries: int,
     return _download_with_retries(image_url, target, retries, overwrite, key, progress)
 
 
-def _gen_owned(prompt: str, target: PreparedTarget, retries: int = 2, overwrite: bool = False, progress: Optional[Callable[[str], None]] = None) -> GenerationResult:
+def _gen_owned(prompt: str, target: PreparedTarget, retries: int = 2, overwrite: bool = False, progress: Optional[Callable[[str], None]] = None, reference_images=None) -> GenerationResult:
     """Generate while the caller owns a prepared output lock."""
     try:
         requested_format = output_format(str(target))
@@ -177,11 +178,18 @@ def _gen_owned(prompt: str, target: PreparedTarget, retries: int = 2, overwrite:
     except APIKeyError as error:
         return _result(GenerationStatus.AUTH_UNAVAILABLE, f"Doubao API key is invalid: {error}", secrets=secrets)
 
-    body = json.dumps({
-        "model": os.environ.get("DOUBAO_IMAGE_MODEL", MODEL), "prompt": prompt,
+    model = os.environ.get("DOUBAO_IMAGE_MODEL", MODEL).strip() or MODEL
+    payload = {
+        "model": model, "prompt": prompt,
         "size": SIZE, "response_format": "url", "output_format": requested_format,
-        "watermark": False, "sequential_image_generation": "disabled",
-    }).encode("utf-8")
+        "watermark": False,
+    }
+    # Pro/Flash only generate a single image and reject group-generation options.
+    if not model.startswith(("doubao-seedream-5-0-pro-", "doubao-seedream-5-0-flash-")):
+        payload["sequential_image_generation"] = "disabled"
+    if reference_images:
+        payload["image"] = reference_images
+    body = json.dumps(payload).encode("utf-8")
     for attempt in range(retries + 1):
         request = urllib.request.Request(URL, data=body, headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"})
         try:
@@ -215,20 +223,22 @@ def _gen_owned(prompt: str, target: PreparedTarget, retries: int = 2, overwrite:
     return _result(GenerationStatus.RETRYABLE_EXHAUSTED, "request retries exhausted", secrets=secrets)
 
 
-def _generate_result_with_lock(prompt: str, out_path: str, retries: int, overwrite: bool, progress: Optional[Callable[[str], None]]) -> GenerationResult:
+def _generate_result_with_lock(prompt: str, out_path: str, retries: int, overwrite: bool, progress: Optional[Callable[[str], None]], reference_images=None) -> GenerationResult:
     try:
+        encoded_references = encode_reference_images(reference_images)
         retries = validate_retries(retries)
         if not isinstance(prompt, str) or not prompt.strip():
             raise ImageOutputError("prompt must be non-empty text")
         if not isinstance(overwrite, bool):
             raise ImageOutputError("overwrite must be a boolean")
-        output_format(out_path)
-    except (ImageOutputError, TypeError, ValueError):
+        if output_format(out_path) not in ('png', 'jpeg'):
+            raise ImageOutputError('Doubao output must be PNG or JPEG')
+    except (ImageOutputError, TypeError, ValueError, OSError):
         return _result(GenerationStatus.INVALID_INPUT, "invalid generation arguments")
     try:
         target = prepare_target(resolve_output_path(out_path))
         with output_lock(prepared_lock_target(target)):
-            result = _gen_owned(prompt, target, retries, overwrite, progress)
+            result = _gen_owned(prompt, target, retries, overwrite, progress, **({"reference_images": encoded_references} if encoded_references else {}))
     except (
         ImageOutputError,
         OutputLockError,
@@ -243,8 +253,8 @@ def _generate_result_with_lock(prompt: str, out_path: str, retries: int, overwri
     return result
 
 
-def generate_result(prompt: str, out_path: str, retries: int = 2, overwrite: bool = False, progress: Optional[Callable[[str], None]] = None) -> GenerationResult:
-    return _generate_result_with_lock(prompt, out_path, retries, overwrite, progress)
+def generate_result(prompt: str, out_path: str, retries: int = 2, overwrite: bool = False, progress: Optional[Callable[[str], None]] = None, reference_images=None) -> GenerationResult:
+    return _generate_result_with_lock(prompt, out_path, retries, overwrite, progress, reference_images)
 
 
 def gen(prompt: str, out_path: str, retries: int = 2, overwrite: bool = False) -> bool:
@@ -258,7 +268,7 @@ def gen(prompt: str, out_path: str, retries: int = 2, overwrite: bool = False) -
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("output_path", help="Output .jpg, .jpeg, .png, or .webp")
+    parser.add_argument("output_path", help="Output .jpg, .jpeg, or .png")
     parser.add_argument("prompt", help="Slide image prompt")
     parser.add_argument(
         "--force",

@@ -20,6 +20,12 @@ from capability_manifest import (
 
 
 EXPECTED_MANIFEST = {
+    "referenceImages": {
+        "schemaVersion": 1, "apiProviders": ["doubao"], "cliOption": "--reference-image",
+        "input": "local-file", "maxImages": 10, "maxBytesPerImage": 10485760,
+        "maxTotalBytes": 31457280, "formats": ["png", "jpeg", "webp"],
+        "unsupported": "unavailable; never drop references",
+    },
     "schemaVersion": 1,
     "skill": "ai-image-to-ppt",
     "contracts": {
@@ -41,7 +47,7 @@ EXPECTED_MANIFEST = {
         {
             "provider": "doubao",
             "channel": "api",
-            "defaultModel": "doubao-seedream-5-0-260128",
+            "defaultModel": "doubao-seedream-5-0-pro-260628",
         },
     ],
     "outputs": {
@@ -65,6 +71,7 @@ def write_skill_fixture(root: Path) -> None:
         script = root / relative_path
         script.parent.mkdir(parents=True, exist_ok=True)
         script.write_text("# fixture\n", encoding="utf-8")
+    (root / "scripts/reference_images.py").write_text("# fixture\n", encoding="utf-8")
     write_manifest(root, EXPECTED_MANIFEST)
 
 
@@ -83,6 +90,19 @@ class CapabilityManifestTests(unittest.TestCase):
             if getattr(error, "winerror", None) == 1314:
                 self.skipTest("Windows symbolic-link creation privilege is unavailable")
             raise
+
+    def test_reference_capability_is_optional_for_old_manifests_and_strict_when_present(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            write_skill_fixture(root)
+            manifest = copy.deepcopy(EXPECTED_MANIFEST)
+            manifest.pop("referenceImages")
+            write_manifest(root, manifest)
+            self.assertTrue(validate_capability_manifest(root)[0])
+            for bad in [{}, {**EXPECTED_MANIFEST["referenceImages"], "maxImages": True}, {**EXPECTED_MANIFEST["referenceImages"], "apiProviders": ["openai"]}]:
+                manifest["referenceImages"] = bad
+                write_manifest(root, manifest)
+                self.assertFalse(validate_capability_manifest(root)[0])
 
     def test_published_capability_manifest_is_valid(self):
         valid, message = validate_capability_manifest(REPOSITORY_ROOT)

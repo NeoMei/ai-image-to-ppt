@@ -65,8 +65,7 @@ python3 scripts/gen_slide.py out/slide_01.jpg "<prompt>" --engine doubao
 OpenAI uses `gpt-image-2` at 2048×1152/medium by default. Gemini uses
 `gemini-3.1-flash-image`, targets 16:9 2K, and uses PNG by default; the optional
 vision check uses `gemini-3.6-flash`. Doubao uses the current
-`doubao-seedream-5-0-260128` default model. OpenAI and Doubao accept `.jpg`, `.jpeg`,
-`.png`, and `.webp`; Gemini accepts `.png`, `.jpg`, and `.jpeg`.
+`doubao-seedream-5-0-pro-260628` default model. Set `DOUBAO_IMAGE_MODEL` explicitly to override it (for example the older Lite `doubao-seedream-5-0-260128`); the adapter never silently downgrades Pro. Pro/Flash omit the unsupported group-generation parameter. OpenAI accepts `.jpg`, `.jpeg`, `.png`, and `.webp`; Gemini and Doubao accept `.png`, `.jpg`, and `.jpeg`.
 
 All API sources are decoded and checked for actual format and strict 16:9 before
 publication. A host artifact is first retained unchanged at the absolute

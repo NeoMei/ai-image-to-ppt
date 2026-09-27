@@ -116,7 +116,7 @@ class DocumentationTests(unittest.TestCase):
     def test_readme_keeps_provider_and_safety_recovery_boundaries(self):
         normalized = " ".join(self.readme.split())
         for expected in (
-            "`doubao-seedream-5-0-260128`",
+            "`doubao-seedream-5-0-pro-260628`",
             "14 MiB",
             "bounded `Retry-After`",
             "Parent-directory replacement",
