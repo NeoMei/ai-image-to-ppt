@@ -35,7 +35,8 @@ deterministic batch state; the Skill retains host discovery and host-tool calls.
 - The host importer preserves an absolute workspace raw copy under
   `raw/<filename>`. Only host artifacts within the 0.5% integer-checked
   near-16:9 tolerance may be center-cropped (never stretched) into a strict
-  16:9 master; API outputs remain strict 16:9 without this exception.
+  16:9 master. API masters also pass exact 16:9 validation. Gemini's 2752×1536
+  2K preset is padded to 2752×1548 before validation.
 - Keep generated masters. Create exact `1280×720 PNG` files only for the
   editable-converter handoff.
 
@@ -81,11 +82,11 @@ from gen_slide import gen
 gen("<prompt>", "out/slide_01.png", engine="gemini")
 ```
 
-## Doubao model and text fidelity
+## API models and text fidelity
 
-The API defaults to `doubao-seedream-5-0-pro-260628`, with PNG or JPEG output. Explicit
-`DOUBAO_IMAGE_MODEL` overrides remain supported; never silently switch to Lite
-when Pro is unavailable. Pro and Flash do not accept group-generation options.
+Read the API default model IDs in the capability manifest and the parameter
+table in README. Explicit model overrides use the provider's environment variable.
+If the selected model is unavailable, follow the declared routing order.
 A successful API result only proves a valid image file, not correct text.
 Inspect Chinese text against the approved copy, including repetition, omitted
 phrases and title/body association. Keep the caller's exact approved prompt;
@@ -97,15 +98,15 @@ text groupings over repeated prohibitions. Do not promise zero text errors.
 ## Reference images
 
 When a caller locks a visual reference, keep it attached through fallback.
-Check `references/capabilities.json` before spending a call. The shipped API
-reference adapter currently supports Doubao; unsupported API adapters return
-`unavailable` with zero generation requests. Host reference support depends on
-its actual callable tool. Continue the normal candidate order, never silently
-remove references. If no candidate can preserve them, stop and report it.
+Check `referenceImages.apiProviders` in `references/capabilities.json` before
+spending a call. Host reference support depends on its actual callable tool.
+Skip unsupported candidates along the normal candidate order. If no candidate
+can preserve the reference images, stop and report it.
 
-Use `gen_slide.py --engine doubao --retries 0 --json` with repeatable
-`--reference-image /absolute/path/to/verified.png`. The adapter validates local
-PNG/JPEG/WebP inputs and sends their bytes as data URLs in Ark's `image` field.
+Use `gen_slide.py --engine <provider> --retries 0 --json` with repeatable
+`--reference-image /absolute/path/to/verified.png` for each supported API route.
+Adapters validate local PNG/JPEG/WebP files and send their bytes in the provider's
+supported reference field or multipart input.
 The caller owns URL download/integrity checks and discloses reference use.
 Keep style references distinct from content references in the prompt: transfer
 materials, lighting, typography and palette; do not copy unrelated wording,

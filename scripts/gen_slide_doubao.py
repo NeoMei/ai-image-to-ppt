@@ -22,11 +22,11 @@ from image_output import (
 from output_lock import OutputLockError, output_lock
 from provider_credentials import APIKeyError, load_api_key, validate_api_key
 from retry_delay import retry_delay
-from reference_images import encode_reference_images
+from reference_images import read_reference_images
 
 SECRET_PATH = Path("~/.secrets/doubao_api_key").expanduser()
 URL = "https://ark.cn-beijing.volces.com/api/v3/images/generations"
-MODEL = "doubao-seedream-5-0-pro-260628"
+MODEL = "doubao-seedream-5-5-261028"
 SIZE = "2560x1440"
 DOWNLOAD_TIMEOUT = 120
 DOUBAO_POLICY_CODES = frozenset({"content_filter", "content_policy_violation", "input_text_risk", "output_image_risk"})
@@ -95,9 +95,12 @@ def _extract_image_url(payload: object) -> str:
     return image_url
 
 
-def _remote_http_result(error: urllib.error.HTTPError, key: str) -> tuple[GenerationStatus, str]:
+def _remote_http_result(error: urllib.error.HTTPError, key: str, *, generating: bool = False) -> tuple[GenerationStatus, str]:
     error_code, message = _error_details(error, key)
-    status = classify_http_failure(error.code, error_code, DOUBAO_POLICY_CODES, DOUBAO_RETRYABLE_CODES)
+    status = classify_http_failure(
+        error.code, error_code, DOUBAO_POLICY_CODES, DOUBAO_RETRYABLE_CODES,
+        unavailable_codes={"invalidendpointormodel.notfound"} if generating else frozenset(),
+    )
     if status is GenerationStatus.AUTH_UNAVAILABLE:
         message = f"authentication failed; check DOUBAO_API_KEY; provider says: {message}"
     return status, message
@@ -184,8 +187,9 @@ def _gen_owned(prompt: str, target: PreparedTarget, retries: int = 2, overwrite:
         "size": SIZE, "response_format": "url", "output_format": requested_format,
         "watermark": False,
     }
-    # Pro/Flash only generate a single image and reject group-generation options.
-    if not model.startswith(("doubao-seedream-5-0-pro-", "doubao-seedream-5-0-flash-")):
+    # Only the older group-capable models accept this parameter. Ark endpoints
+    # hide the underlying model ID, and single-image output is already the default.
+    if model.startswith("doubao-seedream-4-0-") or model == "doubao-seedream-5-0-260128":
         payload["sequential_image_generation"] = "disabled"
     if reference_images:
         payload["image"] = reference_images
@@ -196,7 +200,7 @@ def _gen_owned(prompt: str, target: PreparedTarget, retries: int = 2, overwrite:
             with urllib.request.urlopen(request, timeout=180) as response:
                 raw_response = read_response_body(response)
         except urllib.error.HTTPError as error:
-            status, message = _remote_http_result(error, key)
+            status, message = _remote_http_result(error, key, generating=True)
             if status is GenerationStatus.RETRYABLE_EXHAUSTED and (error.code == 429 or error.code >= 500) and attempt < retries:
                 if progress is not None:
                     progress(f"  HTTP {error.code}: {message} (attempt {attempt + 1})")
@@ -225,7 +229,7 @@ def _gen_owned(prompt: str, target: PreparedTarget, retries: int = 2, overwrite:
 
 def _generate_result_with_lock(prompt: str, out_path: str, retries: int, overwrite: bool, progress: Optional[Callable[[str], None]], reference_images=None) -> GenerationResult:
     try:
-        encoded_references = encode_reference_images(reference_images)
+        encoded_references = [image.data_url() for image in read_reference_images(reference_images)]
         retries = validate_retries(retries)
         if not isinstance(prompt, str) or not prompt.strip():
             raise ImageOutputError("prompt must be non-empty text")

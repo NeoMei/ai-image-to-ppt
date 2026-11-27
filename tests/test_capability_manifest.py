@@ -21,7 +21,7 @@ from capability_manifest import (
 
 EXPECTED_MANIFEST = {
     "referenceImages": {
-        "schemaVersion": 1, "apiProviders": ["doubao"], "cliOption": "--reference-image",
+        "schemaVersion": 1, "apiProviders": ["openai", "gemini", "doubao"], "cliOption": "--reference-image",
         "input": "local-file", "maxImages": 10, "maxBytesPerImage": 10485760,
         "maxTotalBytes": 31457280, "formats": ["png", "jpeg", "webp"],
         "unsupported": "unavailable; never drop references",
@@ -36,18 +36,18 @@ EXPECTED_MANIFEST = {
     },
     "routingOrder": [
         {"provider": "openai", "channel": "host", "modelSelection": "host-owned"},
-        {"provider": "openai", "channel": "api", "defaultModel": "gpt-image-2"},
+        {"provider": "openai", "channel": "api", "defaultModel": "gpt-image-2.6-sunburst"},
         {"provider": "gemini", "channel": "host", "modelSelection": "host-owned"},
         {
             "provider": "gemini",
             "channel": "api",
-            "defaultModel": "gemini-3.1-flash-image",
+            "defaultModel": "gemini-nano-banana-2.1",
         },
         {"provider": "doubao", "channel": "host", "modelSelection": "host-owned"},
         {
             "provider": "doubao",
             "channel": "api",
-            "defaultModel": "doubao-seedream-5-0-pro-260628",
+            "defaultModel": "doubao-seedream-5-5-261028",
         },
     ],
     "outputs": {

@@ -394,9 +394,8 @@ class RouterTests(unittest.TestCase):
 
     def test_cli_help_describes_provider_specific_output_behavior(self):
         help_text = " ".join(gen_slide._parser().format_help().split())
-        self.assertIn("OpenAI/Doubao: .jpg/.jpeg/.png/.webp", help_text)
-        self.assertIn("Gemini: .png (default), .jpg/.jpeg", help_text)
-        self.assertIn("JPEG suffix requests JPEG", help_text)
+        self.assertIn("All providers accept .png/.jpg/.jpeg", help_text)
+        self.assertIn("OpenAI also accepts .webp", help_text)
         self.assertIn("actual encoding and strict 16:9", help_text)
         self.assertIn(f"0..{gen_slide.MAX_RETRIES}", help_text)
         self.assertIn("API/CLI adapter", help_text)

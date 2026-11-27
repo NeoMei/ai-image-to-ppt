@@ -17,18 +17,18 @@ SUPPORTED_CONTRACTS = {
 }
 EXPECTED_ROUTES = (
     ("openai", "host", "host-owned"),
-    ("openai", "api", "gpt-image-2"),
+    ("openai", "api", "gpt-image-2.6-sunburst"),
     ("gemini", "host", "host-owned"),
-    ("gemini", "api", "gemini-3.1-flash-image"),
+    ("gemini", "api", "gemini-nano-banana-2.1"),
     ("doubao", "host", "host-owned"),
-    ("doubao", "api", "doubao-seedream-5-0-pro-260628"),
+    ("doubao", "api", "doubao-seedream-5-5-261028"),
 )
 EXPECTED_OUTPUTS = {
     "normalizedSlide": {"format": "image", "width": 1920, "height": 1080},
     "editableInput": {"format": "png", "width": 1280, "height": 720},
 }
 EXPECTED_REFERENCES = {
-    "schemaVersion": 1, "apiProviders": ["doubao"], "cliOption": "--reference-image",
+    "schemaVersion": 1, "apiProviders": ["openai", "gemini", "doubao"], "cliOption": "--reference-image",
     "input": "local-file", "maxImages": 10, "maxBytesPerImage": 10 * 1024 * 1024,
     "maxTotalBytes": 30 * 1024 * 1024, "formats": ["png", "jpeg", "webp"],
     "unsupported": "unavailable; never drop references",

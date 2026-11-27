@@ -1,16 +1,33 @@
-"""Bounded local reference images for the Doubao API; never fetch arbitrary URLs."""
+"""Validate bounded local reference images before building provider requests."""
 import base64
 import io
 import warnings
+from dataclasses import dataclass
 from pathlib import Path
+from typing import List, Optional, Sequence
+
 from PIL import Image
+
 from image_output import ImageOutputError
 
 MAX_REFERENCE_BYTES = 10 * 1024 * 1024
 MAX_REFERENCE_TOTAL_BYTES = 30 * 1024 * 1024
 MAX_REFERENCE_IMAGES = 10
 
-def encode_reference_images(paths):
+
+@dataclass(frozen=True)
+class ReferenceImage:
+    mime_type: str
+    data: bytes
+
+    def base64_data(self) -> str:
+        return base64.b64encode(self.data).decode('ascii')
+
+    def data_url(self) -> str:
+        return f'data:{self.mime_type};base64,{self.base64_data()}'
+
+
+def read_reference_images(paths: Optional[Sequence[str]]) -> List[ReferenceImage]:
     if paths is None:
         return []
     if not isinstance(paths, (list, tuple)) or len(paths) > MAX_REFERENCE_IMAGES:
@@ -38,5 +55,5 @@ def encode_reference_images(paths):
                     image.load()
         except Exception as error:
             raise ImageOutputError('invalid reference image') from error
-        result.append('data:' + mime + ';base64,' + base64.b64encode(data).decode('ascii'))
+        result.append(ReferenceImage(mime, data))
     return result

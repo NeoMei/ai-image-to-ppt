@@ -101,12 +101,16 @@ def classify_http_failure(
     error_code: Optional[str],
     policy_codes: AbstractSet[str],
     retryable_codes: AbstractSet[str],
+    *,
+    unavailable_codes: AbstractSet[str] = frozenset(),
 ) -> GenerationStatus:
     normalized = error_code.strip().lower() if isinstance(error_code, str) else ""
     if normalized in policy_codes:
         return GenerationStatus.POLICY_REFUSED
     if normalized in retryable_codes:
         return GenerationStatus.RETRYABLE_EXHAUSTED
+    if status_code == 404 and normalized in unavailable_codes:
+        return GenerationStatus.UNAVAILABLE
     if status_code in (401, 403):
         return GenerationStatus.AUTH_UNAVAILABLE
     if status_code == 429 or status_code >= 500:

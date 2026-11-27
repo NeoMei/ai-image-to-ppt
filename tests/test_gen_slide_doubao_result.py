@@ -66,6 +66,7 @@ class StreamResponse:
 DOUBAO_GENERATION_CASES = (
     (401, "invalid_api_key", GenerationStatus.AUTH_UNAVAILABLE, True),
     (403, "permission_denied", GenerationStatus.AUTH_UNAVAILABLE, True),
+    (404, "InvalidEndpointOrModel.NotFound", GenerationStatus.UNAVAILABLE, True),
     (400, "content_filter", GenerationStatus.POLICY_REFUSED, False),
     (400, "content_policy_violation", GenerationStatus.POLICY_REFUSED, False),
     (400, "input_text_risk", GenerationStatus.POLICY_REFUSED, False),

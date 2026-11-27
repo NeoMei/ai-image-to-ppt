@@ -68,7 +68,8 @@ not stretch it. Crop to the largest contained `16*k × 9*k` master, then strict 
 validation is applied to the newly encoded PNG/JPEG before safe publication.
 For example, a 1672×941 PNG becomes a 1664×936 PNG master. MIME and actual
 format must still match the requested suffix. The OpenAI, Gemini, and Doubao
-API adapters remain strict 16:9: they do not receive this tolerance or crop.
+API masters pass strict 16:9 validation. The Gemini adapter extends the two
+outer rows of its documented 2752×1536 2K frame to reach 2752×1548 before validation.
 Forced generation/import publication is ownership-preserving rather than a
 single-syscall atomic replacement. POSIX isolates the current pathname and
 verifies the inode actually moved; Windows opens and verifies the existing

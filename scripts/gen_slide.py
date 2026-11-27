@@ -91,8 +91,6 @@ def generate_result(
     module_name = _module_for_engine(engine)
     if reference_images is not None and not isinstance(reference_images, (list, tuple)):
         return _result(GenerationStatus.INVALID_INPUT, engine, "invalid reference image list")
-    if reference_images and engine != "doubao":
-        return _result(GenerationStatus.UNAVAILABLE, engine, "requested API adapter cannot preserve reference images")
     try:
         provider = importlib.import_module(module_name)
     except Exception:
@@ -169,19 +167,19 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Generate a 16:9 slide image through an API/CLI adapter; "
-            "does not use host capabilities (default: OpenAI GPT Image 2)."
+            "does not use host capabilities (default: OpenAI GPT Image 2.6 Sunburst)."
         )
     )
     parser.add_argument(
         "out_path",
         help=(
-            "Output path. OpenAI/Doubao: .jpg/.jpeg/.png/.webp; "
-            "Gemini: .png (default), .jpg/.jpeg (JPEG suffix requests JPEG). "
+            "Output path. All providers accept .png/.jpg/.jpeg; "
+            "OpenAI also accepts .webp. "
             "All providers validate actual encoding and strict 16:9 dimensions"
         ),
     )
     parser.add_argument("prompt", help="Image generation prompt")
-    parser.add_argument("--reference-image", action="append", help="Local reference image; repeatable, currently supported by Doubao")
+    parser.add_argument("--reference-image", action="append", help="Local PNG, JPEG or WebP reference image; repeatable")
     parser.add_argument(
         "--engine",
         choices=tuple(ENGINE_MODULES),
