@@ -258,12 +258,13 @@ class GeminiVisionRequestTests(unittest.TestCase):
 
         self.assertEqual(result, "answer")
         request = urlopen.call_args.args[0]
-        self.assertIn("gemini-3.6-flash:generateContent", request.full_url)
+        self.assertIn("gemini-4-hydrogen:generateContent", request.full_url)
         self.assertNotIn("secret-key", request.full_url)
         self.assertNotIn("key=", request.full_url)
         self.assertEqual(request.get_header("X-goog-api-key"), "secret-key")
         self.assertEqual(urlopen.call_args.kwargs["timeout"], 60)
         payload = json.loads(request.data)
+        self.assertEqual(payload["generationConfig"], {"thinkingConfig": {"thinkingLevel": "MEDIUM"}})
         self.assertEqual(payload["contents"][0]["parts"][0]["text"], "count the cards")
 
     def test_environment_can_override_model(self):
@@ -283,6 +284,7 @@ class GeminiVisionRequestTests(unittest.TestCase):
                 vision_check_gemini.check(str(image_path), retries=0)
 
         self.assertIn("custom%2Fmodel:generateContent", urlopen.call_args.args[0].full_url)
+        self.assertNotIn("generationConfig", json.loads(urlopen.call_args.args[0].data))
 
 
 class GeminiVisionResponseTests(unittest.TestCase):
@@ -310,7 +312,7 @@ class GeminiVisionResponseTests(unittest.TestCase):
     def test_text_is_found_in_any_candidate_part(self):
         response = FakeResponse({
             "candidates": [
-                {"content": {"parts": [{"thought": True}]}},
+                {"content": {"parts": [{"thought": True, "text": "hidden draft"}]}},
                 {"content": {"parts": [{"inlineData": {}}, {"text": " found "}]}},
             ]
         })
