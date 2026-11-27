@@ -3,6 +3,7 @@
 
 import argparse
 import importlib
+import json
 import re
 from contextlib import redirect_stdout
 from typing import Callable, Optional, Sequence
@@ -198,6 +199,11 @@ def _parser() -> argparse.ArgumentParser:
         help="replace an existing output only after a valid image is ready",
     )
     parser.add_argument(
+        "--check-request",
+        action="store_true",
+        help="Check the Gemini request body offline before allocating a call",
+    )
+    parser.add_argument(
         "--json",
         action="store_true",
         help="emit one structured API-adapter result as JSON",
@@ -206,7 +212,19 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    args = _parser().parse_args(argv)
+    parser = _parser()
+    args = parser.parse_args(argv)
+    if args.check_request:
+        if args.engine != "gemini":
+            parser.error("--check-request currently requires --engine gemini")
+        from gen_slide_gemini import check_request
+
+        failure = check_request(args.prompt, args.out_path, args.reference_image)
+        if args.json:
+            print(failure.to_json() if failure else json.dumps({"status": "ready"}))
+        else:
+            print(_human_summary(failure) if failure else "Ready")
+        return 1 if failure else 0
     if args.json:
         with redirect_stdout(_DiscardTextSink()):
             result = generate_result(

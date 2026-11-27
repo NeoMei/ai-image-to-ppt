@@ -1,6 +1,8 @@
 import base64
+from contextlib import redirect_stdout
 import io
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -87,6 +89,11 @@ class ReferenceImageTests(unittest.TestCase):
             })
 
     def test_gemini_sends_references_and_normalizes_documented_2k_size(self):
+        for model in ('gemini-nano-banana-2.1', 'gemini-3-pro-image'):
+            with self.subTest(model=model), mock.patch.dict(os.environ, {'GEMINI_IMAGE_MODEL': model}):
+                self._check_gemini_reference_request(model)
+
+    def _check_gemini_reference_request(self, model):
         with tempfile.TemporaryDirectory() as directory:
             ref = Path(directory) / 'reference.png'
             out = Path(directory) / 'out.png'
@@ -105,7 +112,7 @@ class ReferenceImageTests(unittest.TestCase):
             self.assertTrue(result.ok)
             network.assert_called_once()
             request = network.call_args.args[0]
-            self.assertIn('/v1/models/gemini-nano-banana-2.1:generateContent', request.full_url)
+            self.assertIn(f'/v1/models/{model}:generateContent', request.full_url)
             body = json.loads(request.data)
             self.assertEqual(body['contents'][0]['parts'], [
                 {'text': 'exact prompt'},
@@ -118,6 +125,22 @@ class ReferenceImageTests(unittest.TestCase):
                 self.assertEqual(master.size, (2752, 1548))
                 self.assertEqual(master.getpixel((0, 6)), (255, 0, 0))
                 self.assertEqual(master.getpixel((2751, 1541)), (0, 0, 255))
+
+    def test_gemini_check_request_uses_wire_size_without_credentials_network_or_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ref = Path(directory) / 'reference.png'
+            out = Path(directory) / 'absent' / 'out.png'
+            Image.new('RGB', (160, 90), 'teal').save(ref)
+            args = [str(out), '中文 prompt', '--engine', 'gemini', '--reference-image', str(ref), '--check-request', '--json']
+            for limit, status, code in [(20_000_000, 'ready', 0), (500, 'unavailable', 1)]:
+                with self.subTest(limit=limit), mock.patch.object(gen_slide_gemini, 'MAX_INLINE_REQUEST_BYTES', limit), mock.patch.object(gen_slide_gemini, '_load_api_key') as key, mock.patch.object(gen_slide_gemini.urllib.request, 'urlopen') as network:
+                    stdout = io.StringIO()
+                    with redirect_stdout(stdout):
+                        self.assertEqual(gen_slide.main(args), code)
+                    self.assertEqual(json.loads(stdout.getvalue())['status'], status)
+                    network.assert_not_called()
+                    key.assert_not_called()
+                    self.assertFalse(out.parent.exists())
 
     def test_openai_and_gemini_reject_bad_references_before_network(self):
         for engine, adapter in [('openai', gen_slide_openai), ('gemini', gen_slide_gemini)]:

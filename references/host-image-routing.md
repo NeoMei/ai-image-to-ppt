@@ -144,8 +144,12 @@ accepts the resulting strict 16:9 master and never stretches it.
 Before a generation attempt, check the actual host tool or API manifest for
 reference-image support. A candidate that cannot carry the required images is
 `unavailable` without a model request; retain the same images for the next
-candidate. The current API adapter supports Doubao via repeatable
-`gen_slide.py --reference-image <local-file>`. OpenAI/Gemini API adapters do not
-yet support references and must never silently run text-only instead. If no
-candidate supports the reference contract, stop. This does not alter refusal,
-invalid-input, retry budget, or serial-sticky rules.
+candidate. For providers listed under `referenceImages.apiProviders`, use
+repeatable `gen_slide.py --reference-image <local-file>` arguments. If no
+candidate can preserve the references, stop.
+
+For providers listed under `requestCheck.apiProviders`, pass the declared
+`requestCheck.cliOption` with `--json` and the same request arguments before
+recording a call. `ready` permits dispatch. `unavailable` skips the candidate,
+and `invalid_input` stops with the reported error. The check is local and
+creates no request or output image.

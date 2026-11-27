@@ -44,6 +44,7 @@ from retry_delay import retry_delay
 SECRET_PATH = Path("~/.secrets/gemini_api_key").expanduser()
 DEFAULT_MODEL = "gemini-nano-banana-2.1"
 MAX_INLINE_REQUEST_BYTES = 20_000_000
+PADDED_2K_MODELS = frozenset({DEFAULT_MODEL, "gemini-3.1-flash-image", "gemini-3-pro-image"})
 URL_TEMPLATE = (
     "https://generativelanguage.googleapis.com/v1/models/"
     "{}:generateContent"
@@ -71,6 +72,10 @@ TRANSPORT_ERRORS = (
 
 def _load_api_key() -> str:
     return load_api_key("GEMINI_API_KEY", SECRET_PATH)
+
+
+class InlineRequestTooLarge(ImageOutputError):
+    pass
 
 
 def _output_config(out_path: str):
@@ -220,6 +225,38 @@ def _normalize_2k_slide(data: bytes, target) -> bytes:
     return buffer.getvalue()
 
 
+def _request_body(prompt: str, image_config: dict, references: Sequence[ReferenceImage]) -> bytes:
+    parts = [{"text": prompt}]
+    parts.extend(
+        {"inlineData": {"mimeType": image.mime_type, "data": image.base64_data()}}
+        for image in references
+    )
+    body = json.dumps({
+        "contents": [{"parts": parts}],
+        "generationConfig": {
+            "responseModalities": ["IMAGE"],
+            "responseFormat": {"image": image_config},
+        },
+    }).encode("utf-8")
+    if len(body) > MAX_INLINE_REQUEST_BYTES:
+        raise InlineRequestTooLarge("Gemini inline request exceeds 20 MB")
+    return body
+
+
+def check_request(prompt: str, out_path: str, reference_images: Optional[Sequence[str]]) -> Optional[GenerationResult]:
+    """Validate the request body without credentials, network, or output writes."""
+    try:
+        if not prompt.strip():
+            raise ImageOutputError("prompt must be non-empty text")
+        _, image_config = _output_config(out_path)
+        _request_body(prompt, image_config, read_reference_images(reference_images))
+    except InlineRequestTooLarge as error:
+        return _result(GenerationStatus.UNAVAILABLE, str(error))
+    except (ImageOutputError, OSError, TypeError, ValueError):
+        return _result(GenerationStatus.INVALID_INPUT, "invalid generation arguments")
+    return None
+
+
 def _gen_owned(
     prompt: str,
     target,
@@ -257,22 +294,10 @@ def _gen_owned(
     model = os.environ.get("GEMINI_IMAGE_MODEL", DEFAULT_MODEL).strip() or DEFAULT_MODEL
     encoded_model = urllib.parse.quote(model, safe="")
     url = URL_TEMPLATE.format(encoded_model)
-    parts = [{"text": prompt}]
-    parts.extend(
-        {"inlineData": {"mimeType": image.mime_type, "data": image.base64_data()}}
-        for image in references
-    )
-    body = json.dumps({
-        "contents": [{"parts": parts}],
-        "generationConfig": {
-            "responseModalities": ["IMAGE"],
-            "responseFormat": {
-                "image": image_config
-            },
-        },
-    }).encode("utf-8")
-    if len(body) > MAX_INLINE_REQUEST_BYTES:
-        return _result(GenerationStatus.UNAVAILABLE, "Gemini inline request exceeds 20 MB")
+    try:
+        body = _request_body(prompt, image_config, references)
+    except InlineRequestTooLarge as error:
+        return _result(GenerationStatus.UNAVAILABLE, str(error))
 
     for attempt in range(retries + 1):
         request = urllib.request.Request(
@@ -350,7 +375,7 @@ def _gen_owned(
 
         try:
             image = _extract_image(payload, target, expected_mime)
-            if model in {DEFAULT_MODEL, "gemini-3.1-flash-image"}:
+            if model in PADDED_2K_MODELS:
                 image = _normalize_2k_slide(image, target)
             validate_image_bytes(image, target)
         except (ImageOutputError, KeyError, IndexError, TypeError, ValueError) as error:

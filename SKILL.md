@@ -107,6 +107,9 @@ Use `gen_slide.py --engine <provider> --retries 0 --json` with repeatable
 `--reference-image /absolute/path/to/verified.png` for each supported API route.
 Adapters validate local PNG/JPEG/WebP files and send their bytes in the provider's
 supported reference field or multipart input.
+When the manifest lists a provider under `requestCheck.apiProviders`, run the
+declared check flag with the same prompt, output path, and reference arguments
+before recording a model call.
 The caller owns URL download/integrity checks and discloses reference use.
 Keep style references distinct from content references in the prompt: transfer
 materials, lighting, typography and palette; do not copy unrelated wording,
@@ -210,7 +213,5 @@ python3 scripts/cleanup_output_locks.py --older-than-days 30
 
 ## Historical reference
 
-The 2026-07-25 nano banana / Doubao provider period generated 224 slides in
-276 seconds with concurrent API work. It is historical only and does not
-represent current host-first GPT Image 2 performance; never reuse that
-concurrency pattern for a sticky routed batch.
+The 2026-07-25 nano banana / Doubao benchmark generated 224 slides in
+276 seconds with concurrent API work. Current sticky routed batches run serially.

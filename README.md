@@ -70,7 +70,10 @@ python3 scripts/gen_slide.py out/slide_01.jpg "<prompt>" --engine doubao
 
 The adapters accept repeatable `--reference-image /absolute/path/to/reference.png`
 for verified local PNG, JPEG, or WebP files. Gemini's encoded inline request has
-a 20 MB limit. Gemini and Doubao accept output paths ending in `.png`, `.jpg`, and `.jpeg`.
+a 20 MB limit. Batch callers can pass `--check-request --json` with the same
+Gemini arguments before allocating a call. Gemini and Doubao accept output paths
+ending in `.png`, `.jpg`, and `.jpeg`. A Seedream 4.0 override downloads the
+model's JPEG and converts it locally for a PNG target.
 Explicit `OPENAI_IMAGE_MODEL`, `GEMINI_IMAGE_MODEL`, and
 `DOUBAO_IMAGE_MODEL` overrides remain supported. The optional vision check uses
 `gemini-3.6-flash`.

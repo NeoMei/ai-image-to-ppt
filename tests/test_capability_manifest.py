@@ -20,6 +20,7 @@ from capability_manifest import (
 
 
 EXPECTED_MANIFEST = {
+    "requestCheck": {"apiProviders": ["gemini"], "cliOption": "--check-request"},
     "referenceImages": {
         "schemaVersion": 1, "apiProviders": ["openai", "gemini", "doubao"], "cliOption": "--reference-image",
         "input": "local-file", "maxImages": 10, "maxBytesPerImage": 10485760,

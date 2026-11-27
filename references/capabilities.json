@@ -59,6 +59,10 @@
     "apiGenerator": "scripts/gen_slide.py",
     "normalizedExport": "scripts/export_images.py"
   },
+  "requestCheck": {
+    "apiProviders": ["gemini"],
+    "cliOption": "--check-request"
+  },
   "referenceImages": {
     "schemaVersion": 1,
     "apiProviders": [

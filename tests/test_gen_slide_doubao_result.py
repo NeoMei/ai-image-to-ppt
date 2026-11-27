@@ -101,6 +101,22 @@ def generated_url(url="https://cdn.invalid/image"):
 
 
 class DoubaoResultTests(unittest.TestCase):
+    def test_seedream_4_uses_legacy_jpeg_response_and_publishes_png(self):
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            os.environ, {"DOUBAO_IMAGE_MODEL": "doubao-seedream-4-0-260415"},
+        ):
+            target = Path(directory) / "slide.png"
+            responses = [generated_url(), StreamResponse(image_bytes())]
+            with mock.patch.object(gen_slide_doubao, "_load_api_key", return_value="test-key"), mock.patch.object(gen_slide_doubao.urllib.request, "urlopen", side_effect=responses) as network:
+                result = gen_slide_doubao.generate_result("prompt", str(target), retries=0)
+            payload = json.loads(network.call_args_list[0].args[0].data)
+            self.assertNotIn("output_format", payload)
+            self.assertEqual(payload["sequential_image_generation"], "disabled")
+            self.assertTrue(result.ok, result.safe_message)
+            with Image.open(target) as slide:
+                self.assertEqual(slide.format, "PNG")
+                self.assertEqual(slide.size, (160, 90))
+
     def _generate(self, responses, target, retries=0, overwrite=False):
         urlopen_kwargs = (
             {"side_effect": responses}
