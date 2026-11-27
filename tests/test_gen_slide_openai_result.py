@@ -45,6 +45,7 @@ class JsonResponse:
 OPENAI_CASES = (
     (401, "invalid_api_key", GenerationStatus.AUTH_UNAVAILABLE),
     (403, "permission_denied", GenerationStatus.AUTH_UNAVAILABLE),
+    (404, "model_not_found", GenerationStatus.UNAVAILABLE),
     (400, "content_policy_violation", GenerationStatus.POLICY_REFUSED),
     (400, "moderation_blocked", GenerationStatus.POLICY_REFUSED),
     (429, "rate_limit_exceeded", GenerationStatus.RETRYABLE_EXHAUSTED),

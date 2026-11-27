@@ -69,6 +69,7 @@ POLICY_PAYLOADS = (
 GEMINI_CASES = (
     (401, "invalid_api_key", GenerationStatus.AUTH_UNAVAILABLE),
     (403, "permission_denied", GenerationStatus.AUTH_UNAVAILABLE),
+    (404, "NOT_FOUND", GenerationStatus.UNAVAILABLE),
     (400, "blocked", GenerationStatus.POLICY_REFUSED),
     (400, "safety", GenerationStatus.POLICY_REFUSED),
     (429, "rate_limit_exceeded", GenerationStatus.RETRYABLE_EXHAUSTED),
@@ -79,12 +80,15 @@ GEMINI_CASES = (
 
 
 def http_error(status, code, message="safe"):
+    details = {"code": code, "message": message}
+    if status == 404:
+        details.update(code=status, status=code)
     return urllib.error.HTTPError(
         "https://provider.invalid",
         status,
         "request failed",
         {},
-        io.BytesIO(json.dumps({"error": {"code": code, "message": message}}).encode()),
+        io.BytesIO(json.dumps({"error": details}).encode()),
     )
 
 

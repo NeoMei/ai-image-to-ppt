@@ -8,6 +8,7 @@ import os
 import time
 import urllib.error
 import urllib.request
+import uuid
 from pathlib import Path
 from typing import Callable, Optional, Sequence
 
@@ -34,10 +35,12 @@ from image_output import (
 )
 from output_lock import OutputLockError, output_lock
 from provider_credentials import APIKeyError, load_api_key, validate_api_key
+from reference_images import ReferenceImage, read_reference_images
 from retry_delay import retry_delay
 
 API_URL = "https://api.openai.com/v1/images/generations"
-DEFAULT_MODEL = "gpt-image-2"
+EDIT_URL = "https://api.openai.com/v1/images/edits"
+DEFAULT_MODEL = "gpt-image-2.6-sunburst"
 DEFAULT_SIZE = "2048x1152"
 DEFAULT_QUALITY = "medium"
 SECRET_PATH = Path("~/.secrets/openai_api_key").expanduser()
@@ -115,6 +118,27 @@ def _decode_image_response(result: object) -> bytes:
     return decode_base64(encoded)
 
 
+def _edit_request_body(payload: dict, images: Sequence[ReferenceImage]):
+    boundary = uuid.uuid4().hex
+    parts = []
+    for name, value in payload.items():
+        parts.append(
+            f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n'.encode("utf-8")
+        )
+    field = "image[]" if len(images) > 1 else "image"
+    for index, image in enumerate(images):
+        extension = image.mime_type.split("/")[1]
+        parts.extend((
+            f'--{boundary}\r\nContent-Disposition: form-data; name="{field}"; '
+            f'filename="reference-{index}.{extension}"\r\n'
+            f'Content-Type: {image.mime_type}\r\n\r\n'.encode("ascii"),
+            image.data,
+            b"\r\n",
+        ))
+    parts.append(f"--{boundary}--\r\n".encode("ascii"))
+    return b"".join(parts), f"multipart/form-data; boundary={boundary}"
+
+
 def _result(
     status: GenerationStatus,
     message: object,
@@ -136,6 +160,7 @@ def _gen_owned(
     retries: int = 2,
     overwrite: bool = False,
     progress: Optional[Callable[[str], None]] = None,
+    references: Sequence[ReferenceImage] = (),
 ) -> GenerationResult:
     """Generate while the caller owns a prepared output lock."""
     try:
@@ -170,15 +195,21 @@ def _gen_owned(
         "quality": os.environ.get("OPENAI_IMAGE_QUALITY", DEFAULT_QUALITY),
         "output_format": output_format_value,
     }
-    body = json.dumps(payload).encode("utf-8")
+    url = API_URL
+    content_type = "application/json"
+    if references:
+        url = EDIT_URL
+        body, content_type = _edit_request_body(payload, references)
+    else:
+        body = json.dumps(payload).encode("utf-8")
 
     for attempt in range(retries + 1):
         request = urllib.request.Request(
-            API_URL,
+            url,
             data=body,
             headers={
                 "Authorization": f"Bearer {key}",
-                "Content-Type": "application/json",
+                "Content-Type": content_type,
             },
         )
         try:
@@ -191,6 +222,7 @@ def _gen_owned(
                 error_code,
                 OPENAI_POLICY_CODES,
                 OPENAI_RETRYABLE_CODES,
+                unavailable_codes={"model_not_found"},
             )
             if status is GenerationStatus.AUTH_UNAVAILABLE:
                 message = (
@@ -282,6 +314,7 @@ def _generate_result_with_lock(
     retries: int,
     overwrite: bool,
     progress: Optional[Callable[[str], None]],
+    reference_images: Optional[Sequence[str]] = None,
 ) -> GenerationResult:
     try:
         retries = validate_retries(retries)
@@ -290,7 +323,8 @@ def _generate_result_with_lock(
         if not isinstance(overwrite, bool):
             raise ImageOutputError("overwrite must be a boolean")
         _output_format(out_path)
-    except (ImageOutputError, TypeError, ValueError):
+        references = read_reference_images(reference_images)
+    except (ImageOutputError, OSError, TypeError, ValueError):
         return _result(GenerationStatus.INVALID_INPUT, "invalid generation arguments")
 
     try:
@@ -302,6 +336,7 @@ def _generate_result_with_lock(
                 retries,
                 overwrite,
                 progress,
+                **({"references": references} if references else {}),
             )
     except (
         ImageOutputError,
@@ -327,8 +362,9 @@ def generate_result(
     retries: int = 2,
     overwrite: bool = False,
     progress: Optional[Callable[[str], None]] = None,
+    reference_images: Optional[Sequence[str]] = None,
 ) -> GenerationResult:
-    return _generate_result_with_lock(prompt, out_path, retries, overwrite, progress)
+    return _generate_result_with_lock(prompt, out_path, retries, overwrite, progress, reference_images)
 
 
 def gen(

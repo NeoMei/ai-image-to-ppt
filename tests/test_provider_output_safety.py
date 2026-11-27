@@ -231,7 +231,7 @@ class GeminiContractTests(unittest.TestCase):
 
     def test_default_model_is_current_stable_image_model(self):
         self.assertEqual(
-            gen_slide_gemini.DEFAULT_MODEL, "gemini-3.1-flash-image"
+            gen_slide_gemini.DEFAULT_MODEL, "gemini-nano-banana-2.1"
         )
 
     def test_invalid_base64_is_not_retried_or_published(self):

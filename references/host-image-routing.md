@@ -68,7 +68,8 @@ not stretch it. Crop to the largest contained `16*k × 9*k` master, then strict 
 validation is applied to the newly encoded PNG/JPEG before safe publication.
 For example, a 1672×941 PNG becomes a 1664×936 PNG master. MIME and actual
 format must still match the requested suffix. The OpenAI, Gemini, and Doubao
-API adapters remain strict 16:9: they do not receive this tolerance or crop.
+API masters pass strict 16:9 validation. The Gemini adapter extends the two
+outer rows of its documented 2752×1536 2K frame to reach 2752×1548 before validation.
 Forced generation/import publication is ownership-preserving rather than a
 single-syscall atomic replacement. POSIX isolates the current pathname and
 verifies the inode actually moved; Windows opens and verifies the existing
@@ -143,8 +144,12 @@ accepts the resulting strict 16:9 master and never stretches it.
 Before a generation attempt, check the actual host tool or API manifest for
 reference-image support. A candidate that cannot carry the required images is
 `unavailable` without a model request; retain the same images for the next
-candidate. The current API adapter supports Doubao via repeatable
-`gen_slide.py --reference-image <local-file>`. OpenAI/Gemini API adapters do not
-yet support references and must never silently run text-only instead. If no
-candidate supports the reference contract, stop. This does not alter refusal,
-invalid-input, retry budget, or serial-sticky rules.
+candidate. For providers listed under `referenceImages.apiProviders`, use
+repeatable `gen_slide.py --reference-image <local-file>` arguments. If no
+candidate can preserve the references, stop.
+
+For providers listed under `requestCheck.apiProviders`, pass the declared
+`requestCheck.cliOption` with `--json` and the same request arguments before
+recording a call. `ready` permits dispatch. `unavailable` skips the candidate,
+and `invalid_input` stops with the reported error. The check is local and
+creates no request or output image.

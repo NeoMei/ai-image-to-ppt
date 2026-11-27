@@ -16,7 +16,7 @@
     {
       "provider": "openai",
       "channel": "api",
-      "defaultModel": "gpt-image-2"
+      "defaultModel": "gpt-image-2.6-sunburst"
     },
     {
       "provider": "gemini",
@@ -26,7 +26,7 @@
     {
       "provider": "gemini",
       "channel": "api",
-      "defaultModel": "gemini-3.1-flash-image"
+      "defaultModel": "gemini-nano-banana-2.1"
     },
     {
       "provider": "doubao",
@@ -36,7 +36,7 @@
     {
       "provider": "doubao",
       "channel": "api",
-      "defaultModel": "doubao-seedream-5-0-pro-260628"
+      "defaultModel": "doubao-seedream-5-5-261028"
     }
   ],
   "outputs": {
@@ -59,10 +59,14 @@
     "apiGenerator": "scripts/gen_slide.py",
     "normalizedExport": "scripts/export_images.py"
   },
+  "requestCheck": {
+    "apiProviders": ["gemini"],
+    "cliOption": "--check-request"
+  },
   "referenceImages": {
     "schemaVersion": 1,
     "apiProviders": [
-      "doubao"
+      "openai", "gemini", "doubao"
     ],
     "cliOption": "--reference-image",
     "input": "local-file",

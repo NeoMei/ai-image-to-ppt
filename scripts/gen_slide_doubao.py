@@ -3,6 +3,7 @@
 
 import argparse
 import http.client
+import io
 import json
 import os
 import time
@@ -17,16 +18,16 @@ from image_output import (
     MAX_IMAGE_BYTES, ImageOutputError, ImageStreamError, PreparedTarget,
     expected_mime_type, output_format, parse_json_response, prepare_target, prepared_lock_target,
     preflight_output, publish_bytes, read_bounded_image_stream,
-    read_response_body, resolve_output_path, validate_image_bytes, validate_retries,
+    read_response_body, resolve_output_path, validate_decoded_image_bytes, validate_image_bytes, validate_retries,
 )
 from output_lock import OutputLockError, output_lock
 from provider_credentials import APIKeyError, load_api_key, validate_api_key
 from retry_delay import retry_delay
-from reference_images import encode_reference_images
+from reference_images import read_reference_images
 
 SECRET_PATH = Path("~/.secrets/doubao_api_key").expanduser()
 URL = "https://ark.cn-beijing.volces.com/api/v3/images/generations"
-MODEL = "doubao-seedream-5-0-pro-260628"
+MODEL = "doubao-seedream-5-5-261028"
 SIZE = "2560x1440"
 DOWNLOAD_TIMEOUT = 120
 DOUBAO_POLICY_CODES = frozenset({"content_filter", "content_policy_violation", "input_text_risk", "output_image_risk"})
@@ -95,15 +96,18 @@ def _extract_image_url(payload: object) -> str:
     return image_url
 
 
-def _remote_http_result(error: urllib.error.HTTPError, key: str) -> tuple[GenerationStatus, str]:
+def _remote_http_result(error: urllib.error.HTTPError, key: str, *, generating: bool = False) -> tuple[GenerationStatus, str]:
     error_code, message = _error_details(error, key)
-    status = classify_http_failure(error.code, error_code, DOUBAO_POLICY_CODES, DOUBAO_RETRYABLE_CODES)
+    status = classify_http_failure(
+        error.code, error_code, DOUBAO_POLICY_CODES, DOUBAO_RETRYABLE_CODES,
+        unavailable_codes={"invalidendpointormodel.notfound"} if generating else frozenset(),
+    )
     if status is GenerationStatus.AUTH_UNAVAILABLE:
         message = f"authentication failed; check DOUBAO_API_KEY; provider says: {message}"
     return status, message
 
 
-def _validate_download_content_type(response, target: PreparedTarget) -> None:
+def _validate_download_content_type(response, expected_mime: str) -> None:
     headers = getattr(response, "headers", {})
     try:
         content_type = headers.get("Content-Type")
@@ -112,18 +116,19 @@ def _validate_download_content_type(response, target: PreparedTarget) -> None:
     if not isinstance(content_type, str) or not content_type.strip():
         raise ImageOutputError("download Content-Type must be non-empty text")
     media_type = content_type.split(";", 1)[0].strip().lower()
-    if media_type != expected_mime_type(str(target)):
+    if media_type != expected_mime:
         raise ImageOutputError("download Content-Type does not match output target")
 
 
-def _download_with_retries(image_url: str, target: PreparedTarget, retries: int, overwrite: bool, key: str, progress: Optional[Callable[[str], None]]) -> GenerationResult:
+def _download_with_retries(image_url: str, target: PreparedTarget, retries: int, overwrite: bool, key: str, progress: Optional[Callable[[str], None]], *, jpeg_to_png: bool = False) -> GenerationResult:
     """Download one generated URL; retries remain inside this exact URL."""
     secrets = (key,) if key else ()
+    source_path = target.path.with_suffix(".jpg") if jpeg_to_png else target.path
     for attempt in range(retries + 1):
         request = urllib.request.Request(image_url)
         try:
             with urllib.request.urlopen(request, timeout=DOWNLOAD_TIMEOUT) as response:
-                _validate_download_content_type(response, target)
+                _validate_download_content_type(response, expected_mime_type(str(source_path)))
                 image = read_bounded_image_stream(response, max_bytes=MAX_IMAGE_BYTES)
         except urllib.error.HTTPError as error:
             status, message = _remote_http_result(error, key)
@@ -145,8 +150,13 @@ def _download_with_retries(image_url: str, target: PreparedTarget, retries: int,
             return _result(GenerationStatus.INVALID_OUTPUT, f"invalid downloaded image: {_redact(error, key)}", secrets=secrets)
 
         try:
+            if jpeg_to_png:
+                jpeg = validate_decoded_image_bytes(image, source_path, copy_image=True)
+                buffer = io.BytesIO()
+                jpeg.image.convert("RGB").save(buffer, format="PNG")
+                image = buffer.getvalue()
             validate_image_bytes(image, target)
-        except (ImageOutputError, TypeError, ValueError) as error:
+        except (ImageOutputError, OSError, TypeError, ValueError) as error:
             return _result(GenerationStatus.INVALID_OUTPUT, f"invalid downloaded image: {_redact(error, key)}", secrets=secrets)
         try:
             byte_count = publish_bytes(image, target, overwrite=overwrite)
@@ -156,8 +166,8 @@ def _download_with_retries(image_url: str, target: PreparedTarget, retries: int,
     return _result(GenerationStatus.RETRYABLE_EXHAUSTED, "download retries exhausted", secrets=secrets)
 
 
-def _download_image_result(image_url: str, target: PreparedTarget, retries: int, overwrite: bool, key: str, progress: Optional[Callable[[str], None]]) -> GenerationResult:
-    return _download_with_retries(image_url, target, retries, overwrite, key, progress)
+def _download_image_result(image_url: str, target: PreparedTarget, retries: int, overwrite: bool, key: str, progress: Optional[Callable[[str], None]], *, jpeg_to_png: bool = False) -> GenerationResult:
+    return _download_with_retries(image_url, target, retries, overwrite, key, progress, jpeg_to_png=jpeg_to_png)
 
 
 def _gen_owned(prompt: str, target: PreparedTarget, retries: int = 2, overwrite: bool = False, progress: Optional[Callable[[str], None]] = None, reference_images=None) -> GenerationResult:
@@ -179,13 +189,17 @@ def _gen_owned(prompt: str, target: PreparedTarget, retries: int = 2, overwrite:
         return _result(GenerationStatus.AUTH_UNAVAILABLE, f"Doubao API key is invalid: {error}", secrets=secrets)
 
     model = os.environ.get("DOUBAO_IMAGE_MODEL", MODEL).strip() or MODEL
+    seedream_4 = model.startswith("doubao-seedream-4-0-")
     payload = {
         "model": model, "prompt": prompt,
-        "size": SIZE, "response_format": "url", "output_format": requested_format,
+        "size": SIZE, "response_format": "url",
         "watermark": False,
     }
-    # Pro/Flash only generate a single image and reject group-generation options.
-    if not model.startswith(("doubao-seedream-5-0-pro-", "doubao-seedream-5-0-flash-")):
+    if not seedream_4:
+        payload["output_format"] = requested_format
+    # Only the older group-capable models accept this parameter. Ark endpoints
+    # hide the underlying model ID, and single-image output is already the default.
+    if seedream_4 or model == "doubao-seedream-5-0-260128":
         payload["sequential_image_generation"] = "disabled"
     if reference_images:
         payload["image"] = reference_images
@@ -196,7 +210,7 @@ def _gen_owned(prompt: str, target: PreparedTarget, retries: int = 2, overwrite:
             with urllib.request.urlopen(request, timeout=180) as response:
                 raw_response = read_response_body(response)
         except urllib.error.HTTPError as error:
-            status, message = _remote_http_result(error, key)
+            status, message = _remote_http_result(error, key, generating=True)
             if status is GenerationStatus.RETRYABLE_EXHAUSTED and (error.code == 429 or error.code >= 500) and attempt < retries:
                 if progress is not None:
                     progress(f"  HTTP {error.code}: {message} (attempt {attempt + 1})")
@@ -219,13 +233,16 @@ def _gen_owned(prompt: str, target: PreparedTarget, retries: int = 2, overwrite:
             image_url = _extract_image_url(payload)
         except (ImageOutputError, TypeError, ValueError, UnicodeError) as error:
             return _result(GenerationStatus.INVALID_OUTPUT, f"invalid image response: {_redact(error, key)}", secrets=secrets)
-        return _download_image_result(image_url, target, retries, overwrite, key, progress)
+        return _download_image_result(
+            image_url, target, retries, overwrite, key, progress,
+            **({"jpeg_to_png": True} if seedream_4 and requested_format == "png" else {}),
+        )
     return _result(GenerationStatus.RETRYABLE_EXHAUSTED, "request retries exhausted", secrets=secrets)
 
 
 def _generate_result_with_lock(prompt: str, out_path: str, retries: int, overwrite: bool, progress: Optional[Callable[[str], None]], reference_images=None) -> GenerationResult:
     try:
-        encoded_references = encode_reference_images(reference_images)
+        encoded_references = [image.data_url() for image in read_reference_images(reference_images)]
         retries = validate_retries(retries)
         if not isinstance(prompt, str) or not prompt.strip():
             raise ImageOutputError("prompt must be non-empty text")

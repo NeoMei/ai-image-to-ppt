@@ -1,6 +1,8 @@
 import base64
+from contextlib import redirect_stdout
 import io
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -11,6 +13,8 @@ from PIL import Image
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 import gen_slide
 import gen_slide_doubao
+import gen_slide_gemini
+import gen_slide_openai
 from generation_result import GenerationStatus
 
 class Response(io.BytesIO):
@@ -48,12 +52,103 @@ class ReferenceImageTests(unittest.TestCase):
             key.assert_not_called()
             network.assert_not_called()
 
-    def test_unsupported_adapter_cannot_drop_references(self):
-        for engine in ['openai', 'gemini']:
-            with mock.patch.object(gen_slide.importlib, 'import_module') as provider:
-                result = gen_slide.generate_result('prompt', 'out.png', engine=engine, reference_images=['reference.png'])
-            self.assertEqual(result.status, GenerationStatus.UNAVAILABLE)
-            provider.assert_not_called()
+    def test_openai_sends_references_to_edits_with_current_model(self):
+        from email import policy
+        from email.parser import BytesParser
+
+        with tempfile.TemporaryDirectory() as directory:
+            ref = Path(directory) / 'reference.png'
+            Image.new('RGB', (160, 90), 'teal').save(ref)
+            response = Response(json.dumps({'data': [{
+                'b64_json': base64.b64encode(ref.read_bytes()).decode(),
+            }]}).encode())
+            with mock.patch.object(gen_slide_openai, '_load_api_key', return_value='test-key'), mock.patch.object(gen_slide_openai.urllib.request, 'urlopen', return_value=response) as network:
+                result = gen_slide.generate_result('确切的 prompt', str(Path(directory) / 'out.png'), retries=0, reference_images=[str(ref), str(ref)])
+            self.assertTrue(result.ok)
+            network.assert_called_once()
+            request = network.call_args.args[0]
+            self.assertEqual(request.full_url, 'https://api.openai.com/v1/images/edits')
+            mime = BytesParser(policy=policy.default).parsebytes(
+                f"Content-Type: {request.get_header('Content-type')}\r\n\r\n".encode() + request.data
+            )
+            fields, images = {}, []
+            for part in mime.iter_parts():
+                name = part.get_param('name', header='content-disposition')
+                if name == 'image[]':
+                    self.assertEqual(part.get_content_type(), 'image/png')
+                    images.append(part.get_payload(decode=True))
+                else:
+                    fields[name] = part.get_payload(decode=True).decode()
+            self.assertEqual(images, [ref.read_bytes()] * 2)
+            self.assertEqual(fields, {
+                'model': 'gpt-image-2.6-sunburst',
+                'prompt': '确切的 prompt',
+                'size': '2048x1152',
+                'quality': 'medium',
+                'output_format': 'png',
+            })
+
+    def test_gemini_sends_references_and_normalizes_documented_2k_size(self):
+        for model in ('gemini-nano-banana-2.1', 'gemini-3-pro-image'):
+            with self.subTest(model=model), mock.patch.dict(os.environ, {'GEMINI_IMAGE_MODEL': model}):
+                self._check_gemini_reference_request(model)
+
+    def _check_gemini_reference_request(self, model):
+        with tempfile.TemporaryDirectory() as directory:
+            ref = Path(directory) / 'reference.png'
+            out = Path(directory) / 'out.png'
+            Image.new('RGB', (160, 90), 'teal').save(ref)
+            canvas = io.BytesIO()
+            image = Image.new('RGB', (2752, 1536), 'white')
+            image.putpixel((0, 0), (255, 0, 0))
+            image.putpixel((2751, 1535), (0, 0, 255))
+            image.save(canvas, format='PNG')
+            response = Response(json.dumps({'candidates': [{'content': {'parts': [
+                {'thought': True, 'inlineData': {'mimeType': 'image/png', 'data': 'interim-image'}},
+                {'inlineData': {'mimeType': 'image/png', 'data': base64.b64encode(canvas.getvalue()).decode()}},
+            ]}}]}).encode())
+            with mock.patch.object(gen_slide_gemini, '_load_api_key', return_value='test-key'), mock.patch.object(gen_slide_gemini.urllib.request, 'urlopen', return_value=response) as network:
+                result = gen_slide.generate_result('exact prompt', str(out), engine='gemini', retries=0, reference_images=[str(ref)])
+            self.assertTrue(result.ok)
+            network.assert_called_once()
+            request = network.call_args.args[0]
+            self.assertIn(f'/v1/models/{model}:generateContent', request.full_url)
+            body = json.loads(request.data)
+            self.assertEqual(body['contents'][0]['parts'], [
+                {'text': 'exact prompt'},
+                {'inlineData': {'mimeType': 'image/png', 'data': base64.b64encode(ref.read_bytes()).decode()}},
+            ])
+            self.assertEqual(body['generationConfig']['responseFormat']['image'], {
+                'aspectRatio': 'ASPECT_RATIO_SIXTEEN_BY_NINE', 'imageSize': 'IMAGE_SIZE_TWO_K',
+            })
+            with Image.open(out) as master:
+                self.assertEqual(master.size, (2752, 1548))
+                self.assertEqual(master.getpixel((0, 6)), (255, 0, 0))
+                self.assertEqual(master.getpixel((2751, 1541)), (0, 0, 255))
+
+    def test_gemini_check_request_uses_wire_size_without_credentials_network_or_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ref = Path(directory) / 'reference.png'
+            out = Path(directory) / 'absent' / 'out.png'
+            Image.new('RGB', (160, 90), 'teal').save(ref)
+            args = [str(out), '中文 prompt', '--engine', 'gemini', '--reference-image', str(ref), '--check-request', '--json']
+            for limit, status, code in [(20_000_000, 'ready', 0), (500, 'unavailable', 1)]:
+                with self.subTest(limit=limit), mock.patch.object(gen_slide_gemini, 'MAX_INLINE_REQUEST_BYTES', limit), mock.patch.object(gen_slide_gemini, '_load_api_key') as key, mock.patch.object(gen_slide_gemini.urllib.request, 'urlopen') as network:
+                    stdout = io.StringIO()
+                    with redirect_stdout(stdout):
+                        self.assertEqual(gen_slide.main(args), code)
+                    self.assertEqual(json.loads(stdout.getvalue())['status'], status)
+                    network.assert_not_called()
+                    key.assert_not_called()
+                    self.assertFalse(out.parent.exists())
+
+    def test_openai_and_gemini_reject_bad_references_before_network(self):
+        for engine, adapter in [('openai', gen_slide_openai), ('gemini', gen_slide_gemini)]:
+            with self.subTest(engine=engine), mock.patch.object(adapter, '_load_api_key') as key, mock.patch.object(adapter.urllib.request, 'urlopen') as network:
+                result = gen_slide.generate_result('prompt', 'out.png', engine=engine, reference_images=['not-a-local-file.png'])
+                self.assertEqual(result.status, GenerationStatus.INVALID_INPUT)
+                key.assert_not_called()
+                network.assert_not_called()
 
     def test_cli_forwards_repeatable_reference(self):
         with mock.patch.object(gen_slide, 'generate_result', return_value=gen_slide_doubao._result(GenerationStatus.SUCCESS, 'ok', str(Path.cwd() / 'out.png'))) as generate:
@@ -77,7 +172,7 @@ class ReferenceImageTests(unittest.TestCase):
             network.assert_not_called()
 
     def test_pro_and_flash_omit_unsupported_group_parameter(self):
-        for model in [None, 'doubao-seedream-5-0-flash-260915', 'doubao-seedream-5-0-pro-260628']:
+        for model in [None, 'doubao-seedream-5-0-flash-260915', 'doubao-seedream-5-0-pro-260628', 'ep-custom-endpoint']:
             with tempfile.TemporaryDirectory() as directory, mock.patch.dict('os.environ', {}, clear=True):
                 if model:
                     import os
@@ -87,7 +182,7 @@ class ReferenceImageTests(unittest.TestCase):
                     result = gen_slide.generate_result('exact prompt', str(Path(directory) / 'out.png'), engine='doubao', retries=0)
                 self.assertTrue(result.ok)
                 body = json.loads(network.call_args.args[0].data)
-                self.assertEqual(body['model'], model or 'doubao-seedream-5-0-pro-260628')
+                self.assertEqual(body['model'], model or 'doubao-seedream-5-5-261028')
                 self.assertNotIn('sequential_image_generation', body)
 
     def test_lite_override_retains_legacy_request(self):

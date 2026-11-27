@@ -110,13 +110,13 @@ class OpenAIGenerationTests(unittest.TestCase):
 
             self.assertTrue(ok)
             self.assertEqual(out_path.read_bytes(), generated_image)
-            self.assertIn("(0KB, OpenAI gpt-image-2)", output.getvalue())
+            self.assertIn("(0KB, OpenAI gpt-image-2.6-sunburst)", output.getvalue())
             request = urlopen.call_args.args[0]
             payload = json.loads(request.data)
             self.assertEqual(request.full_url, gen_slide_openai.API_URL)
             self.assertEqual(request.headers["Authorization"], "Bearer test-key")
             self.assertEqual(payload, {
-                "model": "gpt-image-2",
+                "model": "gpt-image-2.6-sunburst",
                 "prompt": "draw a slide",
                 "size": "2048x1152",
                 "quality": "medium",
@@ -140,7 +140,7 @@ class OpenAIGenerationTests(unittest.TestCase):
                  redirect_stdout(success_output):
                 self.assertTrue(gen_slide_openai.gen("prompt", str(target), retries=0))
             self.assertNotIn(key, success_output.getvalue())
-            self.assertIn("(0KB, OpenAI gpt-image-2)", success_output.getvalue())
+            self.assertIn("(0KB, OpenAI gpt-image-2.6-sunburst)", success_output.getvalue())
 
             failure_output = io.StringIO()
             with mock.patch.dict(os.environ, {"OPENAI_API_KEY": key}, clear=True), \

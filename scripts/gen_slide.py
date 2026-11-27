@@ -3,6 +3,7 @@
 
 import argparse
 import importlib
+import json
 import re
 from contextlib import redirect_stdout
 from typing import Callable, Optional, Sequence
@@ -91,8 +92,6 @@ def generate_result(
     module_name = _module_for_engine(engine)
     if reference_images is not None and not isinstance(reference_images, (list, tuple)):
         return _result(GenerationStatus.INVALID_INPUT, engine, "invalid reference image list")
-    if reference_images and engine != "doubao":
-        return _result(GenerationStatus.UNAVAILABLE, engine, "requested API adapter cannot preserve reference images")
     try:
         provider = importlib.import_module(module_name)
     except Exception:
@@ -169,19 +168,19 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Generate a 16:9 slide image through an API/CLI adapter; "
-            "does not use host capabilities (default: OpenAI GPT Image 2)."
+            "does not use host capabilities (default: OpenAI GPT Image 2.6 Sunburst)."
         )
     )
     parser.add_argument(
         "out_path",
         help=(
-            "Output path. OpenAI/Doubao: .jpg/.jpeg/.png/.webp; "
-            "Gemini: .png (default), .jpg/.jpeg (JPEG suffix requests JPEG). "
+            "Output path. All providers accept .png/.jpg/.jpeg; "
+            "OpenAI also accepts .webp. "
             "All providers validate actual encoding and strict 16:9 dimensions"
         ),
     )
     parser.add_argument("prompt", help="Image generation prompt")
-    parser.add_argument("--reference-image", action="append", help="Local reference image; repeatable, currently supported by Doubao")
+    parser.add_argument("--reference-image", action="append", help="Local PNG, JPEG or WebP reference image; repeatable")
     parser.add_argument(
         "--engine",
         choices=tuple(ENGINE_MODULES),
@@ -200,6 +199,11 @@ def _parser() -> argparse.ArgumentParser:
         help="replace an existing output only after a valid image is ready",
     )
     parser.add_argument(
+        "--check-request",
+        action="store_true",
+        help="Check the Gemini request body offline before allocating a call",
+    )
+    parser.add_argument(
         "--json",
         action="store_true",
         help="emit one structured API-adapter result as JSON",
@@ -208,7 +212,19 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    args = _parser().parse_args(argv)
+    parser = _parser()
+    args = parser.parse_args(argv)
+    if args.check_request:
+        if args.engine != "gemini":
+            parser.error("--check-request currently requires --engine gemini")
+        from gen_slide_gemini import check_request
+
+        failure = check_request(args.prompt, args.out_path, args.reference_image)
+        if args.json:
+            print(failure.to_json() if failure else json.dumps({"status": "ready"}))
+        else:
+            print(_human_summary(failure) if failure else "Ready")
+        return 1 if failure else 0
     if args.json:
         with redirect_stdout(_DiscardTextSink()):
             result = generate_result(

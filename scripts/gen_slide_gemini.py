@@ -3,6 +3,7 @@
 
 import argparse
 import http.client
+import io
 import json
 import os
 import time
@@ -11,6 +12,8 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Callable, Optional, Sequence
+
+from PIL import Image, ImageOps
 
 from generation_result import (
     GenerationResult,
@@ -29,15 +32,19 @@ from image_output import (
     publish_bytes,
     read_response_body,
     resolve_output_path,
+    validate_decoded_image_bytes,
     validate_image_bytes,
     validate_retries,
 )
 from output_lock import OutputLockError, output_lock
 from provider_credentials import APIKeyError, load_api_key, validate_api_key
+from reference_images import ReferenceImage, read_reference_images
 from retry_delay import retry_delay
 
 SECRET_PATH = Path("~/.secrets/gemini_api_key").expanduser()
-DEFAULT_MODEL = "gemini-3.1-flash-image"
+DEFAULT_MODEL = "gemini-nano-banana-2.1"
+MAX_INLINE_REQUEST_BYTES = 20_000_000
+PADDED_2K_MODELS = frozenset({DEFAULT_MODEL, "gemini-3.1-flash-image", "gemini-3-pro-image"})
 URL_TEMPLATE = (
     "https://generativelanguage.googleapis.com/v1/models/"
     "{}:generateContent"
@@ -65,6 +72,10 @@ TRANSPORT_ERRORS = (
 
 def _load_api_key() -> str:
     return load_api_key("GEMINI_API_KEY", SECRET_PATH)
+
+
+class InlineRequestTooLarge(ImageOutputError):
+    pass
 
 
 def _output_config(out_path: str):
@@ -121,6 +132,8 @@ def _http_error_details(error: urllib.error.HTTPError, key: str):
         if isinstance(payload, dict) and isinstance(payload.get("error"), dict):
             details = payload["error"]
             candidate_code = details.get("code")
+            if not isinstance(candidate_code, str):
+                candidate_code = details.get("status")
             if isinstance(candidate_code, str) and candidate_code:
                 code = candidate_code
             candidate_message = details.get("message")
@@ -171,7 +184,7 @@ def _extract_image(payload: object, target: Path, expected_mime: str) -> bytes:
         raise ImageOutputError("response parts must be a list")
 
     for part in parts:
-        if not isinstance(part, dict):
+        if not isinstance(part, dict) or part.get("thought") is True:
             continue
         inline = part.get("inlineData") or part.get("inline_data")
         if not isinstance(inline, dict) or not inline.get("data"):
@@ -187,12 +200,70 @@ def _extract_image(payload: object, target: Path, expected_mime: str) -> bytes:
     raise ImageOutputError("response contains no image data")
 
 
+def _normalize_2k_slide(data: bytes, target) -> bytes:
+    loaded = validate_decoded_image_bytes(data, target, copy_image=True)
+    # Google's 16:9 2K preset is 2752x1536. Extend the outer rows so no
+    # generated content is cropped or stretched and the master is exactly 16:9.
+    if (loaded.width, loaded.height) != (2752, 1536):
+        return data
+    image = loaded.image
+    padding = 6
+    canvas = ImageOps.expand(image, border=(0, padding, 0, padding))
+    top = image.crop((0, 0, loaded.width, 1))
+    bottom = image.crop((0, loaded.height - 1, loaded.width, loaded.height))
+    canvas.paste(top.resize((loaded.width, padding), Image.Resampling.NEAREST), (0, 0))
+    canvas.paste(bottom.resize((loaded.width, padding), Image.Resampling.NEAREST), (0, loaded.height + padding))
+    buffer = io.BytesIO()
+    options = {"quality": 95} if loaded.image_format == "JPEG" else {}
+    for key in ("icc_profile", "transparency"):
+        if key in image.info:
+            options[key] = image.info[key]
+    try:
+        canvas.save(buffer, format=loaded.image_format, **options)
+    except (OSError, ValueError) as error:
+        raise ImageOutputError("Gemini slide could not be encoded after normalization") from error
+    return buffer.getvalue()
+
+
+def _request_body(prompt: str, image_config: dict, references: Sequence[ReferenceImage]) -> bytes:
+    parts = [{"text": prompt}]
+    parts.extend(
+        {"inlineData": {"mimeType": image.mime_type, "data": image.base64_data()}}
+        for image in references
+    )
+    body = json.dumps({
+        "contents": [{"parts": parts}],
+        "generationConfig": {
+            "responseModalities": ["IMAGE"],
+            "responseFormat": {"image": image_config},
+        },
+    }).encode("utf-8")
+    if len(body) > MAX_INLINE_REQUEST_BYTES:
+        raise InlineRequestTooLarge("Gemini inline request exceeds 20 MB")
+    return body
+
+
+def check_request(prompt: str, out_path: str, reference_images: Optional[Sequence[str]]) -> Optional[GenerationResult]:
+    """Validate the request body without credentials, network, or output writes."""
+    try:
+        if not prompt.strip():
+            raise ImageOutputError("prompt must be non-empty text")
+        _, image_config = _output_config(out_path)
+        _request_body(prompt, image_config, read_reference_images(reference_images))
+    except InlineRequestTooLarge as error:
+        return _result(GenerationStatus.UNAVAILABLE, str(error))
+    except (ImageOutputError, OSError, TypeError, ValueError):
+        return _result(GenerationStatus.INVALID_INPUT, "invalid generation arguments")
+    return None
+
+
 def _gen_owned(
     prompt: str,
     target,
     retries: int = 2,
     overwrite: bool = False,
     progress: Optional[Callable[[str], None]] = None,
+    references: Sequence[ReferenceImage] = (),
 ) -> GenerationResult:
     """Generate while the caller owns a prepared output lock."""
     try:
@@ -223,15 +294,10 @@ def _gen_owned(
     model = os.environ.get("GEMINI_IMAGE_MODEL", DEFAULT_MODEL).strip() or DEFAULT_MODEL
     encoded_model = urllib.parse.quote(model, safe="")
     url = URL_TEMPLATE.format(encoded_model)
-    body = json.dumps({
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {
-            "responseModalities": ["IMAGE"],
-            "responseFormat": {
-                "image": image_config
-            },
-        },
-    }).encode("utf-8")
+    try:
+        body = _request_body(prompt, image_config, references)
+    except InlineRequestTooLarge as error:
+        return _result(GenerationStatus.UNAVAILABLE, str(error))
 
     for attempt in range(retries + 1):
         request = urllib.request.Request(
@@ -252,6 +318,7 @@ def _gen_owned(
                 error_code,
                 GEMINI_POLICY_CODES,
                 GEMINI_RETRYABLE_CODES,
+                unavailable_codes={"not_found"},
             )
             if status is GenerationStatus.AUTH_UNAVAILABLE:
                 message = (
@@ -308,6 +375,8 @@ def _gen_owned(
 
         try:
             image = _extract_image(payload, target, expected_mime)
+            if model in PADDED_2K_MODELS:
+                image = _normalize_2k_slide(image, target)
             validate_image_bytes(image, target)
         except (ImageOutputError, KeyError, IndexError, TypeError, ValueError) as error:
             return _result(
@@ -344,6 +413,7 @@ def _generate_result_with_lock(
     retries: int,
     overwrite: bool,
     progress: Optional[Callable[[str], None]],
+    reference_images: Optional[Sequence[str]] = None,
 ) -> GenerationResult:
     try:
         retries = validate_retries(retries)
@@ -352,13 +422,17 @@ def _generate_result_with_lock(
         if not isinstance(overwrite, bool):
             raise ImageOutputError("overwrite must be a boolean")
         _output_config(out_path)
-    except (ImageOutputError, TypeError, ValueError):
+        references = read_reference_images(reference_images)
+    except (ImageOutputError, OSError, TypeError, ValueError):
         return _result(GenerationStatus.INVALID_INPUT, "invalid generation arguments")
 
     try:
         target = prepare_target(resolve_output_path(out_path))
         with output_lock(prepared_lock_target(target)):
-            result = _gen_owned(prompt, target, retries, overwrite, progress)
+            result = _gen_owned(
+                prompt, target, retries, overwrite, progress,
+                **({"references": references} if references else {}),
+            )
     except (
         ImageOutputError,
         OutputLockError,
@@ -383,8 +457,9 @@ def generate_result(
     retries: int = 2,
     overwrite: bool = False,
     progress: Optional[Callable[[str], None]] = None,
+    reference_images: Optional[Sequence[str]] = None,
 ) -> GenerationResult:
-    return _generate_result_with_lock(prompt, out_path, retries, overwrite, progress)
+    return _generate_result_with_lock(prompt, out_path, retries, overwrite, progress, reference_images)
 
 
 def gen(

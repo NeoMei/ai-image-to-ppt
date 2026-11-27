@@ -17,22 +17,23 @@ SUPPORTED_CONTRACTS = {
 }
 EXPECTED_ROUTES = (
     ("openai", "host", "host-owned"),
-    ("openai", "api", "gpt-image-2"),
+    ("openai", "api", "gpt-image-2.6-sunburst"),
     ("gemini", "host", "host-owned"),
-    ("gemini", "api", "gemini-3.1-flash-image"),
+    ("gemini", "api", "gemini-nano-banana-2.1"),
     ("doubao", "host", "host-owned"),
-    ("doubao", "api", "doubao-seedream-5-0-pro-260628"),
+    ("doubao", "api", "doubao-seedream-5-5-261028"),
 )
 EXPECTED_OUTPUTS = {
     "normalizedSlide": {"format": "image", "width": 1920, "height": 1080},
     "editableInput": {"format": "png", "width": 1280, "height": 720},
 }
 EXPECTED_REFERENCES = {
-    "schemaVersion": 1, "apiProviders": ["doubao"], "cliOption": "--reference-image",
+    "schemaVersion": 1, "apiProviders": ["openai", "gemini", "doubao"], "cliOption": "--reference-image",
     "input": "local-file", "maxImages": 10, "maxBytesPerImage": 10 * 1024 * 1024,
     "maxTotalBytes": 30 * 1024 * 1024, "formats": ["png", "jpeg", "webp"],
     "unsupported": "unavailable; never drop references",
 }
+EXPECTED_REQUEST_CHECK = {"apiProviders": ["gemini"], "cliOption": "--check-request"}
 EXPECTED_SCRIPTS = {
     "generationResult",
     "hostRoutingPolicy",
@@ -210,7 +211,8 @@ def _validate_scripts(skill_root: Path, value: object) -> None:
 def _validate_manifest(skill_root: Path, manifest: dict) -> None:
     top_level = _require_exact_keys(
         manifest,
-        {"schemaVersion", "skill", "contracts", "routingOrder", "outputs", "scripts"} | ({"referenceImages"} if "referenceImages" in manifest else set()),
+        {"schemaVersion", "skill", "contracts", "routingOrder", "outputs", "scripts"}
+        | (set(manifest) & {"referenceImages", "requestCheck"}),
         "capability manifest",
     )
     schema_version = _require_integer(top_level["schemaVersion"], "schemaVersion")
@@ -223,6 +225,8 @@ def _validate_manifest(skill_root: Path, manifest: dict) -> None:
         references = _require_exact_keys(top_level["referenceImages"], EXPECTED_REFERENCES, "referenceImages")
         if json.dumps(references, sort_keys=True) != json.dumps(EXPECTED_REFERENCES, sort_keys=True):
             raise CapabilityManifestError("referenceImages does not match the supported contract")
+    if "requestCheck" in top_level and top_level["requestCheck"] != EXPECTED_REQUEST_CHECK:
+        raise CapabilityManifestError("requestCheck does not match the supported contract")
     _validate_contracts(top_level["contracts"])
     _validate_routes(top_level["routingOrder"])
     _validate_outputs(top_level["outputs"])

@@ -62,18 +62,29 @@ python3 scripts/gen_slide.py out/slide_01.png "<prompt>" --engine gemini
 python3 scripts/gen_slide.py out/slide_01.jpg "<prompt>" --engine doubao
 ```
 
-OpenAI uses `gpt-image-2` at 2048×1152/medium by default. Gemini uses
-`gemini-3.1-flash-image`, targets 16:9 2K, and uses PNG by default; the optional
-vision check uses `gemini-3.6-flash`. Doubao uses the current
-`doubao-seedream-5-0-pro-260628` default model. Set `DOUBAO_IMAGE_MODEL` explicitly to override it (for example the older Lite `doubao-seedream-5-0-260128`); the adapter never silently downgrades Pro. Pro/Flash omit the unsupported group-generation parameter. OpenAI accepts `.jpg`, `.jpeg`, `.png`, and `.webp`; Gemini and Doubao accept `.png`, `.jpg`, and `.jpeg`.
+| Provider | Default API model | Slide request |
+| --- | --- | --- |
+| [OpenAI](https://developers.openai.com/api/docs/guides/image-generation#size-and-quality-options) | `gpt-image-2.6-sunburst` | 2048×1152, medium quality, PNG/JPEG/WebP. Text uses Images Generations. Reference images use multipart Images Edits with the same prompt, size, and quality. |
+| [Gemini](https://aistudio.google.com/docs/image-generation#aspect-ratios-and-image-size) | `gemini-nano-banana-2.1` | GenerateContent with the 16:9 2K image response preset, PNG by default or JPEG. Reference images are inline image parts. The documented 2752×1536 result gets six rows of edge padding at the top and bottom. |
+| [Doubao](https://docs.volcengine.com/docs/ark/image-generation-api?lang=zh) | `doubao-seedream-5-5-261028` | Ark single image at 2560×1440, PNG/JPEG, URL response, watermark off. Reference images go in `image`. The request omits group-generation fields for 5.5, 5.0 Pro/Flash, and endpoint IDs. |
+
+The adapters accept repeatable `--reference-image /absolute/path/to/reference.png`
+for verified local PNG, JPEG, or WebP files. Gemini's encoded inline request has
+a 20 MB limit. Batch callers can pass `--check-request --json` with the same
+Gemini arguments before allocating a call. Gemini and Doubao accept output paths
+ending in `.png`, `.jpg`, and `.jpeg`. A Seedream 4.0 override downloads the
+model's JPEG and converts it locally for a PNG target.
+Explicit `OPENAI_IMAGE_MODEL`, `GEMINI_IMAGE_MODEL`, and
+`DOUBAO_IMAGE_MODEL` overrides remain supported. The optional vision check uses
+`gemini-3.6-flash`.
 
 All API sources are decoded and checked for actual format and strict 16:9 before
 publication. A host artifact is first retained unchanged at the absolute
 workspace sibling path `raw/<filename>`. The host importer alone may accept a
 near-16:9 image within a 0.5% integer cross-product tolerance, center-crop it
 (never stretch it) to the largest strict 16:9 master, and strictly revalidate
-the encoded master. API adapters never receive that tolerance or crop. Existing
-outputs are protected unless `--force` is explicit. API single-image outputs
+the encoded master. The Gemini 2K preset has its own exact-size padding rule.
+Existing outputs are protected unless `--force` is explicit. API single-image outputs
 use conditional, ownership-preserving publication. On POSIX, an existing target
 is first atomically displaced into a private same-directory recovery area and
 the inode actually moved must match locked preflight. On Windows, the existing
