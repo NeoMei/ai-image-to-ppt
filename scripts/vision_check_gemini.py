@@ -30,7 +30,7 @@ from provider_credentials import APIKeyError, load_api_key, validate_api_key
 from retry_delay import retry_delay
 
 
-DEFAULT_MODEL = "gemini-3.6-flash"
+DEFAULT_MODEL = "gemini-4-hydrogen"
 DEFAULT_QUESTION = "详细描述这张图片: 配色、布局、文字内容、任何渲染问题。"
 SECRET_PATH = Path("~/.secrets/gemini_api_key").expanduser()
 API_ROOT = "https://generativelanguage.googleapis.com/v1beta/models"
@@ -179,7 +179,7 @@ def _parse_text(payload: object) -> str:
         if not isinstance(parts, list):
             continue
         for part in parts:
-            if not isinstance(part, dict):
+            if not isinstance(part, dict) or part.get("thought") is True:
                 continue
             text = part.get("text")
             if isinstance(text, str) and text.strip():
@@ -211,7 +211,7 @@ def check(img_path: str, question: str = None, retries: int = 2) -> str:
     model = os.environ.get("GEMINI_VISION_MODEL", DEFAULT_MODEL).strip() or DEFAULT_MODEL
     encoded_model = urllib.parse.quote(model, safe="")
     url = f"{API_ROOT}/{encoded_model}:generateContent"
-    body = json.dumps({
+    payload = {
         "contents": [{"parts": [
             {"text": question or DEFAULT_QUESTION},
             {"inline_data": {
@@ -219,7 +219,10 @@ def check(img_path: str, question: str = None, retries: int = 2) -> str:
                 "data": base64.b64encode(image_data).decode("ascii"),
             }},
         ]}],
-    }).encode("utf-8")
+    }
+    if model == DEFAULT_MODEL:
+        payload["generationConfig"] = {"thinkingConfig": {"thinkingLevel": "MEDIUM"}}
+    body = json.dumps(payload).encode("utf-8")
 
     for attempt in range(retries + 1):
         request = urllib.request.Request(

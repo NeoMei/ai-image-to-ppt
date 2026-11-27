@@ -140,7 +140,7 @@ Final check before output: total cards MUST be 8.
 
 ## Validate, convert, and export
 
-Run a visual self-check for quantity-sensitive pages:
+Run a visual self-check for quantity-sensitive pages with Gemini 4 Hydrogen:
 
 ```bash
 python3 scripts/vision_check_gemini.py out/slide_01.jpg "精确数一下卡片数量是否正确?"

@@ -76,7 +76,8 @@ ending in `.png`, `.jpg`, and `.jpeg`. A Seedream 4.0 override downloads the
 model's JPEG and converts it locally for a PNG target.
 Explicit `OPENAI_IMAGE_MODEL`, `GEMINI_IMAGE_MODEL`, and
 `DOUBAO_IMAGE_MODEL` overrides remain supported. The optional vision check uses
-`gemini-3.6-flash`.
+[`gemini-4-hydrogen`](https://ai.google.dev/gemini-api/docs/models/gemini-4-hydrogen)
+with medium thinking. Set `GEMINI_VISION_MODEL` to override it.
 
 All API sources are decoded and checked for actual format and strict 16:9 before
 publication. A host artifact is first retained unchanged at the absolute
